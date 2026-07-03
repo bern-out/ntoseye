@@ -5,6 +5,8 @@ use std::time::{Duration, Instant};
 use iced_x86::{Code, Decoder, DecoderOptions, Instruction, Mnemonic};
 use single_instance::SingleInstance;
 
+use std::sync::Arc;
+
 use crate::backend::MemoryOps;
 use crate::bugchecks::{CURRENT_KERNEL_RELOAD_WINDOW, looks_like_kernel_pointer};
 use crate::dbg_backend::{
@@ -17,6 +19,7 @@ use crate::gdb::breakpoints::Breakpoint;
 use crate::gdb::{BreakpointHitResult, BreakpointManager, RegisterMap};
 use crate::kd::trace_enabled;
 use crate::memory::AddressSpace;
+use crate::phys::PhysMem;
 use crate::target::{ReloadReport, Target, ThreadInfo};
 use crate::types::VirtAddr;
 use crate::unwind::{
@@ -248,26 +251,43 @@ pub struct Session {
     /// `wait_for_stop` returns this as the proper event instead of a bare
     /// "halted", and `resume` clears it. `None` whenever the host is up to date.
     parked_stop: Option<ContinueOutcome>,
-    /// The single-instance lock, held for the session's lifetime so a second
-    /// ntoseye can't attach to the same VM. `Some` via [`Self::connect`] (every
-    /// host's attach path), `None` via the unguarded [`Self::new`].
+    /// The single-instance control lock, held for the session's lifetime so a
+    /// second ntoseye can't drive the same VM. `Some` via [`Self::connect`]
+    /// with [`SessionLock::Exclusive`], `None` for passive sessions and the
+    /// unguarded [`Self::new`].
     _instance_guard: Option<InstanceGuard>,
 }
 
+/// How a new session guards against concurrent ntoseye instances. Control
+/// transports (kd/gdb) take one host-wide exclusive lock: two debuggers driving
+/// live run control would corrupt each other, and we can't tell whether two
+/// transports point at the same VM, so any kd/gdb pair conflicts. Passive
+/// targets (memory introspection, crash dumps) are safe to run alongside
+/// anything and take no lock.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SessionLock {
+    Exclusive,
+    None,
+}
+
 impl Session {
-    /// Acquire the single-instance lock, connect a backend via `make_backend`,
-    /// and build the owned session; the guarded attach path every host uses. The
-    /// lock is taken *before* `make_backend` runs, so a second instance fails fast
-    /// instead of racing on the transport handshake. Backend selection
-    /// (gdb/kd/memory) stays a frontend concern, in the closure.
-    pub fn connect<F>(make_backend: F) -> Result<Self>
+    /// Take the instance lock `lock` asks for, connect a backend via
+    /// `make_backend`, and build the owned session; the guarded attach path
+    /// every host uses. Any lock is taken *before* `make_backend` runs, so a
+    /// second instance fails fast instead of racing on the transport handshake.
+    /// Backend selection (gdb/kd/memory/dmp) stays a frontend concern, in the
+    /// closure.
+    pub fn connect<F>(phys: Arc<PhysMem>, lock: SessionLock, make_backend: F) -> Result<Self>
     where
         F: FnOnce() -> Result<Box<dyn DebugBackend>>,
     {
-        let guard = acquire_instance_guard()?;
+        let guard = match lock {
+            SessionLock::Exclusive => Some(acquire_instance_guard()?),
+            SessionLock::None => None,
+        };
         let backend = make_backend()?;
-        let mut session = Self::new(backend)?;
-        session._instance_guard = Some(guard);
+        let mut session = Self::new(phys, backend)?;
+        session._instance_guard = guard;
         Ok(session)
     }
 
@@ -275,8 +295,9 @@ impl Session {
     /// guest [`Target`] view internally. The lower-level, *unguarded* constructor
     /// (tests / embedders that manage their own locking); hosts attach via
     /// [`Self::connect`], which takes the single-instance lock first.
-    pub fn new(mut backend: Box<dyn DebugBackend>) -> Result<Self> {
-        let target = Target::new()?;
+    pub fn new(phys: Arc<PhysMem>, mut backend: Box<dyn DebugBackend>) -> Result<Self> {
+        let target = Target::with_phys(phys)?;
+        backend.initialize_from_target(&target);
         let register_map = backend.register_map().clone();
 
         // Seed the selected thread from the backend when it exposes register
@@ -415,7 +436,7 @@ impl Session {
         let cr3 = self.register_map.read_u64("cr3", &regs).unwrap_or(0);
         let trace = resolve_thread_trace_context(&self.target, cr3);
         let code_dtb = preferred_code_dtb(&trace, rip);
-        let memory = AddressSpace::new(&self.target.kvm, code_dtb);
+        let memory = AddressSpace::new(&self.target.phys, code_dtb);
         let mut bytes = [0u8; 16];
         memory.read_bytes(VirtAddr(rip), &mut bytes)?;
         self.breakpoints
@@ -1505,15 +1526,16 @@ impl Session {
     }
 }
 
-/// Process-wide guard that one ntoseye session owns the VM at a time; a second
-/// attach against the same backend would corrupt both. Held inside [`Session`]
-/// for its lifetime (see [`Session::connect`]); dropping it releases the lock.
+/// Guard that one ntoseye session controls a live VM at a time; a second
+/// control-transport attach would corrupt both (see [`SessionLock`]). Held
+/// inside [`Session`] for its lifetime (see [`Session::connect`]); dropping it
+/// releases the lock.
 struct InstanceGuard(#[allow(dead_code)] SingleInstance);
 
-/// Take the single-instance lock, or [`Error::AlreadyRunning`] if another ntoseye
-/// already holds it. Internal to [`Session::connect`], which calls it before
-/// connecting a backend so a second instance fails fast rather than racing on
-/// the transport handshake.
+/// Take the single-instance control lock, or [`Error::AlreadyRunning`] if
+/// another ntoseye already holds it. Internal to [`Session::connect`], which
+/// calls it before connecting a backend so a second instance fails fast rather
+/// than racing on the transport handshake.
 fn acquire_instance_guard() -> Result<InstanceGuard> {
     let instance = SingleInstance::new("ntoseye").map_err(|err| {
         Error::DebugInfo(format!("failed to create single-instance guard: {err:?}"))

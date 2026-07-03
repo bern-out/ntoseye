@@ -1,14 +1,20 @@
 use argh::{FromArgValue, FromArgs};
 
+use std::path::PathBuf;
+use std::sync::Arc;
+
 use crate::{
     dbg_backend::DebugBackend,
     diagnostics,
+    dmp::DmpBackend,
     error::{Error, Result},
     gdb::GdbClient,
     kd::KdBackend,
     memory_backend::MemoryBackend,
+    phys::PhysMem,
     repl::start_repl,
-    session, symbols, virsh,
+    session::{self, SessionLock},
+    symbols, virsh,
 };
 #[cfg(feature = "mcp")]
 use crate::mcp;
@@ -59,6 +65,11 @@ struct Args {
     /// backend connection target. Defaults: '127.0.0.1:1234' for gdb, '/tmp/ntoseye-kd.sock' for kd; unused by memory.
     #[argh(option, long = "connect")]
     connect: Option<String>,
+
+    /// open a Windows kernel crash dump (.dmp) for offline analysis instead of attaching to a live VM; conflicts with --connect
+    #[argh(option, long = "dump")]
+    dump: Option<PathBuf>,
+
     #[argh(subcommand)]
     command: Option<Command>,
 }
@@ -75,13 +86,20 @@ enum Command {
 #[derive(FromArgs)]
 #[argh(subcommand, name = "mcp")]
 /// run as an MCP server, exposing the debugger as tools (reads the top-level
-/// --backend/--connect to choose how to attach). Defaults to the stdio transport
-/// (the client launches this binary); pass --http to serve over the network.
+/// --backend/--connect/--dump to choose how to attach). Defaults to the stdio
+/// transport (the client launches this binary); pass --http to serve over the
+/// network.
 struct McpCommand {
     /// serve the Streamable HTTP transport on this address (e.g. 127.0.0.1:8080)
     /// instead of stdio, for web MCP clients that connect over the network
     #[argh(option, long = "http")]
     http: Option<String>,
+
+    /// start without attaching to anything; the server has no debugger session
+    /// until the client loads a crash dump via the open_dump tool. Conflicts
+    /// with --dump/--connect.
+    #[argh(switch, long = "no-attach")]
+    no_attach: bool,
 
     /// allow Streamable HTTP to bind to a non-loopback address and accept any
     /// browser origin (CORS); exposes debugger control tools to the network, so
@@ -214,11 +232,22 @@ fn run() -> Result<()> {
             Error::DebugInfo("symbol download flag was initialized before startup".into())
         })?;
 
+    if args.dump.is_some() && args.connect.is_some() {
+        return Err(Error::DebugInfo(
+            "--dump opens a crash dump and does not use --connect".to_string(),
+        ));
+    }
+
     if let Some(command) = args.command {
         return match command {
             Command::Virsh(_) => virsh::run_interactive(),
             #[cfg(feature = "mcp")]
             Command::Mcp(mcp_args) => {
+                if mcp_args.no_attach && (args.dump.is_some() || args.connect.is_some()) {
+                    return Err(Error::DebugInfo(
+                        "--no-attach conflicts with --dump/--connect".to_string(),
+                    ));
+                }
                 let backend = match args.backend {
                     BackendKind::Gdb => "gdb",
                     BackendKind::Kd => "kd",
@@ -227,6 +256,8 @@ fn run() -> Result<()> {
                 mcp::run(
                     backend.to_string(),
                     args.connect.clone(),
+                    args.dump.clone(),
+                    mcp_args.no_attach,
                     mcp_args.http.clone(),
                     mcp_args.unsafe_http,
                 )
@@ -235,9 +266,30 @@ fn run() -> Result<()> {
         };
     }
 
-    // `connect` takes the single-instance lock before building the backend, so a
-    // second ntoseye fails fast instead of racing on the transport handshake.
-    let mut ctx = session::Session::connect(|| -> Result<Box<dyn DebugBackend>> {
+    if let Some(dump_path) = &args.dump {
+        let phys = Arc::new(PhysMem::dmp(dump_path)?);
+        let info = phys
+            .dmp_info()
+            .expect("dmp_info must be Some for DMP backend")
+            .clone();
+        // A dump is read-only, so no instance lock: any number of sessions can
+        // analyse dumps alongside a live debugger
+        let mut ctx = session::Session::connect(
+            phys,
+            SessionLock::None,
+            || -> Result<Box<dyn DebugBackend>> { Ok(Box::new(DmpBackend::new(&info))) },
+        )?;
+        return start_repl(&mut ctx);
+    }
+
+    // kd/gdb drive live run control, so they take the exclusive control lock;
+    // passive memory introspection coexists with anything
+    let lock = match args.backend {
+        BackendKind::Gdb | BackendKind::Kd => SessionLock::Exclusive,
+        BackendKind::Memory => SessionLock::None,
+    };
+    let phys = Arc::new(PhysMem::kvm()?);
+    let mut ctx = session::Session::connect(phys, lock, || -> Result<Box<dyn DebugBackend>> {
         Ok(match args.backend {
             BackendKind::Gdb => {
                 let addr = args.connect.as_deref().unwrap_or("127.0.0.1:1234");

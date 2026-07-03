@@ -11,6 +11,7 @@ use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -18,12 +19,14 @@ use std::time::Duration;
 use crate::backend::MemoryOps;
 use crate::bugchecks::{analyze_bugcheck, current_bugcheck};
 use crate::dbg_backend::DebugBackend;
+use crate::dmp::DmpBackend;
 use crate::error::Error;
 use crate::expr::Expr;
 use crate::gdb::GdbClient;
 use crate::kd::KdBackend;
 use crate::memory_backend::MemoryBackend;
-use crate::session::{ContinueOutcome, Session};
+use crate::phys::PhysMem;
+use crate::session::{ContinueOutcome, Session, SessionLock};
 use crate::symbols::{FieldValue, TypeInfo};
 use crate::target::{kthread_state_name, wait_reason_name};
 use crate::types::VirtAddr;
@@ -71,6 +74,7 @@ fn cleanup_session(ctx: &mut Session) {
 fn spawn_session(
     backend: String,
     connect: Option<String>,
+    dump: Option<PathBuf>,
 ) -> anyhow::Result<(mpsc::UnboundedSender<Command>, Arc<AtomicBool>)> {
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
     let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
@@ -83,22 +87,50 @@ fn spawn_session(
     let service_pending_actor = service_pending.clone();
 
     std::thread::spawn(move || {
-        // `connect` takes the single-instance lock (on this actor thread, where
-        // the `!Send` session lives) before building the backend, so the MCP
-        // server refuses to attach if another ntoseye already owns the VM.
-        let built = Session::connect(|| {
-            let backend: Box<dyn DebugBackend> = match backend.as_str() {
-                "gdb" => Box::new(GdbClient::connect(
-                    connect.as_deref().unwrap_or("127.0.0.1:1234"),
-                )?),
-                "kd" => Box::new(KdBackend::connect(
-                    connect.as_deref().unwrap_or("/tmp/ntoseye-kd.sock"),
-                )?),
-                "memory" => Box::new(MemoryBackend::new()),
-                other => return Err(Error::DebugInfo(format!("unknown backend '{other}'"))),
-            };
-            Ok(backend)
-        })
+        let is_dump = dump.is_some();
+
+        // `connect` takes the instance lock (on this actor thread, where the
+        // `!Send` session lives) before building the backend: kd/gdb take the
+        // exclusive control lock so the MCP server refuses to attach if another
+        // ntoseye already drives a VM; dumps and passive memory introspection
+        // are safe alongside anything and take none.
+        let built = (|| {
+            if let Some(dump_path) = &dump {
+                let phys = Arc::new(PhysMem::dmp(dump_path)?);
+                let info = phys
+                    .dmp_info()
+                    .expect("dmp_info must be Some for DMP backend")
+                    .clone();
+                Session::connect(
+                    phys,
+                    SessionLock::None,
+                    || -> crate::error::Result<Box<dyn DebugBackend>> {
+                        Ok(Box::new(DmpBackend::new(&info)))
+                    },
+                )
+            } else {
+                let lock = match backend.as_str() {
+                    "memory" => SessionLock::None,
+                    _ => SessionLock::Exclusive,
+                };
+                let phys = Arc::new(PhysMem::kvm()?);
+                Session::connect(phys, lock, || {
+                    let backend: Box<dyn DebugBackend> = match backend.as_str() {
+                        "gdb" => Box::new(GdbClient::connect(
+                            connect.as_deref().unwrap_or("127.0.0.1:1234"),
+                        )?),
+                        "kd" => Box::new(KdBackend::connect(
+                            connect.as_deref().unwrap_or("/tmp/ntoseye-kd.sock"),
+                        )?),
+                        "memory" => Box::new(MemoryBackend::new()),
+                        other => {
+                            return Err(Error::DebugInfo(format!("unknown backend '{other}'")))
+                        }
+                    };
+                    Ok(backend)
+                })
+            }
+        })()
         .map_err(|e| e.to_string());
 
         let mut ctx = match built {
@@ -112,11 +144,10 @@ fn spawn_session(
             }
         };
 
-        // Unlike the REPL (which pauses at its prompt), the MCP keeps the guest
-        // running for the session; the connect handshake broke the target in, so
-        // resume now. Live introspection reads go through /dev/kvm; tools that need
-        // a stopped target say so and ask the client to call `interrupt` first.
-        if !ctx.backend.is_running() {
+        // For live targets the MCP keeps the guest running between tool calls;
+        // tools that need a stopped target ask the client to call `interrupt`
+        // first. Dumps are always halted — skip the resume.
+        if !is_dump && !ctx.backend.is_running() {
             let _ = ctx.backend.continue_execution();
         }
 
@@ -160,9 +191,20 @@ fn spawn_session(
     }
 }
 
+/// The one shared session slot all transports funnel into. `Opening` reserves
+/// the slot while `open_dump` builds a session off-thread, so a concurrent
+/// `open_dump` can't race the vacancy check and leak a second actor.
+enum SessionSlot {
+    Vacant,
+    Opening,
+    Active(mpsc::UnboundedSender<Command>),
+}
+
+type SharedSession = Arc<std::sync::Mutex<SessionSlot>>;
+
 #[derive(Clone)]
 struct NtoseyeMcp {
-    tx: mpsc::UnboundedSender<Command>,
+    session: SharedSession,
     tool_router: ToolRouter<Self>,
     /// Flipped on shutdown so an in-flight `wait_for_stop` bails out promptly and
     /// the actor can run cleanup (resume the VM) before exit.
@@ -401,6 +443,12 @@ struct SetRegisterArgs {
         description = "New value as a debugger expression (symbol, register, hex, arithmetic)"
     )]
     value: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct OpenDumpArgs {
+    #[schemars(description = "Absolute path to a Windows kernel crash dump (.dmp) file")]
+    path: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -761,10 +809,10 @@ fn json_result(v: Value) -> Result<CallToolResult, McpError> {
 
 #[tool_router]
 impl NtoseyeMcp {
-    fn new(tx: mpsc::UnboundedSender<Command>, interrupt: Arc<AtomicBool>) -> Self {
+    fn new(session: SharedSession, interrupt: Arc<AtomicBool>) -> Self {
         let tool_router = Self::tool_router();
         Self {
-            tx,
+            session,
             tool_router,
             interrupt,
         }
@@ -775,13 +823,30 @@ impl NtoseyeMcp {
     where
         F: FnOnce(&mut Session) -> Result<Value, ToolError> + Send + 'static,
     {
+        let tx = {
+            let guard = self.session.lock().unwrap();
+            match &*guard {
+                SessionSlot::Active(tx) => tx.clone(),
+                SessionSlot::Opening => {
+                    return Err(McpError::invalid_request(
+                        "a debugger session is still opening; retry shortly",
+                        None,
+                    ));
+                }
+                SessionSlot::Vacant => {
+                    return Err(McpError::invalid_request(
+                        "no debugger session is active; call open_dump to load a crash dump",
+                        None,
+                    ));
+                }
+            }
+        };
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.tx
-            .send(Command::Run {
-                job: Box::new(job),
-                reply: reply_tx,
-            })
-            .map_err(|_| McpError::internal_error("debugger session is gone", None))?;
+        tx.send(Command::Run {
+            job: Box::new(job),
+            reply: reply_tx,
+        })
+        .map_err(|_| McpError::internal_error("debugger session is gone", None))?;
         reply_rx
             .await
             .map_err(|_| McpError::internal_error("debugger session dropped the request", None))?
@@ -1049,7 +1114,7 @@ impl NtoseyeMcp {
     }
 
     #[tool(
-        description = "Disassemble 1-128 instructions at an address in the current address space; returns {ip, hex, asm, comment} rows"
+        description = "Disassemble 1-128 instructions at an address in the current address space; returns {instructions:[{ip, hex, asm, comment}]}"
     )]
     async fn disassemble(
         &self,
@@ -1062,7 +1127,7 @@ impl NtoseyeMcp {
                 let rows = ctx
                     .disassemble(VirtAddr(addr), count)
                     .map_err(ToolError::from)?;
-                let arr = rows
+                let arr: Vec<Value> = rows
                     .iter()
                     .map(|r| {
                         serde_json::json!({
@@ -1073,14 +1138,14 @@ impl NtoseyeMcp {
                         })
                     })
                     .collect();
-                Ok(Value::Array(arr))
+                Ok(serde_json::json!({ "instructions": arr }))
             })
             .await?;
         json_result(v)
     }
 
     #[tool(
-        description = "Walk the current thread's call stack; limit default 64, range 1-256. Returns {ip, sp, symbol, source} frames (source: current/unwind/scan). Requires the VM halted (call interrupt first, or be stopped at a breakpoint)."
+        description = "Walk the current thread's call stack; limit default 64, range 1-256. Returns {frames:[{ip, sp, symbol, source}]} (source: current/unwind/scan). Requires the VM halted (call interrupt first, or be stopped at a breakpoint)."
     )]
     async fn backtrace(
         &self,
@@ -1091,7 +1156,7 @@ impl NtoseyeMcp {
             .run(move |ctx| {
                 require_halted(ctx, "backtrace")?;
                 let trace = ctx.backtrace(limit).map_err(ToolError::from)?;
-                let arr = trace
+                let arr: Vec<Value> = trace
                     .frames
                     .iter()
                     .map(|f| {
@@ -1103,7 +1168,7 @@ impl NtoseyeMcp {
                         })
                     })
                     .collect();
-                Ok(Value::Array(arr))
+                Ok(serde_json::json!({ "frames": arr }))
             })
             .await?;
         json_result(v)
@@ -1669,12 +1734,12 @@ impl NtoseyeMcp {
     }
 
     #[tool(
-        description = "List the backend's capability matrix - which debug operations the current transport (kd/gdb/memory) supports - as [{capability, label, supported}]. Check before a state-changing op (e.g. usermode breakpoints)."
+        description = "List the backend's capability matrix - which debug operations the current transport (kd/gdb/memory/dump) supports - as {capabilities:[{capability, label, supported}]}. Check before a state-changing op (e.g. usermode breakpoints)."
     )]
     async fn capabilities(&self) -> Result<CallToolResult, McpError> {
         let v = self
             .run(|ctx| {
-                let arr = ctx
+                let arr: Vec<Value> = ctx
                     .capabilities()
                     .iter()
                     .map(|c| {
@@ -1685,7 +1750,7 @@ impl NtoseyeMcp {
                         })
                     })
                     .collect();
-                Ok(Value::Array(arr))
+                Ok(serde_json::json!({ "capabilities": arr }))
             })
             .await?;
         json_result(v)
@@ -1974,7 +2039,7 @@ impl NtoseyeMcp {
     async fn list_breakpoints(&self) -> Result<CallToolResult, McpError> {
         let v = self
             .run(|ctx| {
-                let arr = ctx
+                let arr: Vec<Value> = ctx
                     .list_breakpoints()
                     .iter()
                     .map(|b| {
@@ -1989,7 +2054,7 @@ impl NtoseyeMcp {
                         })
                     })
                     .collect();
-                Ok(Value::Array(arr))
+                Ok(serde_json::json!({ "breakpoints": arr }))
             })
             .await?;
         json_result(v)
@@ -2246,6 +2311,69 @@ impl NtoseyeMcp {
             .await?;
         json_result(v)
     }
+
+    #[tool(
+        description = "Open a Windows kernel crash dump (.dmp) file for offline analysis; the path is a local file on the debugger host. Must be called before any other tool when the server was started with --no-attach. Only one session can be active at a time. Returns status, path, processor count, and bugcheck analysis if applicable."
+    )]
+    async fn open_dump(
+        &self,
+        Parameters(OpenDumpArgs { path }): Parameters<OpenDumpArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        // Claim the slot before the (slow, off-thread) open so a concurrent
+        // open_dump fails fast instead of racing us and leaking an actor
+        {
+            let mut guard = self.session.lock().unwrap();
+            match *guard {
+                SessionSlot::Vacant => *guard = SessionSlot::Opening,
+                _ => {
+                    return Err(McpError::invalid_request(
+                        "a debugger session is already active",
+                        None,
+                    ));
+                }
+            }
+        }
+
+        let dump_path = PathBuf::from(&path);
+        let built = match tokio::task::spawn_blocking(move || {
+            spawn_session(String::new(), None, Some(dump_path))
+        })
+        .await
+        {
+            Ok(r) => {
+                r.map_err(|e| McpError::internal_error(format!("failed to open dump: {e}"), None))
+            }
+            Err(e) => Err(McpError::internal_error(
+                format!("spawn_blocking failed: {e}"),
+                None,
+            )),
+        };
+
+        // A dump can't hit breakpoints or stop, so no service ticker is needed
+        let tx = match built {
+            Ok((tx, _service_pending)) => tx,
+            Err(e) => {
+                *self.session.lock().unwrap() = SessionSlot::Vacant;
+                return Err(e);
+            }
+        };
+
+        *self.session.lock().unwrap() = SessionSlot::Active(tx);
+
+        let v = self
+            .run(move |ctx| {
+                let processors = ctx.backend.thread_list().map(|t| t.len()).unwrap_or(1);
+                let bc = current_bugcheck(&ctx.target);
+                Ok(serde_json::json!({
+                    "status": "opened",
+                    "path": path,
+                    "processors": processors,
+                    "bugcheck": bc.map(|a| view::to_json(&view::bugcheck(&a))),
+                }))
+            })
+            .await?;
+        json_result(v)
+    }
 }
 
 #[tool_handler]
@@ -2359,6 +2487,8 @@ fn check_http_bind_policy(addr: &str, unsafe_http: bool) -> anyhow::Result<()> {
 pub fn run(
     backend: String,
     connect: Option<String>,
+    dump: Option<PathBuf>,
+    no_attach: bool,
     http: Option<String>,
     unsafe_http: bool,
 ) -> anyhow::Result<()> {
@@ -2367,53 +2497,39 @@ pub fn run(
     }
 
     // The stdio transport speaks MCP on stdout, so all logging goes to stderr.
-    eprintln!("ntoseye-mcp: attaching ({backend})...");
-    let (tx, service_pending) = spawn_session(backend, connect)?;
-    // A sender kept aside so we can drive teardown even after the service (which
-    // owns its own sender) is dropped.
-    let shutdown_tx = tx.clone();
+    let session: SharedSession = Arc::new(std::sync::Mutex::new(SessionSlot::Vacant));
+    if no_attach {
+        eprintln!("ntoseye-mcp: starting without a session (open_dump loads a crash dump)");
+    } else {
+        let label = if dump.is_some() { "dump" } else { &backend };
+        eprintln!("ntoseye-mcp: attaching ({label})...");
+        let (tx, service_pending) = spawn_session(backend, connect, dump)?;
+        *session.lock().unwrap() = SessionSlot::Active(tx.clone());
+        spawn_service_ticker(tx, service_pending);
+    }
+
     // Shared with the handlers so shutdown can interrupt an in-flight
     // `wait_for_stop` (otherwise the actor stays busy and never reaches
     // cleanup, leaving the VM frozen).
     let interrupt = Arc::new(AtomicBool::new(false));
     let interrupt_for_signal = interrupt.clone();
+    // Slot kept aside so we can drive teardown of whichever session is active
+    // by then (eager or opened later via open_dump).
+    let session_for_shutdown = session.clone();
 
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
-        // Background servicing ticker: periodically nudge the actor to service the
-        // guest while idle (see `Command::Service`), so a wrong-process hit on a
-        // shared-page breakpoint doesn't leave it frozen between tool calls.
-        // `Skip` keeps it from flooding the queue if the actor is busy; the task
-        // exits once the actor's channel closes (send fails).
-        let service_tx = tx.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(SERVICE_TICK);
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                tick.tick().await;
-                // Only enqueue when none is outstanding (the actor clears the flag
-                // as it services), so at most one `Service` is ever queued even if
-                // the actor is busy in a long wait.
-                if service_pending.swap(true, Ordering::AcqRel) {
-                    continue;
-                }
-                if service_tx.send(Command::Service).is_err() {
-                    break;
-                }
-            }
-        });
-
         let serve = async {
             match http {
                 Some(addr) => {
                     eprintln!(
-                        "ntoseye-mcp: attached; serving Streamable HTTP at http://{addr}/mcp"
+                        "ntoseye-mcp: serving Streamable HTTP at http://{addr}/mcp"
                     );
-                    serve_http(tx, addr, unsafe_http, interrupt).await
+                    serve_http(session, addr, unsafe_http, interrupt).await
                 }
                 None => {
-                    eprintln!("ntoseye-mcp: attached; serving over stdio");
-                    let service = NtoseyeMcp::new(tx, interrupt).serve(stdio()).await?;
+                    eprintln!("ntoseye-mcp: serving over stdio");
+                    let service = NtoseyeMcp::new(session, interrupt).serve(stdio()).await?;
                     service.waiting().await?;
                     Ok(())
                 }
@@ -2431,25 +2547,55 @@ pub fn run(
         };
 
         // Ask the actor to remove our breakpoints and resume the VM before we
-        // exit, so Ctrl+C doesn't leave the guest frozen with int3s installed.
-        // Set the interrupt first so any in-flight wait returns and the actor is
-        // free to process the Shutdown.
-        eprintln!("ntoseye-mcp: resuming VM and cleaning up...");
+        // exit, so Ctrl+C doesn't leave a live guest frozen with int3s
+        // installed (a no-op for dumps). Set the interrupt first so any
+        // in-flight wait returns and the actor is free to process the Shutdown.
+        eprintln!("ntoseye-mcp: cleaning up...");
         interrupt_for_signal.store(true, Ordering::Relaxed);
-        let (ack_tx, ack_rx) = oneshot::channel();
-        if shutdown_tx.send(Command::Shutdown { ack: ack_tx }).is_ok() {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), ack_rx).await;
+        // Clone the sender out so the slot's mutex isn't held across the await
+        let shutdown_tx = match &*session_for_shutdown.lock().unwrap() {
+            SessionSlot::Active(tx) => Some(tx.clone()),
+            _ => None,
+        };
+        if let Some(tx) = shutdown_tx {
+            let (ack_tx, ack_rx) = oneshot::channel();
+            if tx.send(Command::Shutdown { ack: ack_tx }).is_ok() {
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), ack_rx).await;
+            }
         }
         result
     })
 }
 
+/// Background servicing ticker: periodically nudge the actor to service the
+/// guest while idle (see [`Command::Service`]), so a wrong-process hit on a
+/// shared-page breakpoint doesn't leave it frozen between tool calls.
+/// `service_pending` keeps at most one `Service` queued even if the actor is
+/// busy in a long wait; the thread exits once the actor's channel closes
+/// (send fails).
+fn spawn_service_ticker(
+    tx: mpsc::UnboundedSender<Command>,
+    service_pending: Arc<AtomicBool>,
+) {
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(SERVICE_TICK);
+            if service_pending.swap(true, Ordering::AcqRel) {
+                continue;
+            }
+            if tx.send(Command::Service).is_err() {
+                break;
+            }
+        }
+    });
+}
+
 /// Serve the Streamable HTTP transport on `addr`, mounting the MCP service at
 /// `/mcp`. Every HTTP session gets a clone of the handler (cheap; it holds only
-/// the actor's channel sender), so all connections funnel to the one live
+/// the shared session slot), so all connections funnel to the one live
 /// debugger session.
 async fn serve_http(
-    tx: mpsc::UnboundedSender<Command>,
+    session: SharedSession,
     addr: String,
     unsafe_http: bool,
     interrupt: Arc<AtomicBool>,
@@ -2458,7 +2604,7 @@ async fn serve_http(
     use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
     use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
-    let template = NtoseyeMcp::new(tx, interrupt);
+    let template = NtoseyeMcp::new(session, interrupt);
     let service = StreamableHttpService::new(
         move || Ok(template.clone()),
         LocalSessionManager::default().into(),
