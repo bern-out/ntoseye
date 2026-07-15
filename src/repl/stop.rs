@@ -422,10 +422,11 @@ pub fn rebase_kernel_symbol_for_pending_reload(
 ) -> Option<String> {
     let new_base = kernel_base_hint?;
     let rva = pc.checked_sub(new_base.0)?;
-    let old_addr = debugger.guest.ntoskrnl.base_address.0.checked_add(rva)?;
+    let guest = debugger.guest.as_ref()?;
+    let old_addr = guest.ntoskrnl.base_address.0.checked_add(rva)?;
     let (module, symbol, offset) = debugger
         .symbols
-        .find_closest_symbol_for_address(debugger.guest.ntoskrnl.dtb(), VirtAddr(old_addr))?;
+        .find_closest_symbol_for_address(guest.ntoskrnl.dtb(), VirtAddr(old_addr))?;
     if offset > 0x1000 {
         return None;
     }

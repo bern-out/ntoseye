@@ -12,7 +12,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyDict, PyList};
 
 use crate::backend::MemoryOps;
-use crate::bugchecks::{analyze_bugcheck, current_bugcheck};
+use crate::bugchecks::{analyze_bugcheck, bugcheck_from_dump_info, current_bugcheck};
 use crate::dbg_backend::{DebugBackend, WatchpointAccess};
 use crate::dmp::DmpBackend;
 use crate::error::Error;
@@ -54,6 +54,7 @@ fn err(e: Error) -> PyErr {
     let msg = e.to_string();
     match e {
         Error::BadVirtualAddress(_)
+        | Error::AddressNotInDump(_)
         | Error::BadPhysicalAddress(_)
         | Error::PartialRead(_)
         | Error::PartialWrite(_)
@@ -958,7 +959,7 @@ impl Debugger {
             )));
         }
         let mut buf = vec![0u8; len];
-        let process = self.inner.target.current_process();
+        let process = self.inner.target.current_process().map_err(err)?;
         process
             .memory()
             .read_bytes(VirtAddr(addr), &mut buf)
@@ -1015,6 +1016,7 @@ impl Debugger {
         self.inner
             .target
             .current_process()
+            .map_err(err)?
             .memory()
             .write_bytes(VirtAddr(addr), data)
             .map_err(err)
@@ -1296,7 +1298,9 @@ impl Debugger {
     /// explaining why decoding failed. Returns `None` if the guest is not
     /// bugchecking.
     fn bugcheck<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
-        match current_bugcheck(&self.inner.target) {
+        match current_bugcheck(&self.inner.target)
+            .or_else(|| bugcheck_from_dump_info(&self.inner.target))
+        {
             Some(analysis) => Ok(Some(view_dict(py, &view::bugcheck(&analysis))?)),
             None => Ok(None),
         }
@@ -1447,6 +1451,7 @@ impl Debugger {
         self.inner
             .target
             .current_process()
+            .map_err(err)?
             .memory()
             .read_bytes(VirtAddr(addr), &mut buf)
             .map_err(err)?;
@@ -1687,7 +1692,7 @@ impl Debugger {
             .target
             .enumerate_notify_callbacks()
             .map_err(err)?;
-        let dtb = self.inner.target.guest.ntoskrnl.dtb();
+        let dtb = self.inner.target.guest().map_err(err)?.ntoskrnl.dtb();
         let rows: Vec<view::View> = cbs
             .iter()
             .map(|c| {
@@ -1788,7 +1793,7 @@ impl Debugger {
 
     /// Loaded kernel modules as `(name, base, size)` tuples.
     fn kernel_modules(&self) -> PyResult<Vec<(String, u64, u32)>> {
-        let mods = self.inner.target.guest.kernel_modules().map_err(err)?;
+        let mods = self.inner.target.kernel_modules().map_err(err)?;
         Ok(mods
             .into_iter()
             .map(|m| (m.name, m.base_address.0, m.size))
@@ -2175,7 +2180,8 @@ impl Debugger {
             ContinueOutcome::Bugcheck { rip, info } => {
                 let analysis = info
                     .map(|i| analyze_bugcheck(&self.inner.target, &i))
-                    .or_else(|| current_bugcheck(&self.inner.target));
+                    .or_else(|| current_bugcheck(&self.inner.target))
+                    .or_else(|| bugcheck_from_dump_info(&self.inner.target));
                 let bugcheck_info = match analysis {
                     Some(a) => Some(view_dict(py, &view::bugcheck(&a))?.into_any().unbind()),
                     None => None,
@@ -2282,6 +2288,7 @@ impl Debugger {
         self.inner
             .target
             .current_process()
+            .map_err(err)?
             .memory()
             .read_bytes(VirtAddr(addr), &mut buf)
             .map_err(err)?;
@@ -2425,7 +2432,7 @@ impl Struct {
             .ok_or_else(|| raise("unknown type: _UNICODE_STRING"))?;
         let len_off = us.field_offset("Length").map_err(err)?;
         let buf_off = us.field_offset("Buffer").map_err(err)?;
-        let process = dbg.inner.target.current_process();
+        let process = dbg.inner.target.current_process().map_err(err)?;
         let mem = process.memory();
 
         let mut b2 = [0u8; 2];
@@ -2461,7 +2468,7 @@ impl Struct {
             .ok_or_else(|| raise(format!("{} has no field '{}'", self.name, name)))?;
         let addr = self.base + field.offset as u64;
         let dbg = self.dbg.borrow(py);
-        let process = dbg.inner.target.current_process();
+        let process = dbg.inner.target.current_process().map_err(err)?;
         let mem = process.memory();
 
         match &field.type_data {
@@ -2555,6 +2562,7 @@ impl Struct {
             dbg.inner
                 .target
                 .current_process()
+                .map_err(err)?
                 .memory()
                 .read_bytes(VirtAddr(addr), &mut buf)
                 .map_err(err)?;
@@ -2655,6 +2663,7 @@ impl Struct {
             dbg.inner
                 .target
                 .current_process()
+                .map_err(err)?
                 .memory()
                 .read_bytes(VirtAddr(addr), &mut b)
                 .map_err(err)?;

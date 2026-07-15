@@ -236,22 +236,38 @@ pub fn start_repl(ctx: &mut Session) -> Result<()> {
         INTERRUPT_REQUESTED.store(true, Ordering::SeqCst);
     })?;
 
-    let message_data = debugger.startup_message_data()?;
-
-    println!("{}", "target".bold());
-    println!("  kernel: Windows {}", message_data.build_number.0);
-    println!("  base:   {}", ui::addr(message_data.base_address.0));
-    println!(
-        "  psmods: {}",
-        ui::addr_opt(message_data.loaded_module_list)
-    );
-    println!();
+    let reload_module_list_pending = match debugger.startup_message_data() {
+        Ok(message_data) => {
+            println!("{}", "target".bold());
+            println!("  kernel: Windows {}", message_data.build_number.0);
+            println!("  base:   {}", ui::addr(message_data.base_address.0));
+            println!(
+                "  psmods: {}",
+                ui::addr_opt(message_data.loaded_module_list)
+            );
+            println!();
+            message_data.loaded_module_list.is_zero()
+        }
+        Err(crate::error::Error::NtoskrnlNotFound)
+        | Err(crate::error::Error::AddressNotInDump(_)) => {
+            println!("{}", "target".bold());
+            if let Some(base) = debugger.kernel_base() {
+                println!("  base:   {}", ui::addr(base.0));
+            } else {
+                println!(
+                    "  kernel: {} (ntoskrnl not found in dump)",
+                    "unknown".bright_black()
+                );
+            }
+            println!();
+            false
+        }
+        Err(e) => return Err(e),
+    };
     let capabilities = client.capabilities();
     print_backend_capability_warning(&capabilities);
 
     let has_register_context = supports_capability(&capabilities, DebugCapability::ReadRegisters);
-
-    let reload_module_list_pending = message_data.loaded_module_list.is_zero();
 
     if has_register_context {
         print_break_context(
@@ -331,7 +347,8 @@ pub fn start_repl(ctx: &mut Session) -> Result<()> {
 
     let initial_processes = debugger
         .guest
-        .enumerate_processes()
+        .as_ref()
+        .and_then(|g| g.enumerate_processes().ok())
         .map(|procs| procs.into_iter().map(|p| (p.name, p.pid)).collect())
         .unwrap_or_default();
     let initial_vcpus = if supports_capability(&capabilities, DebugCapability::ThreadList) {

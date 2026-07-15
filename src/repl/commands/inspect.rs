@@ -211,7 +211,7 @@ impl ReplState<'_> {
                 // analysis does.
                 let trace = resolve_thread_trace_context(
                     &self.ctx.target,
-                    self.ctx.target.guest.ntoskrnl.dtb(),
+                    self.ctx.target.kernel_dtb(),
                 );
                 let symbol = format_symbol(&self.ctx.target, &trace, frame.rip);
                 print_ktrap_frame(&frame, Some(&symbol));
@@ -549,7 +549,7 @@ impl ReplState<'_> {
     /// Render a kernel address as its nearest symbol (styled), falling back to
     /// the bare address when nothing resolves.
     fn fmt_kernel_symbol(&self, a: VirtAddr) -> String {
-        let dtb = self.ctx.target.guest.ntoskrnl.dtb();
+        let dtb = self.ctx.target.kernel_dtb();
         self.ctx
             .target
             .symbols
@@ -753,7 +753,7 @@ impl ReplState<'_> {
             }
         };
 
-        let dtb = self.ctx.target.guest.ntoskrnl.dtb();
+        let dtb = self.ctx.target.kernel_dtb();
         let mut printed = 0;
         let mut last_kind = "";
         for c in &callbacks {

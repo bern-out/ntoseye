@@ -89,17 +89,14 @@ impl KtrapFrame {
 /// Read and decode an `_KTRAP_FRAME` at a kernel address. Fails when the
 /// type is not in the loaded symbols or the memory is unreadable.
 pub fn read_ktrap_frame(debugger: &Target, addr: VirtAddr) -> Result<KtrapFrame> {
-    let kernel_dtb = debugger.guest.ntoskrnl.dtb();
+    let process = debugger.current_process()?;
+    let dtb = process.dtb();
     let layout = debugger
         .symbols
-        .find_type_across_modules(kernel_dtb, KTRAP_FRAME_TYPE)
+        .find_type_across_modules(dtb, KTRAP_FRAME_TYPE)
         .ok_or_else(|| Error::StructNotFound(KTRAP_FRAME_TYPE.to_string()))?;
     let mut buf = vec![0u8; layout.size];
-    debugger
-        .guest
-        .ntoskrnl
-        .memory()
-        .read_bytes(addr, &mut buf)?;
+    process.memory().read_bytes(addr, &mut buf)?;
     KtrapFrame::decode(&layout, addr.0, &buf)
 }
 

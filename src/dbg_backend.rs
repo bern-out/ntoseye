@@ -414,6 +414,11 @@ pub trait DebugBackend {
     /// uses this to extract per-CPU registers from the PRCB ContextFrame.
     fn initialize_from_target(&mut self, _target: &Target) {}
 
+    /// Crash context extracted from triage dump EPROCESS/ETHREAD snapshots.
+    fn triage_crash_info(&self) -> Option<&crate::dmp::TriageCrashInfo> {
+        None
+    }
+
     /// Notify the backend about guest rediscovery progress after a transport
     /// reload. Backends can use this to tune reconnect assistance while booting.
     fn note_target_rediscovery_pending(&mut self) {}

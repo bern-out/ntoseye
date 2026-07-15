@@ -146,7 +146,7 @@ pub fn irp(irp: &IrpInfo) -> View {
 /// `_DRIVER_OBJECT`: header fields, device chain, and the 28-entry `IRP_MJ_*`
 /// dispatch table (each routine resolved to its nearest symbol).
 pub fn driver_object(target: &Target, d: &DriverObjectDetail) -> View {
-    let dtb = target.guest.ntoskrnl.dtb();
+    let dtb = target.kernel_dtb();
     let devices = d
         .device_chain
         .iter()

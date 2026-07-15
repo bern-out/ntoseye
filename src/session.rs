@@ -207,7 +207,18 @@ fn update_target_context_from_registers(
     };
     target.registers = Some(register_map.to_hashmap(&registers));
     match register_map.read_u64("cr3", &registers) {
-        Ok(cr3) if cr3 != 0 => target.set_context_dtb_override(cr3),
+        // For triage dumps all modules are loaded with DTB_IDENTITY and
+        // memory reads use identity mapping, so the CR3 from the CONTEXT
+        // record is meaningless.  Setting it here would cause a DTB
+        // mismatch that makes symbol lookup, type resolution, and eval
+        // fail.
+        Ok(cr3)
+            if cr3 != 0
+                && target.guest.is_some()
+                && target.kernel_dtb() != crate::memory::DTB_IDENTITY =>
+        {
+            target.set_context_dtb_override(cr3)
+        }
         _ => target.clear_context_dtb_override(),
     }
 }
@@ -342,7 +353,7 @@ impl Session {
 
         static NEXT_SESSION_ID: AtomicUsize = AtomicUsize::new(1);
 
-        Ok(Self {
+        let mut session = Self {
             id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
             target,
             backend,
@@ -353,7 +364,15 @@ impl Session {
             reload_surface_pending: false,
             parked_stop: None,
             _instance_guard: None,
-        })
+        };
+
+        // Populate target.registers so register names resolve in expressions
+        // (important for dump sessions where no stop event fires).
+        if has_register_context {
+            session.refresh_context_for_current_thread();
+        }
+
+        Ok(session)
     }
 
     /// Single-step one instruction on the currently selected thread. If RIP sits
@@ -781,7 +800,7 @@ impl Session {
             symbol,
             process,
             coherent: self.kernel_coherent(),
-            kernel_base: self.target.guest.ntoskrnl.base_address.0,
+            kernel_base: self.target.kernel_base().map(|a| a.0).unwrap_or(0),
         }
     }
 
@@ -899,8 +918,17 @@ impl Session {
     pub fn vcpus(&mut self) -> Result<Vec<VcpuInfo>> {
         let original = self.backend.stopped_thread_id()?;
         let threads = self.backend.thread_list()?;
-        let processes = self.target.guest.enumerate_processes().unwrap_or_default();
-        let kernel_dtb_masked = self.target.guest.ntoskrnl.dtb() & DTB_PAGE_MASK;
+        let processes = self
+            .target
+            .guest
+            .as_ref()
+            .and_then(|g| g.enumerate_processes().ok())
+            .unwrap_or_default();
+        let kernel_dtb_masked = self
+            .target
+            .guest
+            .as_ref()
+            .map(|g| g.ntoskrnl.dtb() & DTB_PAGE_MASK);
 
         let mut out = Vec::with_capacity(threads.len());
         for thread in &threads {
@@ -935,15 +963,26 @@ impl Session {
                 continue;
             };
 
+            // RIP=0 means the dump did not capture this CPU's context
+            if rip == 0 {
+                out.push(VcpuInfo {
+                    id: thread.clone(),
+                    rip: Some(0),
+                    context: "no context".to_string(),
+                    symbol: None,
+                    error: None,
+                });
+                continue;
+            }
+
             let cr3_masked = cr3 & DTB_PAGE_MASK;
-            let (context, symbol) = if cr3_masked == kernel_dtb_masked {
+            let (context, symbol) = if kernel_dtb_masked.is_some_and(|k| cr3_masked == k) {
                 let sym = self
                     .target
                     .guest
-                    .ntoskrnl
-                    .closest_symbol(VirtAddr(rip))
-                    .map(|(s, o)| format!("{s}+{o:#x}"))
-                    .ok();
+                    .as_ref()
+                    .and_then(|g| g.ntoskrnl.closest_symbol(VirtAddr(rip)).ok())
+                    .map(|(s, o)| format!("{s}+{o:#x}"));
                 ("kernel".to_string(), sym)
             } else {
                 match processes
@@ -957,7 +996,13 @@ impl Session {
                             .format_closest_symbol_for_address(proc.dtb, VirtAddr(rip));
                         (proc.name.clone(), sym)
                     }
-                    None => ("unknown".to_string(), None),
+                    None => {
+                        let sym = self
+                            .target
+                            .closest_symbol_current_context(VirtAddr(rip));
+                        let ctx = if sym.is_some() { "kernel" } else { "unknown" };
+                        (ctx.to_string(), sym)
+                    }
                 }
             };
 
@@ -1029,7 +1074,7 @@ impl Session {
     /// address space. Our own breakpoint `int3` bytes are masked back to the
     /// original opcode, and branch / rip-relative targets get symbol comments.
     pub fn disassemble(&self, addr: VirtAddr, count: usize) -> Result<Vec<DisasmRow>> {
-        let process = self.target.current_process();
+        let process = self.target.current_process()?;
         let dtb = process.dtb();
 
         // x86-64 instructions are at most 15 bytes; over-read so `count` decode.
@@ -1267,7 +1312,7 @@ impl Session {
                         if self.reload_surface_pending {
                             self.reload_surface_pending = false;
                             return Ok(ContinueOutcome::TargetReloaded {
-                                kernel_base: Some(self.target.guest.ntoskrnl.base_address.0),
+                                kernel_base: self.target.kernel_base().map(|a| a.0),
                                 coherent: self.kernel_coherent(),
                             });
                         }
@@ -1317,8 +1362,11 @@ impl Session {
                     let coherent =
                         !matches!(disposition, ReloadDisposition::Reloaded { coherent: false });
                     reload_trace!(
-                        "continue: SURFACE target_reloaded base={:#x} coherent={}",
-                        self.target.guest.ntoskrnl.base_address.0,
+                        "continue: SURFACE target_reloaded base={} coherent={}",
+                        self.target.kernel_base().map_or_else(
+                            || "none".to_string(),
+                            |a| format!("{:#x}", a.0),
+                        ),
                         coherent,
                     );
                     // Establish register/DTB context at the surfaced stop (or
@@ -1326,7 +1374,7 @@ impl Session {
                     // inspection here doesn't see the old kernel's state
                     self.refresh_context_for_current_thread();
                     return Ok(ContinueOutcome::TargetReloaded {
-                        kernel_base: Some(self.target.guest.ntoskrnl.base_address.0),
+                        kernel_base: self.target.kernel_base().map(|a| a.0),
                         coherent,
                     });
                 }
@@ -1560,11 +1608,14 @@ impl Session {
                     // reported; the eventual completion stays silent
                     self.reload_surface_pending = false;
                     reload_trace!(
-                        "classify: reload ok hint={} new_base={:#x} psmods={} coherent={}",
+                        "classify: reload ok hint={} new_base={} psmods={} coherent={}",
                         outcome
                             .hint
                             .map_or_else(|| "none".to_string(), |h| format!("{:#x}", h.0)),
-                        self.target.guest.ntoskrnl.base_address.0,
+                        self.target.kernel_base().map_or_else(
+                            || "none".to_string(),
+                            |a| format!("{:#x}", a.0),
+                        ),
                         report.startup.as_ref().map_or_else(
                             || "none".to_string(),
                             |s| format!("{:#x}", s.loaded_module_list.0),
@@ -1793,7 +1844,7 @@ pub fn stop_event_requires_target_reload(debugger: &Target, event: &StopEvent) -
         return true;
     }
 
-    let current_dtb = debugger.guest.ntoskrnl.dtb();
+    let current_dtb = debugger.kernel_dtb();
     if debugger
         .symbols
         .find_module_for_address(current_dtb, VirtAddr(pc))
@@ -1803,7 +1854,7 @@ pub fn stop_event_requires_target_reload(debugger: &Target, event: &StopEvent) -
     }
 
     if !event.is_bugcheck
-        && pc.abs_diff(debugger.guest.ntoskrnl.base_address.0) < CURRENT_KERNEL_RELOAD_WINDOW
+        && debugger.kernel_base().is_some_and(|base| pc.abs_diff(base.0) < CURRENT_KERNEL_RELOAD_WINDOW)
     {
         return false;
     }
@@ -2102,7 +2153,7 @@ pub fn step_over_current_breakpoint(
     };
 
     if let Err(err) = breakpoints.disable(backend, debugger, bp_id) {
-        if matches!(err, Error::BadVirtualAddress(_)) {
+        if matches!(err, Error::BadVirtualAddress(_) | Error::AddressNotInDump(_)) {
             breakpoints
                 .disable_guest_memory_patch_in_address_space(backend, debugger, bp_id, cr3)?;
         } else {
@@ -2113,7 +2164,7 @@ pub fn step_over_current_breakpoint(
     step_one_and_clear_tf(backend, register_map)?;
 
     if let Err(err) = breakpoints.enable(backend, debugger, bp_id) {
-        if matches!(err, Error::BadVirtualAddress(_)) {
+        if matches!(err, Error::BadVirtualAddress(_) | Error::AddressNotInDump(_)) {
             // Address space no longer exists; drop the breakpoint and move on.
             breakpoints.discard(bp_id)?;
         } else {

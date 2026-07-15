@@ -852,7 +852,7 @@ impl SymbolStore {
         Ok(job.path)
     }
 
-    fn build_image_download_job(
+    pub(crate) fn build_image_download_job(
         image_file_name: &str,
         time_date_stamp: u32,
         size_of_image: u32,
@@ -880,7 +880,11 @@ impl SymbolStore {
     // TODO (everywhere) use MemoryOps, not KvmHandle...
     // TODO (everywhere) propagate errors with format!
     // NOTE dont check for more than 1 CV entry, there shouldn't be more than 1
-    pub fn load_from_binary(&self, object: &mut WinObject) -> Result<Option<u128>> {
+    pub fn load_from_binary(
+        &self,
+        object: &mut WinObject,
+        name: &str,
+    ) -> Result<Option<u128>> {
         let view = object.view().ok_or(Error::ViewFailed)?;
         let debug = view.debug()?;
 
@@ -888,10 +892,65 @@ impl SymbolStore {
             download_job(&job, ProgressBar::new(0))?;
             self.ensure_pdb_loaded(guid, &job.path)?;
 
+            let module_key = Self::module_key(object.dtb(), object.base_address);
+            if !self.modules.contains_key(&module_key) {
+                self.modules.insert(
+                    module_key,
+                    LoadedModule {
+                        name: name.to_string(),
+                        guid,
+                        base_address: object.base_address,
+                        size: object.binary_size().try_into().unwrap_or(u32::MAX),
+                        dtb: object.dtb(),
+                    },
+                );
+            }
+
             return Ok(Some(guid));
         }
 
         Ok(None)
+    }
+
+    /// Load symbols for a module using its image metadata (TimeDateStamp +
+    /// SizeOfImage) when the PE header can't be read from memory — the common
+    /// case for ntoskrnl in triage dumps.  Downloads the PE from Microsoft's
+    /// symbol server, extracts the PDB GUID, downloads the PDB, and registers
+    /// the module.
+    pub fn load_from_module_info(
+        &self,
+        name: &str,
+        base_address: VirtAddr,
+        dtb: Dtb,
+        time_date_stamp: u32,
+        size_of_image: u32,
+    ) -> Result<Option<u128>> {
+        let image_job = Self::build_image_download_job(name, time_date_stamp, size_of_image)?;
+        download_job(&image_job, ProgressBar::new(0))?;
+
+        let Some((pdb_job, guid)) = Self::extract_download_job_from_image_file(&image_job.path)?
+        else {
+            return Ok(None);
+        };
+
+        download_job(&pdb_job, ProgressBar::new(0))?;
+        self.ensure_pdb_loaded(guid, &pdb_job.path)?;
+
+        let module_key = Self::module_key(dtb, base_address);
+        if !self.modules.contains_key(&module_key) {
+            self.modules.insert(
+                module_key,
+                LoadedModule {
+                    name: name.to_string(),
+                    guid,
+                    base_address,
+                    size: size_of_image,
+                    dtb,
+                },
+            );
+        }
+
+        Ok(Some(guid))
     }
 
     pub fn has_guid(&self, guid: u128) -> bool {
@@ -913,6 +972,7 @@ impl SymbolStore {
             }),
             Ok(None) => Self::plan_image_fallback(&addr_space, module_name, base_address),
             Err(Error::BadVirtualAddress(_))
+            | Err(Error::AddressNotInDump(_))
             | Err(Error::PartialRead(_))
             | Err(Error::DebugInfo(_)) => {
                 Self::plan_image_fallback(&addr_space, module_name, base_address)
