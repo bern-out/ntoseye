@@ -267,6 +267,7 @@ impl Drop for InterruptResetGuard {
 #[derive(Clone)]
 struct NtoseyeMcp {
     session: SharedSession,
+    #[allow(dead_code)] // accessed by the #[tool_router] macro expansion
     tool_router: ToolRouter<Self>,
     /// Flipped on shutdown so an in-flight `wait_for_stop` bails out promptly and
     /// the actor can run cleanup (resume the VM) before exit.
@@ -2631,15 +2632,13 @@ impl NtoseyeMcp {
 #[tool_handler]
 impl rmcp::ServerHandler for NtoseyeMcp {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: ProtocolVersion::V_2025_06_18,
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            server_info: Implementation {
-                name: env!("CARGO_PKG_NAME").to_string(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                ..Implementation::from_build_env()
-            },
-            instructions: Some(
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_protocol_version(ProtocolVersion::LATEST)
+            .with_server_info(Implementation::new(
+                env!("CARGO_PKG_NAME"),
+                env!("CARGO_PKG_VERSION"),
+            ))
+            .with_instructions(
                 "ntoseye: introspect and control a live Windows kernel running under \
                  KVM/QEMU. Read-only tools for process/thread/module/driver \
                  enumeration, memory and struct reads, disassembly, backtraces, \
@@ -2663,10 +2662,8 @@ impl rmcp::ServerHandler for NtoseyeMcp {
                  wait_for_stop for it rather than enumerating stale state. \
                  Tools that take an address accept a debugger expression (symbol, \
                  register, hex, arithmetic). Addresses in tool output are 0x hex \
-                 strings (JSON has no hex numbers); ids/pids/sizes stay decimal."
-                    .to_string(),
-            ),
-        }
+                 strings (JSON has no hex numbers); ids/pids/sizes stay decimal.",
+            )
     }
 }
 
@@ -3089,7 +3086,7 @@ mod tests {
         let text = result
             .content
             .first()
-            .and_then(|c| c.raw.as_text())
+            .and_then(|c| c.as_text())
             .map(|t| t.text.as_str())
             .unwrap_or("");
         assert!(text.contains("closed"), "unexpected result: {text}");
@@ -3146,7 +3143,7 @@ mod tests {
         let text = result
             .content
             .first()
-            .and_then(|c| c.raw.as_text())
+            .and_then(|c| c.as_text())
             .map(|t| t.text.as_str())
             .unwrap_or("");
         assert!(text.contains("closed"), "unexpected result: {text}");
