@@ -2784,7 +2784,7 @@ pub fn run(
     let session_for_shutdown = session.clone();
 
     let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(async move {
+    let result = runtime.block_on(async move {
         let serve = async {
             match http {
                 Some(addr) => {
@@ -2830,7 +2830,9 @@ pub fn run(
             }
         }
         result
-    })
+    });
+    runtime.shutdown_background();
+    result
 }
 
 /// Background servicing ticker: periodically nudge the actor to service the
