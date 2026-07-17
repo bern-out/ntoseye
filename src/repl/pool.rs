@@ -209,7 +209,7 @@ pub fn parse_pool_header(
     layout: &PoolLayout,
     header: VirtAddr,
 ) -> Option<PoolHeader> {
-    let mem = debugger.current_process().memory();
+    let mem = debugger.current_process().ok()?.memory();
     let (previous_size, block_units, pool_type, tag) = if layout.pool_header_uses_struct {
         let previous_size =
             read_pool_field(&layout.pool_header, &mem, header, "PreviousSize")? as u8;
@@ -264,8 +264,11 @@ pub fn gap_free_pool_block(
     header: VirtAddr,
     size: u64,
 ) -> PoolHeader {
-    let mem = debugger.current_process().memory();
-    let tag: u32 = mem.read(header + layout.pool_tag_offset).unwrap_or(0);
+    let tag: u32 = debugger
+        .current_process()
+        .ok()
+        .and_then(|p| p.memory().read(header + layout.pool_tag_offset).ok())
+        .unwrap_or(0);
     PoolHeader {
         header,
         body: header + layout.header_size,
@@ -414,7 +417,7 @@ pub fn classify_pool_region(
         let e_addr = debugger
             .symbols
             .find_symbol_across_modules(debugger.current_dtb(), stop)?;
-        let mem = debugger.current_process().memory();
+        let mem = debugger.current_process().ok()?.memory();
         let s = VirtAddr(mem.read::<u64>(s_addr).ok()?);
         let e = VirtAddr(mem.read::<u64>(e_addr).ok()?);
         if addr >= s && addr < e {
@@ -485,7 +488,7 @@ pub fn find_big_pool(
     let table_sym = debugger
         .symbols
         .find_symbol_across_modules(debugger.current_dtb(), "PoolBigPageTable")?;
-    let mem = debugger.current_process().memory();
+    let mem = debugger.current_process().ok()?.memory();
     let table_addr = VirtAddr(mem.read::<u64>(table_sym).ok()?);
     let count_sym = debugger
         .symbols

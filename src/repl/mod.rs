@@ -31,7 +31,6 @@ use crate::session::Session;
 use crate::symbols::ntoseye_home;
 #[cfg(feature = "cli")]
 use crate::target::Target;
-#[cfg(feature = "cli")]
 use crate::ui;
 
 pub static INTERRUPT_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -236,7 +235,6 @@ pub fn start_repl(ctx: &mut Session) -> Result<()> {
         INTERRUPT_REQUESTED.store(true, Ordering::SeqCst);
     })?;
 
-    let message_data = debugger.startup_message_data()?;
     let backend_label = client.name();
 
     // Loaded up front so the summary prints with the transport banner and
@@ -271,29 +269,51 @@ pub fn start_repl(ctx: &mut Session) -> Result<()> {
     embed::print_script_load_failures(&py_report);
     print_alias_load_failures(&alias_report);
 
-    println!("\n{}", ui::label("target"));
-    println!(
-        "  {} Windows {}",
-        ui::muted("kernel"),
-        message_data.build_number.0
-    );
-    println!(
-        "  {} {}",
-        ui::muted("base  "),
-        ui::addr(message_data.base_address.0)
-    );
-    println!(
-        "  {} {}",
-        ui::muted("psmods"),
-        ui::addr_opt(message_data.loaded_module_list)
-    );
-    println!();
+    // Triage dumps may lack the ntoskrnl PE header needed for full kernel
+    // discovery; a missing kernel is non-fatal and commands that need it
+    // fail individually.
+    let reload_module_list_pending = match debugger.startup_message_data() {
+        Ok(message_data) => {
+            println!("\n{}", ui::label("target"));
+            println!(
+                "  {} Windows {}",
+                ui::muted("kernel"),
+                message_data.build_number.0
+            );
+            println!(
+                "  {} {}",
+                ui::muted("base  "),
+                ui::addr(message_data.base_address.0)
+            );
+            println!(
+                "  {} {}",
+                ui::muted("psmods"),
+                ui::addr_opt(message_data.loaded_module_list)
+            );
+            println!();
+            message_data.loaded_module_list.is_zero()
+        }
+        Err(crate::error::Error::NtoskrnlNotFound)
+        | Err(crate::error::Error::AddressNotInDump(_)) => {
+            println!("\n{}", ui::label("target"));
+            if let Some(base) = debugger.kernel_base() {
+                println!("  {} {}", ui::muted("base  "), ui::addr(base.0));
+            } else {
+                println!(
+                    "  {} {}",
+                    ui::muted("kernel"),
+                    ui::muted("unknown (ntoskrnl not found in dump)")
+                );
+            }
+            println!();
+            false
+        }
+        Err(e) => return Err(e),
+    };
     let capabilities = client.capabilities();
     print_backend_capability_warning(&capabilities);
 
     let has_register_context = supports_capability(&capabilities, DebugCapability::ReadRegisters);
-
-    let reload_module_list_pending = message_data.loaded_module_list.is_zero();
 
     if has_register_context {
         print_break_context(
@@ -373,7 +393,8 @@ pub fn start_repl(ctx: &mut Session) -> Result<()> {
 
     let initial_processes = debugger
         .guest
-        .enumerate_processes()
+        .as_ref()
+        .and_then(|g| g.enumerate_processes().ok())
         .map(|procs| procs.into_iter().map(|p| (p.name, p.pid)).collect())
         .unwrap_or_default();
     let initial_vcpus = if supports_capability(&capabilities, DebugCapability::ThreadList) {

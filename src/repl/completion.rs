@@ -88,7 +88,7 @@ pub struct ReplCaches {
 impl ReplCaches {
     /// Re-enumerate the guest's process list into the completion cache
     pub fn refresh_processes(&self, debugger: &Target) -> Result<()> {
-        let processes = debugger.guest.enumerate_processes()?;
+        let processes = debugger.guest()?.enumerate_processes()?;
         *self.processes.write().unwrap() = processes.into_iter().map(|p| (p.name, p.pid)).collect();
         Ok(())
     }

@@ -45,6 +45,7 @@ pub mod session;
 pub mod symbols;
 pub mod target;
 pub mod trapframe;
+pub mod triage;
 pub mod types;
 pub mod ui;
 pub mod unwind;

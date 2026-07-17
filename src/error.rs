@@ -137,6 +137,9 @@ pub enum Error {
     #[error("Bad virtual address: {0:x}")]
     BadVirtualAddress(VirtAddr),
 
+    #[error("Address {0:x} is not captured in the triage dump's memory snapshot")]
+    AddressNotInDump(VirtAddr),
+
     #[error("Bad physical address: {0:x}")]
     BadPhysicalAddress(PhysAddr),
 

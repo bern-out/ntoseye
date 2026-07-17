@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::backend::MemoryOps;
-use crate::bugchecks::{analyze_bugcheck, current_bugcheck};
+use crate::bugchecks::{analyze_bugcheck, bugcheck_from_dump_info, current_bugcheck};
 use crate::dbg_backend::{DebugBackend, WatchpointAccess};
 use crate::dmp::DmpBackend;
 use crate::error::Error;
@@ -635,6 +635,7 @@ impl From<Error> for ToolError {
         let msg = e.to_string();
         match e {
             Error::BadVirtualAddress(_)
+            | Error::AddressNotInDump(_)
             | Error::BadPhysicalAddress(_)
             | Error::PartialRead(_)
             | Error::PartialWrite(_)
@@ -783,7 +784,8 @@ fn continue_outcome_json(ctx: &Session, outcome: ContinueOutcome) -> Value {
         ContinueOutcome::Bugcheck { rip, info } => {
             let analysis = info
                 .map(|i| analyze_bugcheck(&ctx.target, &i))
-                .or_else(|| current_bugcheck(&ctx.target));
+                .or_else(|| current_bugcheck(&ctx.target))
+                .or_else(|| bugcheck_from_dump_info(&ctx.target));
             serde_json::json!({
                 "stop": "bugcheck",
                 "rip": rip.map(hex),
@@ -979,8 +981,117 @@ fn module_json(m: &crate::guest::ModuleInfo) -> Value {
     })
 }
 
+fn exception_json(exc: &crate::dmp::DmpException) -> Value {
+    serde_json::json!({
+        "code": format!("0x{:08X}", exc.code),
+        "code_name": exception_code_name(exc.code),
+        "flags": exc.flags,
+        "address": hex(exc.address),
+        "parameters": exc.parameters.iter().map(|p| hex(*p)).collect::<Vec<_>>(),
+    })
+}
+
+fn exception_code_name(code: u32) -> &'static str {
+    match code {
+        0xC0000005 => "STATUS_ACCESS_VIOLATION",
+        0xC000001D => "STATUS_ILLEGAL_INSTRUCTION",
+        0xC0000094 => "STATUS_INTEGER_DIVIDE_BY_ZERO",
+        0xC0000095 => "STATUS_INTEGER_OVERFLOW",
+        0xC0000096 => "STATUS_PRIVILEGED_INSTRUCTION",
+        0xC00000FD => "STATUS_STACK_OVERFLOW",
+        0xC0000006 => "STATUS_IN_PAGE_ERROR",
+        0x80000003 => "STATUS_BREAKPOINT",
+        0x80000004 => "STATUS_SINGLE_STEP",
+        0xC000008E => "STATUS_FLOAT_DIVIDE_BY_ZERO",
+        0xC0000090 => "STATUS_FLOAT_INVALID_OPERATION",
+        0xC0000091 => "STATUS_FLOAT_OVERFLOW",
+        0xC000008D => "STATUS_FLOAT_DENORMAL_OPERAND",
+        0xC0000092 => "STATUS_FLOAT_STACK_CHECK",
+        0xC0000093 => "STATUS_FLOAT_UNDERFLOW",
+        0xC000008F => "STATUS_FLOAT_INEXACT_RESULT",
+        _ => "unknown",
+    }
+}
+
+fn system_info_json(info: &crate::dmp::DmpSystemInfo) -> Value {
+    let product = match info.product_type {
+        1 => "Workstation",
+        2 => "DomainController",
+        3 => "Server",
+        _ => "Unknown",
+    };
+    let system_time = if info.system_time != 0 {
+        filetime_to_iso(info.system_time as u64)
+    } else {
+        None
+    };
+    let machine = match info.machine_image_type {
+        0x014c => "I386",
+        0x8664 => "AMD64",
+        0xAA64 => "ARM64",
+        _ => "Unknown",
+    };
+    serde_json::json!({
+        "major_version": info.major_version,
+        "build": info.minor_version,
+        "service_pack_build": info.service_pack_build,
+        "machine_image_type": format!("0x{:04X}", info.machine_image_type),
+        "machine": machine,
+        "system_time": system_time,
+        "system_up_time_secs": if info.system_up_time != 0 {
+            Some(info.system_up_time / 10_000_000)
+        } else {
+            None
+        },
+        "product_type": product,
+        "suite_mask": format!("0x{:04X}", info.suite_mask),
+    })
+}
+
+fn filetime_to_iso(ft: u64) -> Option<String> {
+    // Windows FILETIME: 100-ns intervals since 1601-01-01 UTC.
+    // Unix epoch is 11644473600 seconds after that.
+    const EPOCH_DIFF: i64 = 11_644_473_600;
+    let secs = (ft / 10_000_000) as i64 - EPOCH_DIFF;
+    if secs < 0 || secs > 253_402_300_799 {
+        return None;
+    }
+    let s = secs % 60;
+    let total_m = secs / 60;
+    let m = total_m % 60;
+    let total_h = total_m / 60;
+    let h = total_h % 24;
+    let days = total_h / 24;
+    // Approximate date from days since epoch (good enough for display)
+    let (y, mo, d) = days_to_ymd(days);
+    Some(format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z"))
+}
+
+fn days_to_ymd(mut days: i64) -> (i64, i64, i64) {
+    // Civil days since 1970-01-01 to (year, month, day)
+    days += 719_468;
+    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
+    let doe = days - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+fn unloaded_driver_json(d: &crate::dmp::UnloadedDriver) -> Value {
+    serde_json::json!({
+        "name": d.name,
+        "start_address": hex(d.start_address),
+        "end_address": hex(d.end_address),
+    })
+}
+
 fn read_virt_bytes(ctx: &mut Session, addr: u64, buf: &mut [u8]) -> Result<(), ToolError> {
-    let process = ctx.target.current_process();
+    let process = ctx.target.current_process()?;
     process
         .memory()
         .read_bytes(VirtAddr(addr), buf)
@@ -1092,7 +1203,6 @@ impl NtoseyeMcp {
             .run(move |ctx| {
                 let mods = ctx
                     .target
-                    .guest
                     .kernel_modules()
                     .map_err(|e| enumeration_error(ctx, e))?;
                 let f = filter.as_deref().map(str::to_ascii_lowercase);
@@ -1461,7 +1571,7 @@ impl NtoseyeMcp {
         let limit = optional_limit("limit", limit, LIST_DEFAULT_LIMIT, LIST_MAX_LIMIT)?;
         let v = self
             .run(move |ctx| {
-                let dtb = ctx.target.guest.ntoskrnl.dtb();
+                let dtb = ctx.target.kernel_dtb();
                 let cbs = ctx
                     .target
                     .enumerate_notify_callbacks()
@@ -1787,7 +1897,7 @@ impl NtoseyeMcp {
             .run(move |ctx| {
                 let process = ctx
                     .target
-                    .guest
+                    .guest()?
                     .enumerate_processes()
                     .map_err(|e| enumeration_error(ctx, e))?
                     .into_iter()
@@ -1850,10 +1960,14 @@ impl NtoseyeMcp {
     async fn bugcheck(&self) -> Result<CallToolResult, McpError> {
         let v = self
             .run(|ctx| {
-                Ok(match current_bugcheck(&ctx.target) {
-                    Some(analysis) => view::to_json(&view::bugcheck(&analysis)),
-                    None => Value::Null,
-                })
+                Ok(
+                    match current_bugcheck(&ctx.target)
+                        .or_else(|| bugcheck_from_dump_info(&ctx.target))
+                    {
+                        Some(analysis) => view::to_json(&view::bugcheck(&analysis)),
+                        None => serde_json::json!({}),
+                    },
+                )
             })
             .await?;
         json_result(v)
@@ -2467,7 +2581,7 @@ impl NtoseyeMcp {
                 }
                 let addr = eval_addr(ctx, &address)?;
                 ctx.target
-                    .current_process()
+                    .current_process()?
                     .memory()
                     .write_bytes(VirtAddr(addr), &bytes)
                     .map_err(ToolError::from)?;
@@ -2499,7 +2613,7 @@ impl NtoseyeMcp {
     }
 
     #[tool(
-        description = "Open a Windows kernel crash dump (.dmp) file for offline analysis. Must be called before any other tool when the server was started without --dump/--connect. Only one session can be active at a time. Returns status, path, processor count, and bugcheck analysis if applicable."
+        description = "Open a Windows kernel crash dump (.dmp) file for offline analysis. Must be called before any other tool when the server was started without --dump/--connect. Only one session can be active at a time. Returns {status, path, processors, bugcheck, exception:{code, code_name, flags, address, parameters}, system_info:{major_version, minor_version, build, service_pack_build, machine_image_type, machine, system_time, system_up_time_secs, product_type, suite_mask}}."
     )]
     async fn open_dump(
         &self,
@@ -2520,12 +2634,50 @@ impl NtoseyeMcp {
         let v = self
             .run(move |ctx| {
                 let processors = ctx.backend.thread_list().map(|t| t.len()).unwrap_or(1);
-                let bc = current_bugcheck(&ctx.target);
+                let bc =
+                    current_bugcheck(&ctx.target).or_else(|| bugcheck_from_dump_info(&ctx.target));
+                let dmp = ctx.target.phys.dmp_info();
+                let crash_context = ctx.backend.triage_crash_info().map(|ci| {
+                    let mut ctx = serde_json::json!({
+                        "process_name": ci.process_name,
+                        "process_id": ci.process_id,
+                        "thread_id": ci.thread_id,
+                    });
+                    let obj = ctx.as_object_mut().unwrap();
+                    if let Some(ppid) = ci.parent_process_id {
+                        obj.insert("parent_process_id".into(), serde_json::json!(ppid));
+                    }
+                    if let Some(es) = ci.exit_status {
+                        obj.insert("exit_status".into(), format!("0x{es:08X}").into());
+                    }
+                    if let Some(ct) = ci.create_time {
+                        obj.insert("create_time".into(), filetime_to_iso(ct).into());
+                    }
+                    if let Some(es) = ci.thread_exit_status {
+                        obj.insert("thread_exit_status".into(), format!("0x{es:08X}").into());
+                    }
+                    ctx
+                });
+                let prcb = dmp.and_then(|d| d.triage_prcb_info.as_ref()).map(|p| {
+                    serde_json::json!({
+                        "current_thread": format!("0x{:X}", p.current_thread),
+                        "processor_number": p.processor_number,
+                        "mhz": p.mhz,
+                        "cpu_type": p.cpu_type,
+                        "vendor_string": p.vendor_string,
+                    })
+                });
                 Ok(serde_json::json!({
                     "status": "opened",
                     "path": path,
                     "processors": processors,
                     "bugcheck": bc.map(|a| view::to_json(&view::bugcheck(&a))),
+                    "exception": dmp.and_then(|d| d.exception.as_ref().map(exception_json)),
+                    "system_info": dmp.and_then(|d| d.system_info.as_ref().map(system_info_json)),
+                    "crash_context": crash_context,
+                    "prcb": prcb,
+                    "broken_driver": dmp.and_then(|d| d.broken_driver.clone()),
+                    "triage_overflowed": dmp.map(|d| d.triage_overflowed),
                 }))
             })
             .await?;
@@ -2588,7 +2740,7 @@ impl NtoseyeMcp {
     }
 
     #[tool(
-        description = "One-shot overview for crash/debug triage: bundles status, bugcheck analysis, backtrace, and loaded kernel modules into a single response. backtrace is null when the VM is running. Returns {status, bugcheck, backtrace, modules}."
+        description = "One-shot overview for crash/debug triage: bundles status, bugcheck analysis, exception record, system info, backtrace, loaded/unloaded kernel modules into a single response. backtrace is null when the VM is running. Returns {status, bugcheck, exception, system_info, backtrace, modules, modules_total, unloaded_drivers, crash_context}."
     )]
     async fn triage(&self) -> Result<CallToolResult, McpError> {
         let v = self
@@ -2597,7 +2749,9 @@ impl NtoseyeMcp {
                 let running = s.running;
                 let status = run_status_json(s);
 
-                let bc = current_bugcheck(&ctx.target).map(|a| view::to_json(&view::bugcheck(&a)));
+                let bc = current_bugcheck(&ctx.target)
+                    .or_else(|| bugcheck_from_dump_info(&ctx.target))
+                    .map(|a| view::to_json(&view::bugcheck(&a)));
 
                 let bt = if !running {
                     ctx.backtrace(BACKTRACE_DEFAULT_LIMIT)
@@ -2607,16 +2761,66 @@ impl NtoseyeMcp {
                     None
                 };
 
-                let all_mods = ctx.target.guest.kernel_modules().unwrap_or_default();
+                let all_mods = ctx.target.kernel_modules().unwrap_or_default();
                 let modules_total = all_mods.len();
                 let mods: Vec<Value> = all_mods.iter().take(200).map(module_json).collect();
+
+                let dmp = ctx.target.phys.dmp_info();
+                let exception = dmp.and_then(|d| d.exception.as_ref().map(exception_json));
+                let system_info = dmp.and_then(|d| d.system_info.as_ref().map(system_info_json));
+                let unloaded: Vec<Value> = dmp
+                    .map(|d| {
+                        d.unloaded_drivers
+                            .iter()
+                            .map(unloaded_driver_json)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                let crash_context = ctx.backend.triage_crash_info().map(|ci| {
+                    let mut ctx = serde_json::json!({
+                        "process_name": ci.process_name,
+                        "process_id": ci.process_id,
+                        "thread_id": ci.thread_id,
+                    });
+                    let obj = ctx.as_object_mut().unwrap();
+                    if let Some(ppid) = ci.parent_process_id {
+                        obj.insert("parent_process_id".into(), serde_json::json!(ppid));
+                    }
+                    if let Some(es) = ci.exit_status {
+                        obj.insert("exit_status".into(), format!("0x{es:08X}").into());
+                    }
+                    if let Some(ct) = ci.create_time {
+                        obj.insert("create_time".into(), filetime_to_iso(ct).into());
+                    }
+                    if let Some(es) = ci.thread_exit_status {
+                        obj.insert("thread_exit_status".into(), format!("0x{es:08X}").into());
+                    }
+                    ctx
+                });
+                let prcb = dmp.and_then(|d| d.triage_prcb_info.as_ref()).map(|p| {
+                    serde_json::json!({
+                        "current_thread": format!("0x{:X}", p.current_thread),
+                        "processor_number": p.processor_number,
+                        "mhz": p.mhz,
+                        "cpu_type": p.cpu_type,
+                        "vendor_string": p.vendor_string,
+                    })
+                });
 
                 Ok(serde_json::json!({
                     "status": status,
                     "bugcheck": bc,
+                    "exception": exception,
+                    "system_info": system_info,
                     "backtrace": bt,
                     "modules": mods,
                     "modules_total": modules_total,
+                    "unloaded_drivers": unloaded,
+                    "crash_context": crash_context,
+                    "prcb": prcb,
+                    "broken_driver": dmp.and_then(|d| d.broken_driver.clone()),
+                    "triage_overflowed": dmp.map(|d| d.triage_overflowed),
                 }))
             })
             .await?;

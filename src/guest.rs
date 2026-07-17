@@ -34,6 +34,7 @@ pub struct ModuleInfo {
     pub short_name: String,
     pub base_address: VirtAddr,
     pub size: u32,
+    pub time_date_stamp: Option<u32>,
 }
 
 impl ModuleInfo {
@@ -44,7 +45,13 @@ impl ModuleInfo {
             short_name,
             base_address,
             size,
+            time_date_stamp: None,
         }
+    }
+
+    pub fn with_time_date_stamp(mut self, tds: u32) -> Self {
+        self.time_date_stamp = Some(tds);
+        self
     }
 
     pub fn derive_short_name(name: &str) -> String {
@@ -307,7 +314,28 @@ impl WinObject {
         // Clone the Arc handles to a local so `load_from_binary` can take
         // `&mut self` without aliasing the `self.symbols`/`self.phys` fields.
         let symbols = Arc::clone(&self.symbols);
-        self.guid = symbols.load_from_binary(&mut self)?;
+        self.guid = symbols.load_from_binary(&mut self, "ntoskrnl.exe")?;
+        Ok(self)
+    }
+
+    /// Fallback symbol loader for triage dumps where the PE header page isn't
+    /// in the dump.  Uses the module's TimeDateStamp + SizeOfImage from the
+    /// triage driver list to download the PE from Microsoft's symbol server,
+    /// extract the PDB GUID, and load the PDB.
+    pub fn load_symbols_from_module_info(
+        mut self,
+        name: &str,
+        time_date_stamp: u32,
+        size_of_image: u32,
+    ) -> Result<Self> {
+        let symbols = Arc::clone(&self.symbols);
+        self.guid = symbols.load_from_module_info(
+            name,
+            self.base_address,
+            self.dtb,
+            time_date_stamp,
+            size_of_image,
+        )?;
         Ok(self)
     }
 
@@ -668,26 +696,19 @@ fn find_kernel_dtb(phys: &PhysMem) -> Result<Option<Dtb>> {
     Ok(None)
 }
 
+fn is_ntoskrnl_header(header: &[u8]) -> bool {
+    header.len() >= 4
+        && header[..4] == [0x4d, 0x5a, 0x90, 0x00]
+        && header.chunks_exact(8).any(|c| c == b"POOLCODE")
+}
+
 fn is_ntoskrnl_pte(phys: &PhysMem, pte: PageTableEntry) -> Result<bool> {
     if pte.is_user() || !pte.is_nx() {
         return Ok(false);
     }
 
     let header = phys.read::<[u8; 0x1000]>(pte.page_frame())?;
-
-    if header[..4] != [0x4d, 0x5a, 0x90, 0x00] {
-        return Ok(false);
-    }
-
-    for chunk in header.chunks_exact(8) {
-        if chunk != b"POOLCODE" {
-            continue;
-        }
-
-        return Ok(true);
-    }
-
-    Ok(false)
+    Ok(is_ntoskrnl_header(&header))
 }
 
 fn find_ntoskrnl_va(kernel_dtb: Dtb, phys: &PhysMem) -> Result<Option<VirtAddr>> {
@@ -779,6 +800,56 @@ fn find_ntoskrnl_va(kernel_dtb: Dtb, phys: &PhysMem) -> Result<Option<VirtAddr>>
     Ok(None)
 }
 
+/// Scan captured virtual memory regions for the ntoskrnl PE header.
+///
+/// Triage dumps have no page tables, so we can't walk the PML4. Instead we
+/// probe the identity-mapped virtual memory for the MZ header + POOLCODE
+/// marker, the same heuristic `is_ntoskrnl_pte` uses but at the virtual
+/// layer.
+fn find_ntoskrnl_va_triage(kernel_dtb: Dtb, phys: &PhysMem) -> Result<Option<VirtAddr>> {
+    let space = crate::memory::AddressSpace::new(phys, kernel_dtb);
+
+    // Triage dumps include ntoskrnl's base in PsLoadedModuleList. We can
+    // read the PsLoadedModuleList VA from the header; the list entry itself
+    // is at nt!PsLoadedModuleList, which is inside ntoskrnl. The first
+    // entry in the list is ntoskrnl's own LDR_DATA_TABLE_ENTRY whose
+    // DllBase field gives us the base.
+    //
+    // But we don't have the offsets yet (no PDB). Instead, just try
+    // addresses from the data blocks that look like kernel-space PE headers.
+    if let Some(dmp_info) = phys.dmp_info() {
+        // Check triage driver base addresses first — ntoskrnl is typically
+        // the first entry and this avoids scanning up to 4096 pages.
+        let mut header = vec![0u8; 0x1000];
+        for driver in &dmp_info.triage_drivers {
+            let candidate = VirtAddr(driver.base);
+            if space.read_bytes(candidate, &mut header).is_err() {
+                continue;
+            }
+            if is_ntoskrnl_header(&header) {
+                return Ok(Some(candidate));
+            }
+        }
+
+        // Fallback: scan backwards from PsLoadedModuleList.
+        let ps_loaded = dmp_info.ps_loaded_module_list;
+        if ps_loaded >= 0xfffff80000000000 {
+            let page_base = ps_loaded & !0xFFF;
+            for offset in (0..0x100_0000u64).step_by(0x1000) {
+                let candidate = page_base - offset;
+                if space.read_bytes(VirtAddr(candidate), &mut header).is_err() {
+                    continue;
+                }
+                if is_ntoskrnl_header(&header) {
+                    return Ok(Some(VirtAddr(candidate)));
+                }
+            }
+        }
+    }
+
+    Ok(None)
+}
+
 fn find_ntoskrnl(phys: Arc<PhysMem>, symbols: Arc<SymbolStore>) -> Result<Option<WinObject>> {
     let Some(kernel_dtb) = find_kernel_dtb(&phys)? else {
         return Ok(None);
@@ -846,8 +917,54 @@ impl Guest {
         symbols: Arc<SymbolStore>,
         kernel_dtb: Dtb,
     ) -> Result<Self> {
-        let ntoskrnl_va = find_ntoskrnl_va(kernel_dtb, &phys)?.ok_or(Error::NtoskrnlNotFound)?;
-        let ntoskrnl = WinObject::new(phys, symbols, kernel_dtb, ntoskrnl_va).load_symbols()?;
+        let is_triage = kernel_dtb == crate::memory::DTB_IDENTITY;
+
+        let ntoskrnl_va = if is_triage {
+            find_ntoskrnl_va_triage(kernel_dtb, &phys)?
+        } else {
+            find_ntoskrnl_va(kernel_dtb, &phys)?
+        };
+
+        // For triage dumps, fall back to kern_base from KDDEBUGGER_DATA64
+        // when the PE header page isn't captured in the dump.
+        let ntoskrnl_va = match ntoskrnl_va {
+            Some(va) => va,
+            None if is_triage => phys
+                .dmp_info()
+                .and_then(|i| i.kern_base)
+                .map(VirtAddr)
+                .ok_or(Error::NtoskrnlNotFound)?,
+            None => return Err(Error::NtoskrnlNotFound),
+        };
+
+        let obj = WinObject::new(
+            Arc::clone(&phys),
+            Arc::clone(&symbols),
+            kernel_dtb,
+            ntoskrnl_va,
+        );
+
+        // Try normal symbol loading first; for triage dumps where the PE
+        // header isn't in memory, fall back to downloading by image metadata.
+        let ntoskrnl = match obj.load_symbols() {
+            Ok(loaded) => loaded,
+            Err(_) if is_triage => {
+                let driver = phys
+                    .dmp_info()
+                    .and_then(|info| info.triage_drivers.iter().find(|d| d.base == ntoskrnl_va.0))
+                    .cloned()
+                    .ok_or(Error::NtoskrnlNotFound)?;
+
+                WinObject::new(phys, symbols, kernel_dtb, ntoskrnl_va)
+                    .load_symbols_from_module_info(
+                        &driver.name,
+                        driver.time_date_stamp,
+                        driver.size,
+                    )?
+            }
+            Err(e) => return Err(e),
+        };
+
         ntoskrnl.register_as_kernel();
         Ok(Self { ntoskrnl })
     }
@@ -1061,8 +1178,7 @@ impl Guest {
         prefix == 0xFFFF8 || prefix == 0xFFFF9 || prefix == 0xFFFFA
     }
 
-    fn load_module_symbols(
-        &self,
+    pub(crate) fn load_module_symbols(
         phys: &PhysMem,
         symbols: &SymbolStore,
         modules: Vec<ModuleInfo>,
@@ -1097,6 +1213,19 @@ impl Guest {
                 }
                 Ok(ModuleSymbolDiscovery::NeedsImage { image_job }) => {
                     image_jobs.push((image_job, module));
+                }
+                Err(_e) if module.time_date_stamp.is_some() => {
+                    let tds = module.time_date_stamp.unwrap();
+                    match SymbolStore::build_image_download_job(&module.name, tds, module.size) {
+                        Ok(image_job) => image_jobs.push((image_job, module)),
+                        Err(e) => Self::apply_module_symbol_status(
+                            symbols,
+                            &mut report,
+                            dtb,
+                            &module,
+                            ModuleSymbolStatus::Failed(e.to_string()),
+                        ),
+                    }
                 }
                 Err(e) => {
                     Self::apply_module_symbol_status(
@@ -1239,7 +1368,7 @@ impl Guest {
             }
         }
         let dtb = self.ntoskrnl.dtb();
-        self.load_module_symbols(phys, symbols, modules, dtb, true)
+        Self::load_module_symbols(phys, symbols, modules, dtb, true)
     }
 
     pub fn load_missing_kernel_module_symbols(
@@ -1263,7 +1392,7 @@ impl Guest {
             })
             .collect::<Vec<_>>();
 
-        self.load_module_symbols(phys, symbols, missing, dtb, true)
+        Self::load_module_symbols(phys, symbols, missing, dtb, true)
     }
 
     pub fn load_all_process_module_symbols(
@@ -1274,7 +1403,7 @@ impl Guest {
     ) -> Result<ModuleSymbolLoadReport> {
         let modules = self.process_modules(info)?;
         let dtb = info.dtb;
-        self.load_module_symbols(phys, symbols, modules, dtb, false)
+        Self::load_module_symbols(phys, symbols, modules, dtb, false)
     }
 
     /// Load symbols for an explicit set of modules under `dtb`. Used to lazily
@@ -1288,7 +1417,7 @@ impl Guest {
         modules: Vec<ModuleInfo>,
         dtb: Dtb,
     ) -> Result<ModuleSymbolLoadReport> {
-        self.load_module_symbols(phys, symbols, modules, dtb, false)
+        Self::load_module_symbols(phys, symbols, modules, dtb, false)
     }
 }
 

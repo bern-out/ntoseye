@@ -370,7 +370,7 @@ pub fn bugcheck_site(
 
 /// Decode a known [`BugcheckInfo`] into a structured [`BugcheckAnalysis`].
 pub fn analyze_bugcheck(debugger: &Target, info: &BugcheckInfo) -> BugcheckAnalysis {
-    let trace = resolve_thread_trace_context(debugger, debugger.guest.ntoskrnl.dtb());
+    let trace = resolve_thread_trace_context(debugger, debugger.kernel_dtb());
     let site = bugcheck_site(debugger, &trace, info);
     let descriptor = bugcheck_descriptor(info.code);
     let name = descriptor
@@ -429,14 +429,17 @@ pub fn analyze_bugcheck(debugger: &Target, info: &BugcheckInfo) -> BugcheckAnaly
 /// the first slot). Unlike [`current_bugcheck`], this preserves diagnostics for
 /// the REPL's bugcheck-stop banner.
 pub(crate) fn resolve_current_bugcheck(debugger: &Target) -> CurrentBugcheckResolution {
-    let kernel_dtb = debugger.guest.ntoskrnl.dtb();
+    let Some(guest) = debugger.guest.as_ref() else {
+        return CurrentBugcheckResolution::SymbolUnavailable;
+    };
+    let kernel_dtb = guest.ntoskrnl.dtb();
     let Some(address) = debugger
         .symbols
         .find_symbol_across_modules(kernel_dtb, "KiBugCheckData")
     else {
         return CurrentBugcheckResolution::SymbolUnavailable;
     };
-    let mem = debugger.guest.ntoskrnl.memory();
+    let mem = guest.ntoskrnl.memory();
     let direct = match read_bugcheck_data(&mem, address) {
         Ok(data) => data,
         Err(error) => {
@@ -512,6 +515,24 @@ pub fn current_bugcheck(debugger: &Target) -> Option<BugcheckAnalysis> {
             None
         }
     }
+}
+
+/// Build a [`BugcheckAnalysis`] from the dump header's bugcheck fields when
+/// the live-memory path (`current_bugcheck`) is unavailable (e.g. triage dumps
+/// that don't include the `KiBugCheckData` memory region).
+pub fn bugcheck_from_dump_info(debugger: &Target) -> Option<BugcheckAnalysis> {
+    let dmp = debugger.phys.dmp_info()?;
+    if !plausible_bugcheck_code(dmp.bug_check_code as u64) {
+        return None;
+    }
+    let info = BugcheckInfo {
+        code: dmp.bug_check_code,
+        parameters: dmp.bug_check_parameters,
+        driver: None,
+    };
+    let mut analysis = analyze_bugcheck(debugger, &info);
+    analysis.source = Some("dump header".into());
+    Some(analysis)
 }
 
 pub fn bugcheck_descriptor(code: u32) -> Option<BugcheckDescriptor> {

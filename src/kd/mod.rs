@@ -53,7 +53,7 @@ mod debug_io;
 pub use debug_io::*;
 mod event_loop;
 pub use event_loop::*;
-mod wire;
+pub(crate) mod wire;
 
 #[derive(Debug, Clone)]
 pub struct StateChange {

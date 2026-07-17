@@ -8,6 +8,8 @@ use kdmp_parser::structs::KdDebuggerData64;
 use kdmp_parser::virt;
 use memmap2::Mmap;
 
+use crate::kd::wire::read_u64 as buffer_u64;
+
 use crate::backend::MemoryOps;
 use crate::dbg_backend::{BackendCapability, DebugBackend, DebugCapability, StopEvent};
 use crate::diagnostics;
@@ -51,6 +53,175 @@ pub struct DmpContext {
     pub dr3: u64,
     pub dr6: u64,
     pub dr7: u64,
+    pub mxcsr: u32,
+    pub xmm: [u128; 16],
+    pub debug_control: u64,
+    pub last_branch_to_rip: u64,
+    pub last_branch_from_rip: u64,
+    pub last_exception_to_rip: u64,
+    pub last_exception_from_rip: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DmpException {
+    pub code: u32,
+    pub flags: u32,
+    pub address: u64,
+    pub parameters: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DmpSystemInfo {
+    pub major_version: u32,
+    pub minor_version: u32,
+    pub system_time: i64,
+    pub system_up_time: i64,
+    pub product_type: u32,
+    pub suite_mask: u32,
+    pub machine_image_type: u32,
+    pub service_pack_build: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct UnloadedDriver {
+    pub name: String,
+    pub start_address: u64,
+    pub end_address: u64,
+}
+
+impl DmpContext {
+    pub fn from_bytes(buf: &[u8]) -> Self {
+        use crate::kd::wire::{read_u16, read_u32, read_u64};
+
+        let mut xmm = [0u128; 16];
+        if buf.len() >= context::OFFSET_XMM0 + 16 * 16 {
+            for (i, slot) in xmm.iter_mut().enumerate() {
+                let off = context::OFFSET_XMM0 + i * 16;
+                *slot = u128::from_le_bytes(buf[off..off + 16].try_into().unwrap());
+            }
+        }
+
+        let has_lbr = buf.len() >= context::OFFSET_LAST_EXCEPTION_FROM_RIP + 8;
+
+        Self {
+            rax: read_u64(buf, context::OFFSET_RAX),
+            rbx: read_u64(buf, context::OFFSET_RBX),
+            rcx: read_u64(buf, context::OFFSET_RCX),
+            rdx: read_u64(buf, context::OFFSET_RDX),
+            rsi: read_u64(buf, context::OFFSET_RSI),
+            rdi: read_u64(buf, context::OFFSET_RDI),
+            rbp: read_u64(buf, context::OFFSET_RBP),
+            rsp: read_u64(buf, context::OFFSET_RSP),
+            r8: read_u64(buf, context::OFFSET_R8),
+            r9: read_u64(buf, context::OFFSET_R9),
+            r10: read_u64(buf, context::OFFSET_R10),
+            r11: read_u64(buf, context::OFFSET_R11),
+            r12: read_u64(buf, context::OFFSET_R12),
+            r13: read_u64(buf, context::OFFSET_R13),
+            r14: read_u64(buf, context::OFFSET_R14),
+            r15: read_u64(buf, context::OFFSET_R15),
+            rip: read_u64(buf, context::OFFSET_RIP),
+            eflags: read_u32(buf, context::OFFSET_EFLAGS),
+            cs: read_u16(buf, context::OFFSET_SEG_CS),
+            ds: read_u16(buf, context::OFFSET_SEG_DS),
+            es: read_u16(buf, context::OFFSET_SEG_ES),
+            fs: read_u16(buf, context::OFFSET_SEG_FS),
+            gs: read_u16(buf, context::OFFSET_SEG_GS),
+            ss: read_u16(buf, context::OFFSET_SEG_SS),
+            dr0: read_u64(buf, context::OFFSET_DR0),
+            dr1: read_u64(buf, context::OFFSET_DR1),
+            dr2: read_u64(buf, context::OFFSET_DR2),
+            dr3: read_u64(buf, context::OFFSET_DR3),
+            dr6: read_u64(buf, context::OFFSET_DR6),
+            dr7: read_u64(buf, context::OFFSET_DR7),
+            mxcsr: read_u32(buf, context::OFFSET_MX_CSR),
+            xmm,
+            debug_control: if has_lbr {
+                read_u64(buf, context::OFFSET_DEBUG_CONTROL)
+            } else {
+                0
+            },
+            last_branch_to_rip: if has_lbr {
+                read_u64(buf, context::OFFSET_LAST_BRANCH_TO_RIP)
+            } else {
+                0
+            },
+            last_branch_from_rip: if has_lbr {
+                read_u64(buf, context::OFFSET_LAST_BRANCH_FROM_RIP)
+            } else {
+                0
+            },
+            last_exception_to_rip: if has_lbr {
+                read_u64(buf, context::OFFSET_LAST_EXCEPTION_TO_RIP)
+            } else {
+                0
+            },
+            last_exception_from_rip: if has_lbr {
+                read_u64(buf, context::OFFSET_LAST_EXCEPTION_FROM_RIP)
+            } else {
+                0
+            },
+        }
+    }
+
+    pub fn to_register_buffer(&self, directory_table_base: u64) -> Vec<u8> {
+        let mut data = vec![0u8; context::REGISTER_BUFFER_SIZE];
+
+        macro_rules! put_u64 {
+            ($off:expr, $val:expr) => {
+                data[$off..$off + 8].copy_from_slice(&($val).to_le_bytes());
+            };
+        }
+        macro_rules! put_u32 {
+            ($off:expr, $val:expr) => {
+                data[$off..$off + 4].copy_from_slice(&($val).to_le_bytes());
+            };
+        }
+        macro_rules! put_u16 {
+            ($off:expr, $val:expr) => {
+                data[$off..$off + 2].copy_from_slice(&($val).to_le_bytes());
+            };
+        }
+
+        put_u64!(context::OFFSET_RAX, self.rax);
+        put_u64!(context::OFFSET_RBX, self.rbx);
+        put_u64!(context::OFFSET_RCX, self.rcx);
+        put_u64!(context::OFFSET_RDX, self.rdx);
+        put_u64!(context::OFFSET_RSI, self.rsi);
+        put_u64!(context::OFFSET_RDI, self.rdi);
+        put_u64!(context::OFFSET_RBP, self.rbp);
+        put_u64!(context::OFFSET_RSP, self.rsp);
+        put_u64!(context::OFFSET_R8, self.r8);
+        put_u64!(context::OFFSET_R9, self.r9);
+        put_u64!(context::OFFSET_R10, self.r10);
+        put_u64!(context::OFFSET_R11, self.r11);
+        put_u64!(context::OFFSET_R12, self.r12);
+        put_u64!(context::OFFSET_R13, self.r13);
+        put_u64!(context::OFFSET_R14, self.r14);
+        put_u64!(context::OFFSET_R15, self.r15);
+        put_u64!(context::OFFSET_RIP, self.rip);
+        put_u32!(context::OFFSET_EFLAGS, self.eflags);
+        put_u16!(context::OFFSET_SEG_CS, self.cs);
+        put_u16!(context::OFFSET_SEG_DS, self.ds);
+        put_u16!(context::OFFSET_SEG_ES, self.es);
+        put_u16!(context::OFFSET_SEG_FS, self.fs);
+        put_u16!(context::OFFSET_SEG_GS, self.gs);
+        put_u16!(context::OFFSET_SEG_SS, self.ss);
+        put_u64!(context::OFFSET_DR0, self.dr0);
+        put_u64!(context::OFFSET_DR1, self.dr1);
+        put_u64!(context::OFFSET_DR2, self.dr2);
+        put_u64!(context::OFFSET_DR3, self.dr3);
+        put_u64!(context::OFFSET_DR6, self.dr6);
+        put_u64!(context::OFFSET_DR7, self.dr7);
+        put_u64!(context::OFFSET_CR3, directory_table_base);
+        put_u32!(context::OFFSET_MX_CSR, self.mxcsr);
+        for (i, &val) in self.xmm.iter().enumerate() {
+            let off = context::OFFSET_XMM0 + i * 16;
+            data[off..off + 16].copy_from_slice(&val.to_le_bytes());
+        }
+
+        data
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -61,13 +232,43 @@ pub struct DmpInfo {
     pub context: DmpContext,
     pub offset_prcb_context: Option<u16>,
     pub number_processors: u32,
+    pub is_triage: bool,
+    pub ps_loaded_module_list: u64,
+    pub ps_active_process_head: u64,
+    pub triage_drivers: Vec<crate::triage::TriageDriver>,
+    pub exception: Option<DmpException>,
+    pub system_info: Option<DmpSystemInfo>,
+    pub unloaded_drivers: Vec<UnloadedDriver>,
+    pub triage_process_snapshot: Option<Vec<u8>>,
+    pub triage_thread_snapshot: Option<Vec<u8>>,
+    pub triage_prcb_info: Option<crate::triage::TriagePrcbInfo>,
+    pub broken_driver: Option<String>,
+    pub triage_overflowed: bool,
+    pub kern_base: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TriageCrashInfo {
+    pub process_name: Option<String>,
+    pub process_id: Option<u64>,
+    pub parent_process_id: Option<u64>,
+    pub exit_status: Option<i32>,
+    pub create_time: Option<u64>,
+    pub thread_id: Option<u64>,
+    pub thread_exit_status: Option<i32>,
 }
 
 pub struct DmpMem {
     mmap: Mmap,
-    // Sorted by GPA; each entry is (page-aligned GPA, file byte offset)
-    pages: Vec<(u64, u64)>,
+    storage: DmpStorage,
     info: DmpInfo,
+}
+
+enum DmpStorage {
+    /// Full/BMP/kernel dump: sorted by page-aligned GPA
+    Pages(Vec<(u64, u64)>),
+    /// Triage dump: sorted by VA, variable-size regions
+    Blocks(Vec<crate::triage::TriageBlock>),
 }
 
 impl DmpMem {
@@ -75,8 +276,17 @@ impl DmpMem {
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
 
-        let parser = KernelDumpParser::new(path).map_err(|e| Error::InvalidDump(e.to_string()))?;
+        if crate::triage::is_triage_dump(&mmap) {
+            return Self::open_triage(mmap);
+        }
 
+        match KernelDumpParser::new(path) {
+            Ok(parser) => Self::open_full(mmap, parser),
+            Err(e) => Err(Error::InvalidDump(e.to_string())),
+        }
+    }
+
+    fn open_full(mmap: Mmap, parser: KernelDumpParser) -> Result<Self> {
         let mut pages: Vec<(u64, u64)> = parser
             .physmem()
             .map(|(gpa, offset)| (u64::from(gpa), offset))
@@ -88,12 +298,49 @@ impl DmpMem {
 
         let offset_prcb_context = Self::read_prcb_context_offset(&parser);
 
+        let exc = &hdr.exception;
+        let n_params = (exc.number_parameters as usize).min(15);
+        let exception = if exc.exception_code != 0 || exc.exception_address != 0 {
+            Some(DmpException {
+                code: exc.exception_code,
+                flags: exc.exception_flags,
+                address: exc.exception_address,
+                parameters: exc.exception_information[..n_params].to_vec(),
+            })
+        } else {
+            None
+        };
+
+        let system_info = Some(DmpSystemInfo {
+            major_version: hdr.major_version,
+            minor_version: hdr.minor_version,
+            system_time: hdr.system_time,
+            system_up_time: hdr.system_up_time,
+            product_type: hdr.product_type,
+            suite_mask: hdr.suite_mask,
+            machine_image_type: hdr.machine_image_type,
+            service_pack_build: 0,
+        });
+
         let info = DmpInfo {
             directory_table_base: hdr.directory_table_base,
             bug_check_code: hdr.bug_check_code,
             bug_check_parameters: hdr.bug_check_code_parameters,
             offset_prcb_context,
             number_processors: hdr.number_processors.max(1),
+            is_triage: false,
+            ps_loaded_module_list: hdr.ps_loaded_module_list,
+            ps_active_process_head: hdr.ps_active_process_head,
+            triage_drivers: Vec::new(),
+            exception,
+            system_info,
+            unloaded_drivers: Vec::new(),
+            triage_process_snapshot: None,
+            triage_thread_snapshot: None,
+            triage_prcb_info: None,
+            broken_driver: None,
+            triage_overflowed: false,
+            kern_base: None,
             context: DmpContext {
                 rax: ctx.rax,
                 rbx: ctx.rbx,
@@ -125,10 +372,31 @@ impl DmpMem {
                 dr3: ctx.dr3,
                 dr6: ctx.dr6,
                 dr7: ctx.dr7,
+                mxcsr: ctx.mxcsr,
+                xmm: ctx.xmm_registers,
+                debug_control: ctx.debug_control,
+                last_branch_to_rip: ctx.last_branch_to_rip,
+                last_branch_from_rip: ctx.last_branch_from_rip,
+                last_exception_to_rip: ctx.last_exception_to_rip,
+                last_exception_from_rip: ctx.last_exception_from_rip,
             },
         };
 
-        Ok(Self { mmap, pages, info })
+        Ok(Self {
+            mmap,
+            storage: DmpStorage::Pages(pages),
+            info,
+        })
+    }
+
+    fn open_triage(mmap: Mmap) -> Result<Self> {
+        let (mut info, blocks) = crate::triage::parse_triage(&mmap)?;
+        info.triage_drivers = crate::triage::parse_drivers(&mmap);
+        Ok(Self {
+            mmap,
+            storage: DmpStorage::Blocks(blocks),
+            info,
+        })
     }
 
     fn read_prcb_context_offset(parser: &KernelDumpParser) -> Option<u16> {
@@ -147,15 +415,66 @@ impl DmpMem {
     pub fn new_for_test(pages: Vec<(u64, u64)>, info: DmpInfo) -> Self {
         use memmap2::MmapMut;
         let mmap = MmapMut::map_anon(1).unwrap().make_read_only().unwrap();
-        Self { mmap, pages, info }
+        Self {
+            mmap,
+            storage: DmpStorage::Pages(pages),
+            info,
+        }
     }
 
-    fn lookup_page(&self, gpa: u64) -> Option<u64> {
-        let page_gpa = gpa & !(PAGE_SIZE as u64 - 1);
-        self.pages
-            .binary_search_by_key(&page_gpa, |&(g, _)| g)
-            .ok()
-            .map(|idx| self.pages[idx].1)
+    #[cfg(test)]
+    pub fn new_triage_for_test(
+        data: Vec<u8>,
+        blocks: Vec<crate::triage::TriageBlock>,
+        info: DmpInfo,
+    ) -> Self {
+        use memmap2::MmapMut;
+        let mut mmap_mut = MmapMut::map_anon(data.len()).unwrap();
+        mmap_mut.copy_from_slice(&data);
+        let mmap = mmap_mut.make_read_only().unwrap();
+        Self {
+            mmap,
+            storage: DmpStorage::Blocks(blocks),
+            info,
+        }
+    }
+
+    /// Resolve an address to `(file_offset, max_bytes)` — the exact file
+    /// position and the number of contiguous bytes available from there.
+    fn lookup(&self, addr: u64) -> Option<(u64, usize)> {
+        match &self.storage {
+            DmpStorage::Pages(pages) => {
+                let page_gpa = addr & !(PAGE_SIZE as u64 - 1);
+                let page_offset = (addr as usize) & (PAGE_SIZE - 1);
+                let idx = pages.binary_search_by_key(&page_gpa, |&(g, _)| g).ok()?;
+                Some((pages[idx].1 + page_offset as u64, PAGE_SIZE - page_offset))
+            }
+            DmpStorage::Blocks(blocks) => {
+                let idx = blocks.partition_point(|b| b.address <= addr);
+                // Scan backwards: the nearest-start block may not contain addr
+                // when a smaller overlapping block shadows a larger one.
+                for i in (0..idx).rev() {
+                    let block = &blocks[i];
+                    let offset_in_block = addr - block.address;
+                    if offset_in_block < block.size as u64 {
+                        return Some((
+                            block.offset + offset_in_block,
+                            (block.size as u64 - offset_in_block) as usize,
+                        ));
+                    }
+                }
+                None
+            }
+        }
+    }
+}
+
+impl DmpMem {
+    fn bad_address_error(&self, addr: u64) -> Error {
+        match &self.storage {
+            DmpStorage::Blocks(_) => Error::AddressNotInDump(VirtAddr(addr)),
+            DmpStorage::Pages(_) => Error::BadPhysicalAddress(addr),
+        }
     }
 }
 
@@ -164,17 +483,15 @@ impl MemoryOps<PhysAddr> for DmpMem {
         let mut offset = 0usize;
         while offset < buf.len() {
             let cur_addr = addr + offset as u64;
-            let page_offset = (cur_addr as usize) & (PAGE_SIZE - 1);
-            let chunk = (PAGE_SIZE - page_offset).min(buf.len() - offset);
+            let (file_offset, available) = self
+                .lookup(cur_addr)
+                .ok_or_else(|| self.bad_address_error(cur_addr))?;
+            let chunk = available.min(buf.len() - offset);
 
-            let file_offset = self
-                .lookup_page(cur_addr)
-                .ok_or(Error::BadPhysicalAddress(cur_addr))?;
-
-            let start = file_offset as usize + page_offset;
+            let start = file_offset as usize;
             let end = start + chunk;
             if end > self.mmap.len() {
-                return Err(Error::BadPhysicalAddress(cur_addr));
+                return Err(self.bad_address_error(cur_addr));
             }
             buf[offset..offset + chunk].copy_from_slice(&self.mmap[start..end]);
             offset += chunk;
@@ -202,6 +519,7 @@ pub struct DmpBackend {
     // `select_crash_processor`)
     header_context: DmpContext,
     directory_table_base: u64,
+    triage_crash_info: Option<TriageCrashInfo>,
 }
 
 impl DmpBackend {
@@ -228,66 +546,21 @@ impl DmpBackend {
             prcb_context_offset: info.offset_prcb_context,
             header_context: info.context.clone(),
             directory_table_base: info.directory_table_base,
+            triage_crash_info: None,
         }
     }
 
     fn build_register_buffer(ctx: &DmpContext, directory_table_base: u64) -> Vec<u8> {
-        let mut data = vec![0u8; context::REGISTER_BUFFER_SIZE];
-
-        macro_rules! put_u64 {
-            ($off:expr, $val:expr) => {
-                data[$off..$off + 8].copy_from_slice(&($val).to_le_bytes());
-            };
-        }
-        macro_rules! put_u32 {
-            ($off:expr, $val:expr) => {
-                data[$off..$off + 4].copy_from_slice(&($val).to_le_bytes());
-            };
-        }
-        macro_rules! put_u16 {
-            ($off:expr, $val:expr) => {
-                data[$off..$off + 2].copy_from_slice(&($val).to_le_bytes());
-            };
-        }
-
-        put_u64!(context::OFFSET_RAX, ctx.rax);
-        put_u64!(context::OFFSET_RBX, ctx.rbx);
-        put_u64!(context::OFFSET_RCX, ctx.rcx);
-        put_u64!(context::OFFSET_RDX, ctx.rdx);
-        put_u64!(context::OFFSET_RSI, ctx.rsi);
-        put_u64!(context::OFFSET_RDI, ctx.rdi);
-        put_u64!(context::OFFSET_RBP, ctx.rbp);
-        put_u64!(context::OFFSET_RSP, ctx.rsp);
-        put_u64!(context::OFFSET_R8, ctx.r8);
-        put_u64!(context::OFFSET_R9, ctx.r9);
-        put_u64!(context::OFFSET_R10, ctx.r10);
-        put_u64!(context::OFFSET_R11, ctx.r11);
-        put_u64!(context::OFFSET_R12, ctx.r12);
-        put_u64!(context::OFFSET_R13, ctx.r13);
-        put_u64!(context::OFFSET_R14, ctx.r14);
-        put_u64!(context::OFFSET_R15, ctx.r15);
-        put_u64!(context::OFFSET_RIP, ctx.rip);
-        put_u32!(context::OFFSET_EFLAGS, ctx.eflags);
-        put_u16!(context::OFFSET_SEG_CS, ctx.cs);
-        put_u16!(context::OFFSET_SEG_DS, ctx.ds);
-        put_u16!(context::OFFSET_SEG_ES, ctx.es);
-        put_u16!(context::OFFSET_SEG_FS, ctx.fs);
-        put_u16!(context::OFFSET_SEG_GS, ctx.gs);
-        put_u16!(context::OFFSET_SEG_SS, ctx.ss);
-        put_u64!(context::OFFSET_DR0, ctx.dr0);
-        put_u64!(context::OFFSET_DR1, ctx.dr1);
-        put_u64!(context::OFFSET_DR2, ctx.dr2);
-        put_u64!(context::OFFSET_DR3, ctx.dr3);
-        put_u64!(context::OFFSET_DR6, ctx.dr6);
-        put_u64!(context::OFFSET_DR7, ctx.dr7);
-        put_u64!(context::OFFSET_CR3, directory_table_base);
-
-        data
+        ctx.to_register_buffer(directory_table_base)
     }
 
     fn read_prcb_contexts(&mut self, target: &Target, prcb_ctx_offset: u16) -> Result<()> {
-        let memory = target.guest.ntoskrnl.memory();
-        let processor_block = target.guest.ntoskrnl.symbol("KiProcessorBlock")?.address();
+        let memory = target.guest()?.ntoskrnl.memory();
+        let processor_block = target
+            .guest()?
+            .ntoskrnl
+            .symbol("KiProcessorBlock")?
+            .address();
 
         for i in 0..self.per_cpu_registers.len() {
             let prcb: VirtAddr = memory.read(processor_block + (i as u64) * 8)?;
@@ -341,6 +614,88 @@ impl DmpBackend {
         }
     }
 
+    fn read_u64_field(snap: &[u8], layout: &crate::symbols::TypeInfo, field: &str) -> Option<u64> {
+        let off = layout.field_offset(field).ok()? as usize;
+        if off + 8 <= snap.len() {
+            Some(u64::from_le_bytes(snap[off..off + 8].try_into().ok()?))
+        } else {
+            None
+        }
+    }
+
+    fn read_i32_field(snap: &[u8], layout: &crate::symbols::TypeInfo, field: &str) -> Option<i32> {
+        let off = layout.field_offset(field).ok()? as usize;
+        if off + 4 <= snap.len() {
+            Some(i32::from_le_bytes(snap[off..off + 4].try_into().ok()?))
+        } else {
+            None
+        }
+    }
+
+    fn extract_triage_crash_info(target: &Target, info: &DmpInfo) -> Option<TriageCrashInfo> {
+        let proc_snap = info.triage_process_snapshot.as_deref()?;
+        let dtb = target.kernel_dtb();
+
+        let eprocess_layout = target.symbols.find_type_across_modules(dtb, "_EPROCESS")?;
+
+        let process_name = eprocess_layout
+            .field_offset("ImageFileName")
+            .ok()
+            .and_then(|off| {
+                let off = off as usize;
+                if off + 15 <= proc_snap.len() {
+                    let name_buf = &proc_snap[off..off + 15];
+                    let end = name_buf.iter().position(|&c| c == 0).unwrap_or(15);
+                    let s = String::from_utf8_lossy(&name_buf[..end]).to_string();
+                    if s.is_empty() { None } else { Some(s) }
+                } else {
+                    None
+                }
+            });
+
+        let process_id = Self::read_u64_field(proc_snap, &eprocess_layout, "UniqueProcessId");
+        let parent_process_id =
+            Self::read_u64_field(proc_snap, &eprocess_layout, "InheritedFromUniqueProcessId");
+        let exit_status = Self::read_i32_field(proc_snap, &eprocess_layout, "ExitStatus");
+        let create_time = Self::read_u64_field(proc_snap, &eprocess_layout, "CreateTime");
+
+        let (thread_id, thread_exit_status) = info
+            .triage_thread_snapshot
+            .as_deref()
+            .and_then(|thread_snap| {
+                let ethread_layout = target.symbols.find_type_across_modules(dtb, "_ETHREAD")?;
+                let cid_off = ethread_layout.field_offset("Cid").ok()? as usize;
+                let client_id_layout =
+                    target.symbols.find_type_across_modules(dtb, "_CLIENT_ID")?;
+                let ut_off = client_id_layout.field_offset("UniqueThread").ok()? as usize;
+                let off = cid_off + ut_off;
+                let tid = if off + 8 <= thread_snap.len() {
+                    Some(u64::from_le_bytes(
+                        thread_snap[off..off + 8].try_into().ok()?,
+                    ))
+                } else {
+                    None
+                };
+                let exit_st = Self::read_i32_field(thread_snap, &ethread_layout, "ExitStatus");
+                Some((tid, exit_st))
+            })
+            .unwrap_or((None, None));
+
+        Some(TriageCrashInfo {
+            process_name,
+            process_id,
+            parent_process_id,
+            exit_status,
+            create_time,
+            thread_id,
+            thread_exit_status,
+        })
+    }
+
+    pub fn triage_crash_info(&self) -> Option<&TriageCrashInfo> {
+        self.triage_crash_info.as_ref()
+    }
+
     fn unsupported(operation: &str) -> Error {
         Error::DebugInfo(format!(
             "crash dump is a static snapshot; {operation} is not available"
@@ -348,22 +703,25 @@ impl DmpBackend {
     }
 }
 
-fn buffer_u64(buf: &[u8], offset: usize) -> u64 {
-    u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap())
-}
-
 impl DebugBackend for DmpBackend {
     fn name(&self) -> &'static str {
         "dmp"
     }
     fn initialize_from_target(&mut self, target: &Target) {
-        let Some(offset) = self.prcb_context_offset else {
-            return;
-        };
-        if let Err(e) = self.read_prcb_contexts(target, offset) {
-            diagnostics::eprint_warning(format!("could not read PRCB contexts from dump: {e}"));
+        if let Some(offset) = self.prcb_context_offset {
+            if let Err(e) = self.read_prcb_contexts(target, offset) {
+                diagnostics::eprint_warning(format!("could not read PRCB contexts from dump: {e}"));
+            }
+            self.select_crash_processor();
         }
-        self.select_crash_processor();
+
+        if let Some(info) = target.phys.dmp_info() {
+            self.triage_crash_info = Self::extract_triage_crash_info(target, info);
+        }
+    }
+
+    fn triage_crash_info(&self) -> Option<&TriageCrashInfo> {
+        self.triage_crash_info.as_ref()
     }
 
     fn register_map(&self) -> &RegisterMap {
@@ -384,8 +742,8 @@ impl DebugBackend for DmpBackend {
             BackendCapability::unsupported(DebugCapability::UserModeBreakpoints),
             BackendCapability::unsupported(DebugCapability::TargetReloadDetection),
             BackendCapability::unsupported(DebugCapability::KernelBaseHint),
-            BackendCapability::unsupported(DebugCapability::BugcheckDetection),
-            BackendCapability::unsupported(DebugCapability::BugcheckDetails),
+            BackendCapability::supported(DebugCapability::BugcheckDetection),
+            BackendCapability::supported(DebugCapability::BugcheckDetails),
             BackendCapability::unsupported(DebugCapability::DebugOutput),
         ]
     }
@@ -475,6 +833,19 @@ mod tests {
             bug_check_parameters: [0xdead, 0, 0, 0],
             offset_prcb_context: None,
             number_processors: 1,
+            is_triage: false,
+            ps_loaded_module_list: 0,
+            ps_active_process_head: 0,
+            triage_drivers: Vec::new(),
+            exception: None,
+            system_info: None,
+            unloaded_drivers: Vec::new(),
+            triage_process_snapshot: None,
+            triage_thread_snapshot: None,
+            triage_prcb_info: None,
+            broken_driver: None,
+            triage_overflowed: false,
+            kern_base: None,
             context: DmpContext {
                 rax: 0x1111111111111111,
                 rbx: 0x2222222222222222,
@@ -506,6 +877,13 @@ mod tests {
                 dr3: 0,
                 dr6: 0,
                 dr7: 0,
+                mxcsr: 0,
+                xmm: [0; 16],
+                debug_control: 0,
+                last_branch_to_rip: 0,
+                last_branch_from_rip: 0,
+                last_exception_to_rip: 0,
+                last_exception_from_rip: 0,
             },
         }
     }
@@ -625,7 +1003,7 @@ mod tests {
     }
 
     #[test]
-    fn dmp_mem_lookup_page() {
+    fn dmp_mem_lookup() {
         let pages = vec![
             (0x0000u64, 0x2000u64),
             (0x1000, 0x3000),
@@ -635,16 +1013,16 @@ mod tests {
         ];
         let mem = DmpMem::new_for_test(pages, make_test_info());
 
-        assert_eq!(mem.lookup_page(0x0000), Some(0x2000));
-        assert_eq!(mem.lookup_page(0x0100), Some(0x2000));
-        assert_eq!(mem.lookup_page(0x0FFF), Some(0x2000));
-        assert_eq!(mem.lookup_page(0x1000), Some(0x3000));
-        assert_eq!(mem.lookup_page(0x1500), Some(0x3000));
-        assert_eq!(mem.lookup_page(0x5000), Some(0x5000));
+        assert_eq!(mem.lookup(0x0000), Some((0x2000, 0x1000)));
+        assert_eq!(mem.lookup(0x0100), Some((0x2100, 0x0F00)));
+        assert_eq!(mem.lookup(0x0FFF), Some((0x2FFF, 0x0001)));
+        assert_eq!(mem.lookup(0x1000), Some((0x3000, 0x1000)));
+        assert_eq!(mem.lookup(0x1500), Some((0x3500, 0x0B00)));
+        assert_eq!(mem.lookup(0x5000), Some((0x5000, 0x1000)));
         // Page not present in dump
-        assert_eq!(mem.lookup_page(0x3000), None);
-        assert_eq!(mem.lookup_page(0x4000), None);
-        assert_eq!(mem.lookup_page(0x8000), None);
+        assert_eq!(mem.lookup(0x3000), None);
+        assert_eq!(mem.lookup(0x4000), None);
+        assert_eq!(mem.lookup(0x8000), None);
     }
 
     #[test]
@@ -692,5 +1070,85 @@ mod tests {
             map.read_u64("cr3", &data).unwrap(),
             info.directory_table_base
         );
+    }
+
+    #[test]
+    fn triage_mem_read_within_block() {
+        use crate::triage::TriageBlock;
+
+        let mut data = vec![0u8; 0x4000];
+        // Block at VA 0xfffff80000001000, file offset 0x3000, size 0x100
+        // Fill the file region with recognizable data
+        for i in 0..0x100usize {
+            data[0x3000 + i] = i as u8;
+        }
+
+        let blocks = vec![TriageBlock {
+            address: 0xfffff80000001000,
+            offset: 0x3000,
+            size: 0x100,
+        }];
+
+        let mut info = make_test_info();
+        info.is_triage = true;
+
+        let mem = DmpMem::new_triage_for_test(data, blocks, info);
+
+        // Read from the middle of the block
+        let mut buf = [0u8; 4];
+        mem.read_bytes(0xfffff80000001010u64, &mut buf).unwrap();
+        assert_eq!(buf, [0x10, 0x11, 0x12, 0x13]);
+
+        // Read past the block should fail
+        let mut buf = [0u8; 1];
+        assert!(mem.read_bytes(0xfffff80000001100u64, &mut buf).is_err());
+    }
+
+    #[test]
+    fn triage_overlapping_blocks_fallback() {
+        use crate::triage::TriageBlock;
+
+        let mut data = vec![0u8; 0x8000];
+        // Large block A: VA 0x1000, size 0x3000, at file offset 0x2000
+        for i in 0..0x3000usize {
+            data[0x2000 + i] = 0xAA;
+        }
+        // Small block B: VA 0x2000, size 0x1000, at file offset 0x5000
+        for i in 0..0x1000usize {
+            data[0x5000 + i] = 0xBB;
+        }
+
+        let blocks = vec![
+            TriageBlock {
+                address: 0x1000,
+                offset: 0x2000,
+                size: 0x3000,
+            },
+            TriageBlock {
+                address: 0x2000,
+                offset: 0x5000,
+                size: 0x1000,
+            },
+        ];
+
+        let mut info = make_test_info();
+        info.is_triage = true;
+        let mem = DmpMem::new_triage_for_test(data, blocks, info);
+
+        // Address in block A only (before B starts)
+        let mut buf = [0u8; 1];
+        mem.read_bytes(0x1500u64, &mut buf).unwrap();
+        assert_eq!(buf[0], 0xAA);
+
+        // Address in the overlap region — B wins (highest start <= addr)
+        mem.read_bytes(0x2500u64, &mut buf).unwrap();
+        assert_eq!(buf[0], 0xBB);
+
+        // Address past B's end but still within A — must fall back to A
+        mem.read_bytes(0x3100u64, &mut buf).unwrap();
+        assert_eq!(buf[0], 0xAA);
+
+        // Address past both blocks
+        assert!(mem.read_bytes(0x4100u64, &mut buf).is_err());
     }
 }

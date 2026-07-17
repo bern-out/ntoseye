@@ -4,7 +4,8 @@ use pelite::pe64::{Pe, PeView, image::IMAGE_SCN_MEM_EXECUTE};
 
 use crate::backend::MemoryOps;
 use crate::dbg_backend::{
-    DebugBackend, HW_BREAKPOINT_SLOTS, HwBreakpointAccess, WatchpointAccess, validate_hw_breakpoint,
+    DebugBackend, DebugCapability, HW_BREAKPOINT_SLOTS, HwBreakpointAccess, WatchpointAccess,
+    validate_hw_breakpoint,
 };
 use crate::error::{Error, Result};
 use crate::expr::Expr;
@@ -219,8 +220,18 @@ impl BreakpointManager {
     ) -> Result<u32> {
         let condition_expr = Self::compile_condition(condition.as_deref())?;
         let scope = Self::scope_for_current_context(debugger);
+        let caps = client.capabilities();
         if matches!(scope, BreakpointScope::Process { .. })
-            && !client.supports_user_mode_breakpoints()
+            && !caps
+                .iter()
+                .any(|c| c.capability == DebugCapability::UserModeBreakpoints && c.supported)
+        {
+            return Err(Error::NotSupported);
+        }
+        if matches!(scope, BreakpointScope::Kernel)
+            && !caps
+                .iter()
+                .any(|c| c.capability == DebugCapability::KernelBreakpoints && c.supported)
         {
             return Err(Error::NotSupported);
         }
@@ -681,7 +692,6 @@ impl BreakpointManager {
         address: VirtAddr,
     ) -> Option<ModuleInfo> {
         debugger
-            .guest
             .kernel_modules()
             .ok()?
             .into_iter()

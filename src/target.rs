@@ -19,9 +19,13 @@ use crate::{
 pub struct Target {
     pub phys: Arc<PhysMem>,
     pub symbols: Arc<SymbolStore>,
-    pub guest: Guest,
+    pub guest: Option<Guest>,
     pub current_process: Option<WinObject>,
     pub current_process_info: Option<ProcessInfo>,
+    /// Bare WinObject for triage dumps without a discovered kernel, providing
+    /// identity-mapped memory access so commands like disassemble/search work.
+    triage_fallback: Option<WinObject>,
+    triage_modules_cache: Option<Vec<ModuleInfo>>,
     context_dtb_override: Option<Dtb>,
     pub registers: Option<HashMap<String, u64>>,
     /// Windows thread metadata for the currently inspected live vCPU context.
@@ -482,6 +486,32 @@ pub struct PteWalk {
 }
 
 impl Target {
+    /// Access the guest, returning `Err(NtoskrnlNotFound)` when no kernel was
+    /// discovered (e.g. triage dumps that don't contain the kernel PE header).
+    pub fn guest(&self) -> Result<&Guest> {
+        self.guest.as_ref().ok_or(Error::NtoskrnlNotFound)
+    }
+
+    pub fn kernel_base(&self) -> Option<VirtAddr> {
+        self.guest
+            .as_ref()
+            .map(|g| g.ntoskrnl.base_address)
+            .or_else(|| {
+                self.triage_modules_cache.as_ref().and_then(|mods| {
+                    mods.iter()
+                        .find(|m| m.name.to_ascii_lowercase().contains("ntoskrnl"))
+                        .map(|m| m.base_address)
+                })
+            })
+    }
+
+    pub fn kernel_dtb(&self) -> Dtb {
+        self.guest
+            .as_ref()
+            .map(|g| g.ntoskrnl.dtb())
+            .unwrap_or(crate::memory::DTB_IDENTITY)
+    }
+
     pub fn new() -> Result<Self> {
         Self::with_phys(Arc::new(PhysMem::kvm()?))
     }
@@ -489,12 +519,51 @@ impl Target {
     pub fn with_phys(phys: Arc<PhysMem>) -> Result<Self> {
         let symbols = Arc::new(SymbolStore::new());
         let guest = if let Some(info) = phys.dmp_info() {
-            Guest::new_with_dtb(phys.clone(), symbols.clone(), info.directory_table_base)?
+            let dtb = if info.is_triage {
+                crate::memory::DTB_IDENTITY
+            } else {
+                info.directory_table_base
+            };
+            match Guest::new_with_dtb(phys.clone(), symbols.clone(), dtb) {
+                Ok(g) => Some(g),
+                Err(Error::NtoskrnlNotFound) if info.is_triage => None,
+                Err(e) => return Err(e),
+            }
         } else {
-            Guest::new(phys.clone(), symbols.clone())?
+            Some(Guest::new(phys.clone(), symbols.clone())?)
         };
 
-        let _ = guest.load_all_kernel_module_symbols(&phys, &symbols);
+        // Pre-compute the triage module list once for both symbol loading and
+        // the cached fallback returned by kernel_modules().
+        let triage_modules: Option<Vec<ModuleInfo>> = phys
+            .dmp_info()
+            .filter(|info| info.is_triage && !info.triage_drivers.is_empty())
+            .map(|info| {
+                info.triage_drivers
+                    .iter()
+                    .map(|d| d.to_module_info())
+                    .collect()
+            });
+
+        if let Some(ref guest) = guest {
+            let _ = guest.load_all_kernel_module_symbols(&phys, &symbols);
+        } else if let Some(ref modules) = triage_modules {
+            let dtb = crate::memory::DTB_IDENTITY;
+            let _ = Guest::load_module_symbols(&phys, &symbols, modules.clone(), dtb, false);
+        }
+
+        let triage_fallback = if guest.is_none() {
+            Some(WinObject::new(
+                phys.clone(),
+                symbols.clone(),
+                crate::memory::DTB_IDENTITY,
+                VirtAddr(0),
+            ))
+        } else {
+            None
+        };
+
+        let triage_modules_cache = triage_modules;
 
         Ok(Self {
             phys,
@@ -502,6 +571,8 @@ impl Target {
             guest,
             current_process: None,
             current_process_info: None,
+            triage_fallback,
+            triage_modules_cache,
             context_dtb_override: None,
             registers: None,
             current_windows_thread: None,
@@ -511,10 +582,20 @@ impl Target {
         })
     }
 
-    pub fn current_process(&self) -> &WinObject {
+    pub fn current_process(&self) -> Result<&WinObject> {
         match &self.current_process {
-            Some(p) => p,
-            None => &self.guest.ntoskrnl,
+            Some(p) => Ok(p),
+            None => match &self.guest {
+                Some(g) => Ok(&g.ntoskrnl),
+                None => self.triage_fallback.as_ref().ok_or(Error::NtoskrnlNotFound),
+            },
+        }
+    }
+
+    pub fn kernel_modules(&self) -> Result<Vec<ModuleInfo>> {
+        match self.guest() {
+            Ok(g) => g.kernel_modules().or_else(|_| self.triage_modules()),
+            Err(_) => self.triage_modules(),
         }
     }
 
@@ -523,9 +604,15 @@ impl Target {
     /// list. Shared by the REPL `lm`, the SDK, and MCP.
     pub fn modules(&self) -> Result<Vec<ModuleInfo>> {
         match &self.current_process_info {
-            Some(process) => self.guest.process_modules(process),
-            None => self.guest.kernel_modules(),
+            Some(process) => self.guest()?.process_modules(process),
+            None => self.kernel_modules(),
         }
+    }
+
+    fn triage_modules(&self) -> Result<Vec<ModuleInfo>> {
+        self.triage_modules_cache
+            .clone()
+            .ok_or(Error::NtoskrnlNotFound)
     }
 
     /// Search `length` bytes from `start` in the current address space for the
@@ -536,7 +623,7 @@ impl Target {
             return Ok(Vec::new());
         }
         let mut buf = vec![0u8; length];
-        self.current_process()
+        self.current_process()?
             .memory()
             .read_bytes(start, &mut buf)?;
         Ok((0..=buf.len() - pattern.len())
@@ -585,7 +672,7 @@ impl Target {
     /// walking; the typed cursor walk (`StructRef::list`) is the richer form.
     pub fn walk_list(&self, head: VirtAddr, link_offset: u64) -> Result<Vec<u64>> {
         const MAX: usize = 1000;
-        let mem = self.current_process().memory();
+        let mem = self.current_process()?.memory();
         let mut buf = [0u8; 8];
         mem.read_bytes(head, &mut buf)?;
         let mut current = u64::from_le_bytes(buf);
@@ -611,10 +698,33 @@ impl Target {
     /// Rust `String` (empty when null/zero-length). `Length`/`Buffer` come from
     /// the PDB layout, not hardcoded offsets. Shared by the SDK and MCP.
     pub fn read_unicode_string(&self, addr: VirtAddr) -> Result<String> {
-        self.current_process()
-            .types()
-            .struct_at("_UNICODE_STRING", addr)?
-            .read_unicode_string()
+        let proc = self.current_process()?;
+        match proc.types().struct_at("_UNICODE_STRING", addr) {
+            Ok(s) => s.read_unicode_string(),
+            Err(Error::ExpectedSymbols) => {
+                let dtb = self.kernel_dtb();
+                let ti = self
+                    .symbols
+                    .find_type_across_modules(dtb, "_UNICODE_STRING")
+                    .ok_or(Error::ExpectedSymbols)?;
+                let mem = proc.memory();
+                let len_off = ti.field_offset("Length")? as u64;
+                let buf_off = ti.field_offset("Buffer")? as u64;
+                let length: u16 = mem.read(addr + len_off)?;
+                let buffer: VirtAddr = mem.read(addr + buf_off)?;
+                if length == 0 || buffer.is_zero() {
+                    return Ok(String::new());
+                }
+                let mut buf = vec![0u8; length as usize];
+                mem.read_bytes(buffer, &mut buf)?;
+                let u16s: Vec<u16> = buf
+                    .chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .collect();
+                Ok(String::from_utf16_lossy(&u16s))
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Read a NUL-terminated byte string (`CHAR*`) at `addr` in the current
@@ -624,7 +734,7 @@ impl Target {
     /// completely unmapped start address errors. The `CHAR*` counterpart to
     /// [`read_unicode_string`](Self::read_unicode_string).
     pub fn read_c_string(&self, addr: VirtAddr, max_len: usize) -> Result<String> {
-        let mem = self.current_process().memory();
+        let mem = self.current_process()?.memory();
         let mut bytes = Vec::new();
         while bytes.len() < max_len {
             let cur = addr + bytes.len() as u64;
@@ -648,7 +758,7 @@ impl Target {
     }
 
     pub fn attach(&mut self, pid: u64) -> Result<AttachReport> {
-        let processes = self.guest.enumerate_processes()?;
+        let processes = self.guest()?.enumerate_processes()?;
         let process_info = processes
             .iter()
             .find(|p| p.pid == pid)
@@ -660,12 +770,12 @@ impl Target {
 
     pub fn attach_process_info(&mut self, process_info: ProcessInfo) -> Result<AttachReport> {
         let name = process_info.name.clone();
+        let guest = self.guest.as_ref().ok_or(Error::NtoskrnlNotFound)?;
 
         let symbol_report =
-            self.guest
-                .load_all_process_module_symbols(&self.phys, &self.symbols, &process_info);
+            guest.load_all_process_module_symbols(&self.phys, &self.symbols, &process_info);
 
-        let winobj = self.guest.winobj_from_process_info(&process_info)?;
+        let winobj = guest.winobj_from_process_info(&process_info)?;
 
         self.current_process = Some(winobj);
         self.current_process_info = Some(process_info);
@@ -717,7 +827,7 @@ impl Target {
 
         match name.as_str() {
             "dtb" => Some(self.current_dtb()),
-            "ntbase" | "kernelbase" => Some(self.guest.ntoskrnl.base_address.0),
+            "ntbase" | "kernelbase" => self.guest.as_ref().map(|g| g.ntoskrnl.base_address.0),
             "processbase" | "imagebase" => self.current_process.as_ref().map(|p| p.base_address.0),
             "processdtb" => self.current_process_info.as_ref().map(|p| p.dtb),
             "attachedeprocess" | "attachedprocess" => {
@@ -731,18 +841,19 @@ impl Target {
     }
 
     pub fn builtin_variables(&self) -> Vec<BuiltinVar> {
-        let mut vars = vec![
-            BuiltinVar {
-                name: "dtb",
-                value: self.current_dtb(),
-                source: "current address space",
-            },
-            BuiltinVar {
+        let mut vars = vec![BuiltinVar {
+            name: "dtb",
+            value: self.current_dtb(),
+            source: "current address space",
+        }];
+
+        if let Some(ref guest) = self.guest {
+            vars.push(BuiltinVar {
                 name: "ntbase",
-                value: self.guest.ntoskrnl.base_address.0,
+                value: guest.ntoskrnl.base_address.0,
                 source: "kernel base",
-            },
-        ];
+            });
+        }
 
         if let Some(process) = &self.current_process_info {
             vars.extend([
@@ -859,8 +970,12 @@ impl Target {
         &mut self,
         kernel_base_hint: Option<VirtAddr>,
     ) -> Result<ReloadReport> {
-        let previous_base_address = self.guest.ntoskrnl.base_address;
-        let previous_dtb = self.guest.ntoskrnl.dtb();
+        let previous_base_address = self
+            .guest
+            .as_ref()
+            .map(|g| g.ntoskrnl.base_address)
+            .unwrap_or(VirtAddr(0));
+        let previous_dtb = self.guest.as_ref().map(|g| g.ntoskrnl.dtb());
         let guest = Guest::new_with_kernel_base_hint(
             self.phys.clone(),
             self.symbols.clone(),
@@ -868,21 +983,24 @@ impl Target {
         )?;
         let new_dtb = guest.ntoskrnl.dtb();
 
-        self.symbols.clear_modules_for_dtb(previous_dtb);
+        if let Some(prev_dtb) = previous_dtb {
+            self.symbols.clear_modules_for_dtb(prev_dtb);
+        }
         self.symbols.clear_modules_for_dtb(new_dtb);
-        self.guest = guest;
+
+        let (symbol_report, symbol_error) =
+            match guest.load_all_kernel_module_symbols(&self.phys, &self.symbols) {
+                Ok(report) => (Some(report), None),
+                Err(e) => (None, Some(e.to_string())),
+            };
+
+        self.guest = Some(guest);
+        self.triage_fallback = None;
+        self.triage_modules_cache = None;
         self.detach();
         self.clear_context_dtb_override();
         self.registers = None;
         self.clear_current_windows_thread_context();
-
-        let (symbol_report, symbol_error) = match self
-            .guest
-            .load_all_kernel_module_symbols(&self.phys, &self.symbols)
-        {
-            Ok(report) => (Some(report), None),
-            Err(e) => (None, Some(e.to_string())),
-        };
         let startup = self.startup_message_data().ok();
 
         Ok(ReloadReport {
@@ -894,23 +1012,40 @@ impl Target {
     }
 
     pub fn current_kernel_mapping_is_valid(&self) -> bool {
-        let memory = self.guest.ntoskrnl.memory();
+        if self.triage_fallback.is_some() {
+            return true;
+        }
+        // Triage dumps capture kernel state at bugcheck time — it is
+        // coherent by definition.  The MZ check below guards against
+        // undetected reboots on live VMs, which can't happen for dumps.
+        // The ntoskrnl base page is often not captured in triage dumps,
+        // so the MZ read would fail even though the state is valid.
+        if self.phys.dmp_info().is_some_and(|i| i.is_triage) {
+            return true;
+        }
+        let Some(ref guest) = self.guest else {
+            return false;
+        };
+        let memory = guest.ntoskrnl.memory();
         let mut signature = [0u8; 2];
         memory
-            .read_bytes(self.guest.ntoskrnl.base_address, &mut signature)
+            .read_bytes(guest.ntoskrnl.base_address, &mut signature)
             .is_ok_and(|()| signature == *b"MZ")
     }
 
     pub fn rediscovered_kernel_identity_changed(&self) -> Result<bool> {
+        let current_guest = self.guest()?;
         let guest = Guest::new(self.phys.clone(), self.symbols.clone())?;
         Ok(
-            guest.ntoskrnl.base_address != self.guest.ntoskrnl.base_address
-                || guest.ntoskrnl.dtb() != self.guest.ntoskrnl.dtb(),
+            guest.ntoskrnl.base_address != current_guest.ntoskrnl.base_address
+                || guest.ntoskrnl.dtb() != current_guest.ntoskrnl.dtb(),
         )
     }
 
     pub fn refresh_kernel_module_symbols(&self) -> Result<ModuleSymbolLoadReport> {
         self.guest
+            .as_ref()
+            .ok_or(Error::NtoskrnlNotFound)?
             .load_missing_kernel_module_symbols(&self.phys, &self.symbols)
     }
 
@@ -928,7 +1063,7 @@ impl Target {
             Some(p) => p.dtb(),
             None => self
                 .context_dtb_override
-                .unwrap_or_else(|| self.guest.ntoskrnl.dtb()),
+                .unwrap_or_else(|| self.kernel_dtb()),
         }
     }
 
@@ -943,7 +1078,7 @@ impl Target {
         self.symbols
             .format_closest_symbol_for_address(current_dtb, address)
             .or_else(|| {
-                let kernel_dtb = self.guest.ntoskrnl.dtb();
+                let kernel_dtb = self.kernel_dtb();
                 (looks_like_kernel_pointer(address.0) && current_dtb != kernel_dtb)
                     .then(|| {
                         self.symbols
@@ -956,7 +1091,7 @@ impl Target {
     /// Open a fluent cursor over a kernel struct (ntoskrnl's layout, read
     /// through ntoskrnl's address space).
     fn kernel_struct(&self, name: &str, base: VirtAddr) -> Result<StructRef<'_>> {
-        self.guest.ntoskrnl.types().struct_at(name, base)
+        self.guest()?.ntoskrnl.types().struct_at(name, base)
     }
 
     fn read_kernel_unicode_string(&self, addr: VirtAddr) -> Result<String> {
@@ -965,13 +1100,14 @@ impl Target {
     }
 
     fn object_name_layout(&self) -> Result<ObjectNameLayout> {
+        let dtb = self.guest()?.ntoskrnl.dtb();
         let header_type = self
             .symbols
-            .find_type_across_modules(self.guest.ntoskrnl.dtb(), "_OBJECT_HEADER")
+            .find_type_across_modules(dtb, "_OBJECT_HEADER")
             .ok_or_else(|| Error::StructNotFound("_OBJECT_HEADER".to_string()))?;
         let name_info_type = self
             .symbols
-            .find_type_across_modules(self.guest.ntoskrnl.dtb(), "_OBJECT_HEADER_NAME_INFO")
+            .find_type_across_modules(dtb, "_OBJECT_HEADER_NAME_INFO")
             .ok_or_else(|| Error::StructNotFound("_OBJECT_HEADER_NAME_INFO".to_string()))?;
         Ok(ObjectNameLayout {
             body_offset: header_type.field_offset("Body")?,
@@ -986,7 +1122,7 @@ impl Target {
         object: VirtAddr,
         object_name: &ObjectNameLayout,
     ) -> Result<Option<String>> {
-        let memory = self.guest.ntoskrnl.memory();
+        let memory = self.guest()?.ntoskrnl.memory();
         let header = object - object_name.body_offset;
         let info_mask: u8 = memory.read(header + object_name.info_mask_offset)?;
         if (info_mask & 0x02) == 0 {
@@ -999,13 +1135,14 @@ impl Target {
     }
 
     fn object_directory_layout(&self) -> Result<ObjectDirectoryLayout> {
+        let dtb = self.guest()?.ntoskrnl.dtb();
         let dir_type = self
             .symbols
-            .find_type_across_modules(self.guest.ntoskrnl.dtb(), "_OBJECT_DIRECTORY")
+            .find_type_across_modules(dtb, "_OBJECT_DIRECTORY")
             .ok_or_else(|| Error::StructNotFound("_OBJECT_DIRECTORY".to_string()))?;
         let entry_type = self
             .symbols
-            .find_type_across_modules(self.guest.ntoskrnl.dtb(), "_OBJECT_DIRECTORY_ENTRY")
+            .find_type_across_modules(dtb, "_OBJECT_DIRECTORY_ENTRY")
             .ok_or_else(|| Error::StructNotFound("_OBJECT_DIRECTORY_ENTRY".to_string()))?;
         let buckets = dir_type
             .fields
@@ -1026,7 +1163,7 @@ impl Target {
         dir: &ObjectDirectoryLayout,
         object_name: &ObjectNameLayout,
     ) -> Result<Vec<(String, VirtAddr)>> {
-        let memory = self.guest.ntoskrnl.memory();
+        let memory = self.guest()?.ntoskrnl.memory();
         let mut out = Vec::new();
         for bucket in 0..dir.bucket_count {
             let mut entry: VirtAddr = memory.read(directory + dir.buckets_offset + bucket * 8)?;
@@ -1055,8 +1192,16 @@ impl Target {
 
     /// Enumerate processes matching `filter` (see [`process_matches`]); `None`
     /// returns all. The shared list helper behind the SDK/MCP process filters.
+    ///
+    /// Falls back to the triage EPROCESS snapshot when the full linked-list
+    /// walk is unavailable (e.g. triage dumps with limited memory).
     pub fn matching_processes(&self, filter: Option<&str>) -> Result<Vec<ProcessInfo>> {
-        let procs = self.guest.enumerate_processes()?;
+        let procs = match self.guest().and_then(|g| g.enumerate_processes()) {
+            Ok(p) if !p.is_empty() => p,
+            Ok(_) => self.triage_process_list().unwrap_or_default(),
+            Err(Error::NtoskrnlNotFound) => self.triage_process_list()?,
+            Err(e) => return Err(e),
+        };
         Ok(match filter {
             None => procs,
             Some(f) => procs
@@ -1066,15 +1211,66 @@ impl Target {
         })
     }
 
+    /// Extract a single-entry process list from the triage EPROCESS snapshot.
+    fn triage_process_list(&self) -> Result<Vec<ProcessInfo>> {
+        let info = self.phys.dmp_info().ok_or(Error::NtoskrnlNotFound)?;
+        let proc_snap = info
+            .triage_process_snapshot
+            .as_deref()
+            .ok_or(Error::NtoskrnlNotFound)?;
+
+        let dtb = self.kernel_dtb();
+        let eprocess_layout = self
+            .symbols
+            .find_type_across_modules(dtb, "_EPROCESS")
+            .ok_or(Error::ExpectedSymbols)?;
+
+        let pid = eprocess_layout
+            .field_offset("UniqueProcessId")
+            .ok()
+            .and_then(|off| {
+                let off = off as usize;
+                if off + 8 <= proc_snap.len() {
+                    proc_snap[off..off + 8]
+                        .try_into()
+                        .ok()
+                        .map(u64::from_le_bytes)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+
+        let name = eprocess_layout
+            .field_offset("ImageFileName")
+            .ok()
+            .and_then(|off| {
+                let off = off as usize;
+                if off + 15 <= proc_snap.len() {
+                    let buf = &proc_snap[off..off + 15];
+                    let end = buf.iter().position(|&c| c == 0).unwrap_or(15);
+                    let s = String::from_utf8_lossy(&buf[..end]).to_string();
+                    if s.is_empty() { None } else { Some(s) }
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| "<unknown>".to_string());
+
+        Ok(vec![ProcessInfo {
+            pid,
+            name,
+            dtb: info.directory_table_base,
+            eprocess_va: VirtAddr(0),
+        }])
+    }
+
     pub fn enumerate_driver_objects(&self) -> Result<Vec<DriverObjectInfo>> {
-        let memory = self.guest.ntoskrnl.memory();
+        let guest = self.guest()?;
+        let memory = guest.ntoskrnl.memory();
         let object_name = self.object_name_layout()?;
         let dir = self.object_directory_layout()?;
-        let root_ptr = self
-            .guest
-            .ntoskrnl
-            .symbol("ObpRootDirectoryObject")?
-            .address();
+        let root_ptr = guest.ntoskrnl.symbol("ObpRootDirectoryObject")?.address();
         let root: VirtAddr = memory.read(root_ptr)?;
         let driver_dir = self
             .enumerate_object_directory(root, &dir, &object_name)?
@@ -1142,7 +1338,7 @@ impl Target {
         if current_location == 0 || current_location as u64 > 0x40 {
             return Ok(None);
         }
-        let types = self.guest.ntoskrnl.types();
+        let types = self.guest()?.ntoskrnl.types();
         let irp_size = types.layout("_IRP")?.size as u64;
         let stack_size = types.layout("_IO_STACK_LOCATION")?.size as u64;
         let addr = irp + irp_size + (current_location as u64 - 1) * stack_size;
@@ -1176,8 +1372,9 @@ impl Target {
     /// Decode a `_DRIVER_OBJECT` at `addr` (or at the pointer `addr` points to),
     /// including its device chain and `MajorFunction` dispatch table.
     pub fn inspect_driver_object(&self, addr: VirtAddr) -> Result<DriverObjectDetail> {
-        let mem = self.guest.ntoskrnl.memory();
-        let layout = self.guest.ntoskrnl.types().layout("_DRIVER_OBJECT")?;
+        let guest = self.guest()?;
+        let mem = guest.ntoskrnl.memory();
+        let layout = guest.ntoskrnl.types().layout("_DRIVER_OBJECT")?;
         let size_off = layout.field_offset("Size")?;
         let mf_off = layout.field_offset("MajorFunction")?;
         let name_off = layout.field_offset("DriverName")?;
@@ -1261,8 +1458,9 @@ impl Target {
     /// Decode a `_DEVICE_OBJECT` at `addr` (or the pointer `addr` points to) and
     /// walk its `AttachedDevice` stack.
     pub fn inspect_device_object(&self, addr: VirtAddr) -> Result<DeviceObjectDetail> {
-        let mem = self.guest.ntoskrnl.memory();
-        let layout = self.guest.ntoskrnl.types().layout("_DEVICE_OBJECT")?;
+        let guest = self.guest()?;
+        let mem = guest.ntoskrnl.memory();
+        let layout = guest.ntoskrnl.types().layout("_DEVICE_OBJECT")?;
         let size_off = layout.field_offset("Size")?;
         let min_size = layout.size as u64;
 
@@ -1337,12 +1535,12 @@ impl Target {
     /// Decode the executive `_OBJECT_HEADER` for `addr`, accepting either the
     /// object body or the header itself, and resolve its type and name.
     pub fn inspect_object_header(&self, addr: VirtAddr) -> Result<ObjectHeaderDetail> {
-        let mem = self.guest.ntoskrnl.memory();
-        let layout = self.guest.ntoskrnl.types().layout("_OBJECT_HEADER")?;
+        let guest = self.guest()?;
+        let mem = guest.ntoskrnl.memory();
+        let layout = guest.ntoskrnl.types().layout("_OBJECT_HEADER")?;
         let header_size = layout.size as u64;
         let body_off = layout.field_offset("Body")?;
-        let name_info_size = self
-            .guest
+        let name_info_size = guest
             .ntoskrnl
             .types()
             .layout("_OBJECT_HEADER_NAME_INFO")
@@ -1374,8 +1572,7 @@ impl Target {
         // raw ^ (second byte of the header address) ^ nt!ObHeaderCookie. The
         // cookie symbol is absent on older builds (treat as 0 -> raw index).
         let type_index: Option<u64> = h.read_field::<u8>("TypeIndex").ok().map(|raw| {
-            let cookie = self
-                .guest
+            let cookie = guest
                 .ntoskrnl
                 .symbol("ObHeaderCookie")
                 .and_then(|s| s.read::<u8>())
@@ -1386,38 +1583,36 @@ impl Target {
 
         // Resolve the type object via ObTypeIndexTable[index] and read its name.
         // ObTypeIndexTable is the array itself, so index it directly.
-        let (type_object, type_name) =
-            match (self.guest.ntoskrnl.symbol("ObTypeIndexTable"), type_index) {
-                (Ok(sym), Some(index)) => {
-                    let resolved = mem
-                        .read::<VirtAddr>(sym.address() + index * 8)
+        let (type_object, type_name) = match (guest.ntoskrnl.symbol("ObTypeIndexTable"), type_index)
+        {
+            (Ok(sym), Some(index)) => {
+                let resolved = mem
+                    .read::<VirtAddr>(sym.address() + index * 8)
+                    .ok()
+                    .filter(|t| !t.is_zero());
+                let name = resolved.and_then(|t| {
+                    let off = guest
+                        .ntoskrnl
+                        .types()
+                        .layout("_OBJECT_TYPE")
+                        .ok()?
+                        .field_offset("Name")
+                        .ok()?;
+                    self.read_kernel_unicode_string(t + off)
                         .ok()
-                        .filter(|t| !t.is_zero());
-                    let name = resolved.and_then(|t| {
-                        let off = self
-                            .guest
-                            .ntoskrnl
-                            .types()
-                            .layout("_OBJECT_TYPE")
-                            .ok()?
-                            .field_offset("Name")
-                            .ok()?;
-                        self.read_kernel_unicode_string(t + off)
-                            .ok()
-                            .filter(|s| !s.is_empty())
-                    });
-                    (resolved, name)
-                }
-                _ => (None, None),
-            };
+                        .filter(|s| !s.is_empty())
+                });
+                (resolved, name)
+            }
+            _ => (None, None),
+        };
 
         // Object name lives in _OBJECT_HEADER_NAME_INFO just before the header
         // when the InfoMask name bit (0x02) is set.
         let (name_info, name) = match (info_mask, name_info_size) {
             (Some(mask), Some(size)) if mask & 0x02 != 0 => {
                 let info = header - size;
-                let name = self
-                    .guest
+                let name = guest
                     .ntoskrnl
                     .types()
                     .layout("_OBJECT_HEADER_NAME_INFO")
@@ -1459,7 +1654,7 @@ impl Target {
         // 1. Loaded module containment (kernel list for kernel VAs, else the
         // current scope's user modules).
         let modules = if is_kernel {
-            self.guest.kernel_modules()
+            self.kernel_modules()
         } else {
             self.modules()
         };
@@ -1468,7 +1663,7 @@ impl Target {
                 address.0 >= m.base_address.0 && address.0 < m.base_address.0 + m.size as u64
             })
         {
-            let memory = self.current_process().memory();
+            let memory = self.current_process()?.memory();
             let section = section_name_at(&memory, m.base_address, address);
             return Ok(AddressDescription {
                 address,
@@ -1544,7 +1739,7 @@ impl Target {
     /// `MI_SYSTEM_VA_TYPE` name (sans `MiVa` prefix), read from the PDB enum so
     /// it adapts per build. `MiVisibleState` is a pointer to `_MI_VISIBLE_STATE`.
     fn kernel_va_region(&self, address: VirtAddr) -> Option<String> {
-        let ntos = &self.guest.ntoskrnl;
+        let ntos = &self.guest.as_ref()?.ntoskrnl;
         let range_start: VirtAddr = ntos.symbol("MmSystemRangeStart").ok()?.read().ok()?;
         if address.0 < range_start.0 {
             return None;
@@ -1588,9 +1783,9 @@ impl Target {
             ("image", "PspLoadImageNotifyRoutine"),
         ];
 
-        let mem = self.guest.ntoskrnl.memory();
-        let ex_callback_size = self
-            .guest
+        let guest = self.guest()?;
+        let mem = guest.ntoskrnl.memory();
+        let ex_callback_size = guest
             .ntoskrnl
             .types()
             .layout("_EX_CALLBACK")
@@ -1598,8 +1793,7 @@ impl Target {
             .map(|l| l.size as u64)
             .filter(|s| (8..=0x40).contains(s))
             .unwrap_or(8);
-        let block_layout = self
-            .guest
+        let block_layout = guest
             .ntoskrnl
             .types()
             .layout("_EX_CALLBACK_ROUTINE_BLOCK")
@@ -1617,7 +1811,7 @@ impl Target {
         let mut out = Vec::new();
 
         for (kind, symbol) in sets {
-            let Ok(sym) = self.guest.ntoskrnl.symbol(symbol) else {
+            let Ok(sym) = guest.ntoskrnl.symbol(symbol) else {
                 continue;
             };
             let base = sym.address();
@@ -1663,9 +1857,9 @@ impl Target {
         Ok(out)
     }
 
-    fn dump_ssdt_table(&self, label: &str, base: VirtAddr, limit: u32) -> SsdtTable {
-        let mem = self.guest.ntoskrnl.memory();
-        let dtb = self.guest.ntoskrnl.dtb();
+    fn dump_ssdt_table(&self, label: &str, base: VirtAddr, limit: u32, guest: &Guest) -> SsdtTable {
+        let mem = guest.ntoskrnl.memory();
+        let dtb = guest.ntoskrnl.dtb();
         let mut entries = Vec::new();
         // Clamp implausible limits so a garbage descriptor can't spin.
         let limit = limit.min(0x4000);
@@ -1707,23 +1901,16 @@ impl Target {
     /// Dump the kernel SSDT (`KiServiceTable`) and, when initialized, the
     /// win32k shadow table from `KeServiceDescriptorTableShadow`.
     pub fn dump_ssdt(&self) -> Result<Vec<SsdtTable>> {
-        let mem = self.guest.ntoskrnl.memory();
-        let base = self.guest.ntoskrnl.symbol("KiServiceTable")?.address();
-        let limit = self
-            .guest
-            .ntoskrnl
-            .symbol("KiServiceLimit")?
-            .read::<u32>()?;
-        let mut tables = vec![self.dump_ssdt_table("SSDT", base, limit)];
+        let guest = self.guest()?;
+        let mem = guest.ntoskrnl.memory();
+        let base = guest.ntoskrnl.symbol("KiServiceTable")?.address();
+        let limit = guest.ntoskrnl.symbol("KiServiceLimit")?.read::<u32>()?;
+        let mut tables = vec![self.dump_ssdt_table("SSDT", base, limit, guest)];
 
         // Shadow table: [0] is the kernel SSDT, [1] is win32k. Only present once
         // a GUI thread has initialized it.
-        if let Ok(sdt) = self.guest.ntoskrnl.symbol("KeServiceDescriptorTableShadow") {
-            let desc = self
-                .guest
-                .ntoskrnl
-                .types()
-                .layout("_KSERVICE_TABLE_DESCRIPTOR");
+        if let Ok(sdt) = guest.ntoskrnl.symbol("KeServiceDescriptorTableShadow") {
+            let desc = guest.ntoskrnl.types().layout("_KSERVICE_TABLE_DESCRIPTOR");
             let desc_size = desc.as_ref().ok().map(|l| l.size as u64).unwrap_or(0x20);
             let base_off = desc
                 .as_ref()
@@ -1740,7 +1927,7 @@ impl Target {
                 && !w_base.is_zero()
             {
                 let w_limit = mem.read::<u32>(win32k + limit_off).unwrap_or(0);
-                tables.push(self.dump_ssdt_table("shadow SSDT (win32k)", w_base, w_limit));
+                tables.push(self.dump_ssdt_table("shadow SSDT (win32k)", w_base, w_limit, guest));
             }
         }
 
@@ -1750,8 +1937,9 @@ impl Target {
     /// Read an `_IRP` only if it looks like one (Type == 6, plausible Size),
     /// returning `(stack_count, current_location)`.
     fn plausible_irp(&self, irp: VirtAddr) -> Option<(u8, u8)> {
-        let mem = self.guest.ntoskrnl.memory();
-        let layout = self.guest.ntoskrnl.types().layout("_IRP").ok()?;
+        let guest = self.guest.as_ref()?;
+        let mem = guest.ntoskrnl.memory();
+        let layout = guest.ntoskrnl.types().layout("_IRP").ok()?;
         let ty: u16 = mem.read(irp).ok()?;
         if ty != 6 {
             return None;
@@ -1773,9 +1961,10 @@ impl Target {
     /// each device's `_DEVICE_OBJECT.CurrentIrp`. `filter` scopes processes
     /// (pid or name substring) and, for the device sweep, driver names.
     pub fn discover_irps(&self, filter: Option<&str>) -> Result<Vec<IrpHit>> {
-        let mem = self.guest.ntoskrnl.memory();
+        let guest = self.guest()?;
+        let mem = guest.ntoskrnl.memory();
         let off = |ty: &str, field: &str| -> Option<u64> {
-            self.guest
+            guest
                 .ntoskrnl
                 .types()
                 .layout(ty)
@@ -1789,7 +1978,7 @@ impl Target {
         let mut out = Vec::new();
 
         // --- process / thread IrpLists ---
-        let procs = self.guest.enumerate_processes()?;
+        let procs = guest.enumerate_processes()?;
         let thread_head_off = off("_EPROCESS", "ThreadListHead");
         let thread_link_off = off("_ETHREAD", "ThreadListEntry");
         let irp_list_off = off("_ETHREAD", "IrpList");
@@ -1915,15 +2104,15 @@ impl Target {
         &self,
         process: &ProcessInfo,
     ) -> Result<Vec<ThreadInfo>> {
-        let memory = self.guest.ntoskrnl.memory();
-        let eprocess = self
-            .guest
+        let guest = self.guest()?;
+        let memory = guest.ntoskrnl.memory();
+        let eprocess = guest
             .ntoskrnl
             .types_in(process.dtb)
             .struct_at("_EPROCESS", process.eprocess_va)?;
-        let eprocess_layout = self.guest.ntoskrnl.types().layout("_EPROCESS")?;
+        let eprocess_layout = guest.ntoskrnl.types().layout("_EPROCESS")?;
         let thread_list_head_offset = eprocess_layout.field_offset("ThreadListHead")?;
-        let ethread_layout = self.guest.ntoskrnl.types().layout("_ETHREAD")?;
+        let ethread_layout = guest.ntoskrnl.types().layout("_ETHREAD")?;
         let thread_list_entry_offset = ethread_layout.field_offset("ThreadListEntry")?;
         let head = eprocess.addr() + thread_list_head_offset;
 
@@ -1945,7 +2134,7 @@ impl Target {
     }
 
     pub fn enumerate_threads(&self) -> Result<Vec<ThreadInfo>> {
-        let processes = self.guest.enumerate_processes()?;
+        let processes = self.guest()?.enumerate_processes()?;
         let mut threads = Vec::new();
 
         for process in &processes {
@@ -1967,8 +2156,9 @@ impl Target {
         ethread: VirtAddr,
         process_hint: Option<&ProcessInfo>,
     ) -> Result<ThreadInfo> {
-        let memory = self.guest.ntoskrnl.memory();
-        let types = self.guest.ntoskrnl.types();
+        let guest = self.guest()?;
+        let memory = guest.ntoskrnl.memory();
+        let types = guest.ntoskrnl.types();
         let ethread_layout = types.layout("_ETHREAD")?;
         let kthread_layout = types.layout("_KTHREAD")?;
         let tcb_offset = ethread_layout.field_offset("Tcb").unwrap_or(0);
@@ -2035,7 +2225,7 @@ impl Target {
         // thread's pid/EPROCESS against a one-shot process list for the name.
         let owner: Option<ProcessInfo> = match process_hint {
             Some(_) => None,
-            None => self.guest.enumerate_processes().ok().and_then(|processes| {
+            None => guest.enumerate_processes().ok().and_then(|processes| {
                 processes.into_iter().find(|process| {
                     pid.is_some_and(|pid| process.pid == pid)
                         || eprocess.is_some_and(|eprocess| process.eprocess_va == eprocess)
@@ -2046,7 +2236,7 @@ impl Target {
 
         let process_name = owner
             .map(|process| process.name.clone())
-            .or_else(|| eprocess.and_then(|eprocess| self.guest.process_image_name(eprocess)))
+            .or_else(|| eprocess.and_then(|eprocess| guest.process_image_name(eprocess)))
             // PID 0 is the System Idle Process, which isn't on PsActiveProcessHead
             // and so never matches above; label its per-CPU idle threads like WinDbg
             .or_else(|| (pid == Some(0)).then(|| "Idle".to_string()));
@@ -2082,7 +2272,7 @@ impl Target {
         ethread: VirtAddr,
     ) -> Option<Vec<VirtAddr>> {
         let irp_list_offset = ethread_layout.field_offset("IrpList").ok()?;
-        let irp_layout = self.guest.ntoskrnl.types().layout("_IRP").ok()?;
+        let irp_layout = self.guest.as_ref()?.ntoskrnl.types().layout("_IRP").ok()?;
         let thread_list_entry_offset = irp_layout.field_offset("ThreadListEntry").ok()?;
         let head = ethread + irp_list_offset;
         let mut current: VirtAddr = memory.read(head).ok()?;
@@ -2104,21 +2294,20 @@ impl Target {
     }
 
     pub fn current_windows_thread_for_processor(&self, processor: u16) -> Result<ThreadInfo> {
-        let memory = self.guest.ntoskrnl.memory();
-        let prcb_current_thread_offset = self
-            .guest
+        let guest = self.guest()?;
+        let memory = guest.ntoskrnl.memory();
+        let prcb_current_thread_offset = guest
             .ntoskrnl
             .types()
             .layout("_KPRCB")?
             .field_offset("CurrentThread")?;
-        let ethread_tcb_offset = self
-            .guest
+        let ethread_tcb_offset = guest
             .ntoskrnl
             .types()
             .layout("_ETHREAD")?
             .field_offset("Tcb")
             .unwrap_or(0);
-        let processor_block = self.guest.ntoskrnl.symbol("KiProcessorBlock")?.address();
+        let processor_block = guest.ntoskrnl.symbol("KiProcessorBlock")?.address();
         let prcb: VirtAddr = memory.read(processor_block + (processor as u64) * 8)?;
         if prcb.is_zero() {
             return Err(Error::DebugInfo(format!(
@@ -2142,9 +2331,10 @@ impl Target {
         &self,
         process: &ProcessInfo,
     ) -> Result<Vec<MemoryRegionInfo>> {
+        let guest = self.guest()?;
         let memory = AddressSpace::new(&self.phys, process.dtb);
-        let types = self.guest.ntoskrnl.types_in(process.dtb);
-        let eprocess_layout = self.guest.ntoskrnl.types().layout("_EPROCESS")?;
+        let types = guest.ntoskrnl.types_in(process.dtb);
+        let eprocess_layout = guest.ntoskrnl.types().layout("_EPROCESS")?;
         let vad_root_base = process.eprocess_va + eprocess_layout.field_offset("VadRoot")?;
         let root = self.read_vad_root(process.dtb, vad_root_base)?;
         if root.is_zero() {
@@ -2159,7 +2349,7 @@ impl Target {
         let left_offset = node_layout.field_offset("Left").unwrap_or(0);
         let right_offset = node_layout.field_offset("Right").unwrap_or(8);
         let flags_layout = types.layout("_MMVAD_FLAGS").ok();
-        let modules = self.guest.process_modules(process).unwrap_or_default();
+        let modules = guest.process_modules(process).unwrap_or_default();
 
         let mut regions = Vec::new();
         let mut stack = vec![root];
@@ -2193,7 +2383,7 @@ impl Target {
 
     fn read_vad_root(&self, dtb: Dtb, vad_root_base: VirtAddr) -> Result<VirtAddr> {
         let memory = AddressSpace::new(&self.phys, dtb);
-        let types = self.guest.ntoskrnl.types_in(dtb);
+        let types = self.guest()?.ntoskrnl.types_in(dtb);
 
         if let Ok(tree_layout) = types.layout("_RTL_AVL_TREE")
             && let Ok(root_offset) = tree_layout.field_offset("Root")
@@ -2314,9 +2504,18 @@ impl Target {
     }
 
     pub fn startup_message_data(&mut self) -> Result<StartupMessage> {
-        let build_number = self.guest.ntoskrnl.symbol("NtBuildNumber")?.read()?;
-        let base_address = self.guest.ntoskrnl.base_address;
-        let loaded_module_list = self.guest.ntoskrnl.symbol("PsLoadedModuleList")?.read()?;
+        let guest = self.guest()?;
+        let build_number: u16 = guest
+            .ntoskrnl
+            .symbol("NtBuildNumber")
+            .and_then(|s| s.read())
+            .unwrap_or(0u16);
+        let base_address = guest.ntoskrnl.base_address;
+        let loaded_module_list = guest
+            .ntoskrnl
+            .symbol("PsLoadedModuleList")
+            .and_then(|s| s.read())
+            .unwrap_or(VirtAddr(0));
 
         Ok(StartupMessage {
             build_number: Value(build_number),
@@ -2329,10 +2528,10 @@ impl Target {
         // Walk through the current inspection address space so user VAs resolve
         // through the attached process's tables (not the kernel's). MmPteBase is
         // a kernel VA valid in any process context (the recursive PML4 slot).
-        let memory = self.current_process().memory();
+        let memory = self.current_process()?.memory();
         let dtb = self.current_dtb();
 
-        let pte_base: VirtAddr = self.guest.ntoskrnl.symbol("MmPteBase")?.read()?;
+        let pte_base: VirtAddr = self.guest()?.ntoskrnl.symbol("MmPteBase")?.read()?;
         let pde_base = pte_base + (pte_base.0 >> 9 & 0x7FFFFFFFFF);
         let ppe_base = pde_base + (pde_base.0 >> 9 & 0x3FFFFFFF);
         let pxe_base = ppe_base + (ppe_base.0 >> 9 & 0x1FFFFF);

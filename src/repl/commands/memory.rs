@@ -145,7 +145,7 @@ impl ReplState<'_> {
     /// Read guest memory in the current process context for *display*, masking
     /// out our own breakpoint int3 bytes so listings never show them.
     fn read_for_display(&self, addr: VirtAddr, buf: &mut [u8]) -> Result<()> {
-        let process = self.ctx.target.current_process();
+        let process = self.ctx.target.current_process()?;
         process.memory().read_bytes(addr, buf)?;
         self.ctx
             .breakpoints
@@ -212,7 +212,7 @@ impl ReplState<'_> {
 
         let bytes = encode(value);
         let formatted_value = display_value(value);
-        let mem = self.ctx.target.current_process().memory();
+        let mem = self.ctx.target.current_process()?.memory();
         if let Err(e) = mem.write_bytes(address, &bytes) {
             error!("failed to write {}: {}", noun, e);
         } else {
@@ -254,7 +254,7 @@ impl ReplState<'_> {
             return Ok(());
         }
 
-        let dtb = self.ctx.target.current_process().dtb();
+        let dtb = self.ctx.target.current_process()?.dtb();
         let trace = resolve_thread_trace_context(&self.ctx.target, dtb);
         for (i, chunk) in data.chunks_exact(8).enumerate() {
             let value = u64::from_le_bytes(chunk.try_into().unwrap());
@@ -382,7 +382,7 @@ impl ReplState<'_> {
 
         // resolve branch / rip-relative targets the same way the break/status
         // view does, so the `disasm` command's comments read identically
-        let dtb = self.ctx.target.current_process().dtb();
+        let dtb = self.ctx.target.current_process()?.dtb();
         let trace = resolve_thread_trace_context(&self.ctx.target, dtb);
         let resolve = |target: u64| format_symbol(&self.ctx.target, &trace, target);
 
@@ -466,7 +466,7 @@ impl ReplState<'_> {
         };
 
         let data = repeat_pattern(&pattern, length);
-        let mem = self.ctx.target.current_process().memory();
+        let mem = self.ctx.target.current_process()?.memory();
 
         if let Err(e) = mem.write_bytes(address, &data) {
             error!("failed to fill memory: {}", e);
@@ -538,16 +538,7 @@ impl ReplState<'_> {
             let sym = self
                 .ctx
                 .target
-                .guest
-                .ntoskrnl
-                .closest_symbol(VirtAddr(addr))
-                .map(|(s, o)| {
-                    if o == 0 {
-                        s.to_string()
-                    } else {
-                        format!("{}+{:#x}", s, o)
-                    }
-                })
+                .closest_symbol_current_context(VirtAddr(addr))
                 .unwrap_or_default();
 
             println!("{}  {}", ui::addr(addr), ui::symbol(&sym));
@@ -613,7 +604,7 @@ impl ReplState<'_> {
                     match self
                         .ctx
                         .target
-                        .current_process()
+                        .current_process()?
                         .memory()
                         .read_bytes(address, &mut buf)
                     {
