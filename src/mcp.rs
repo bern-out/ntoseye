@@ -983,7 +983,8 @@ fn module_json(m: &crate::guest::ModuleInfo) -> Value {
 
 fn exception_json(exc: &crate::dmp::DmpException) -> Value {
     serde_json::json!({
-        "code": format!("0x{:08X}", exc.code),
+        "code": exc.code,
+        "code_hex": hex(exc.code as u64),
         "code_name": exception_code_name(exc.code),
         "flags": exc.flags,
         "address": hex(exc.address),
@@ -1035,7 +1036,7 @@ fn system_info_json(info: &crate::dmp::DmpSystemInfo) -> Value {
         "major_version": info.major_version,
         "build": info.minor_version,
         "service_pack_build": info.service_pack_build,
-        "machine_image_type": format!("0x{:04X}", info.machine_image_type),
+        "machine_image_type": hex(info.machine_image_type as u64),
         "machine": machine,
         "system_time": system_time,
         "system_up_time_secs": if info.system_up_time != 0 {
@@ -1044,7 +1045,42 @@ fn system_info_json(info: &crate::dmp::DmpSystemInfo) -> Value {
             None
         },
         "product_type": product,
-        "suite_mask": format!("0x{:04X}", info.suite_mask),
+        "suite_mask": hex(info.suite_mask as u64),
+    })
+}
+
+/// Crash context extracted from the triage EPROCESS/ETHREAD snapshots,
+/// shared by `open_dump` and `triage`.
+fn crash_context_json(ci: &crate::dmp::TriageCrashInfo) -> Value {
+    let mut v = serde_json::json!({
+        "process_name": ci.process_name,
+        "process_id": ci.process_id,
+        "thread_id": ci.thread_id,
+    });
+    let obj = v.as_object_mut().unwrap();
+    if let Some(ppid) = ci.parent_process_id {
+        obj.insert("parent_process_id".into(), serde_json::json!(ppid));
+    }
+    if let Some(es) = ci.exit_status {
+        obj.insert("exit_status".into(), hex(es as u64).into());
+    }
+    if let Some(ct) = ci.create_time {
+        obj.insert("create_time".into(), filetime_to_iso(ct).into());
+    }
+    if let Some(es) = ci.thread_exit_status {
+        obj.insert("thread_exit_status".into(), hex(es as u64).into());
+    }
+    v
+}
+
+/// Crashing processor's PRCB summary, shared by `open_dump` and `triage`.
+fn prcb_json(p: &crate::triage::TriagePrcbInfo) -> Value {
+    serde_json::json!({
+        "current_thread": hex(p.current_thread),
+        "processor_number": p.processor_number,
+        "mhz": p.mhz,
+        "cpu_type": p.cpu_type,
+        "vendor_string": p.vendor_string,
     })
 }
 
@@ -1955,7 +1991,7 @@ impl NtoseyeMcp {
     }
 
     #[tool(
-        description = "Analyze the current bugcheck (BSOD): {code, code_hex, name, description, driver, args:[{index, value, description}], fault:{ip, symbol, driver}, trap_frames:[{address, rip_symbol, frame:{rax..r11, rip, rsp, cs, ss, eflags, error_code, previous_mode, previous_irql}|null, error:string|null}], source}, or null if the guest is not bugchecking"
+        description = "Analyze the current bugcheck (BSOD): {code, code_hex, name, description, driver, args:[{index, value, description}], fault:{ip, symbol, driver}, trap_frames:[{address, rip_symbol, frame:{rax..r11, rip, rsp, cs, ss, eflags, error_code, previous_mode, previous_irql}|null, error:string|null}], source}, or {} if the guest is not bugchecking"
     )]
     async fn bugcheck(&self) -> Result<CallToolResult, McpError> {
         let v = self
@@ -2613,7 +2649,7 @@ impl NtoseyeMcp {
     }
 
     #[tool(
-        description = "Open a Windows kernel crash dump (.dmp) file for offline analysis. Must be called before any other tool when the server was started without --dump/--connect. Only one session can be active at a time. Returns {status, path, processors, bugcheck, exception:{code, code_name, flags, address, parameters}, system_info:{major_version, minor_version, build, service_pack_build, machine_image_type, machine, system_time, system_up_time_secs, product_type, suite_mask}}."
+        description = "Open a Windows kernel crash dump (.dmp) file for offline analysis. Must be called before any other tool when the server was started without --dump/--connect. Only one session can be active at a time. Returns {status, path, processors, bugcheck, exception:{code, code_hex, code_name, flags, address, parameters}, system_info:{major_version, build, service_pack_build, machine_image_type, machine, system_time, system_up_time_secs, product_type, suite_mask}, crash_context, prcb, broken_driver, triage_overflowed}."
     )]
     async fn open_dump(
         &self,
@@ -2637,36 +2673,8 @@ impl NtoseyeMcp {
                 let bc =
                     current_bugcheck(&ctx.target).or_else(|| bugcheck_from_dump_info(&ctx.target));
                 let dmp = ctx.target.phys.dmp_info();
-                let crash_context = ctx.backend.triage_crash_info().map(|ci| {
-                    let mut ctx = serde_json::json!({
-                        "process_name": ci.process_name,
-                        "process_id": ci.process_id,
-                        "thread_id": ci.thread_id,
-                    });
-                    let obj = ctx.as_object_mut().unwrap();
-                    if let Some(ppid) = ci.parent_process_id {
-                        obj.insert("parent_process_id".into(), serde_json::json!(ppid));
-                    }
-                    if let Some(es) = ci.exit_status {
-                        obj.insert("exit_status".into(), format!("0x{es:08X}").into());
-                    }
-                    if let Some(ct) = ci.create_time {
-                        obj.insert("create_time".into(), filetime_to_iso(ct).into());
-                    }
-                    if let Some(es) = ci.thread_exit_status {
-                        obj.insert("thread_exit_status".into(), format!("0x{es:08X}").into());
-                    }
-                    ctx
-                });
-                let prcb = dmp.and_then(|d| d.triage_prcb_info.as_ref()).map(|p| {
-                    serde_json::json!({
-                        "current_thread": format!("0x{:X}", p.current_thread),
-                        "processor_number": p.processor_number,
-                        "mhz": p.mhz,
-                        "cpu_type": p.cpu_type,
-                        "vendor_string": p.vendor_string,
-                    })
-                });
+                let crash_context = ctx.backend.triage_crash_info().map(crash_context_json);
+                let prcb = dmp.and_then(|d| d.triage_prcb_info.as_ref()).map(prcb_json);
                 Ok(serde_json::json!({
                     "status": "opened",
                     "path": path,
@@ -2740,7 +2748,7 @@ impl NtoseyeMcp {
     }
 
     #[tool(
-        description = "One-shot overview for crash/debug triage: bundles status, bugcheck analysis, exception record, system info, backtrace, loaded/unloaded kernel modules into a single response. backtrace is null when the VM is running. Returns {status, bugcheck, exception, system_info, backtrace, modules, modules_total, unloaded_drivers, crash_context}."
+        description = "One-shot overview for crash/debug triage: bundles status, bugcheck analysis, exception record, system info, backtrace, loaded/unloaded kernel modules into a single response. backtrace is null when the VM is running. Returns {status, bugcheck, exception, system_info, backtrace, modules, modules_total, unloaded_drivers, crash_context, prcb, broken_driver, triage_overflowed}."
     )]
     async fn triage(&self) -> Result<CallToolResult, McpError> {
         let v = self
@@ -2777,36 +2785,8 @@ impl NtoseyeMcp {
                     })
                     .unwrap_or_default();
 
-                let crash_context = ctx.backend.triage_crash_info().map(|ci| {
-                    let mut ctx = serde_json::json!({
-                        "process_name": ci.process_name,
-                        "process_id": ci.process_id,
-                        "thread_id": ci.thread_id,
-                    });
-                    let obj = ctx.as_object_mut().unwrap();
-                    if let Some(ppid) = ci.parent_process_id {
-                        obj.insert("parent_process_id".into(), serde_json::json!(ppid));
-                    }
-                    if let Some(es) = ci.exit_status {
-                        obj.insert("exit_status".into(), format!("0x{es:08X}").into());
-                    }
-                    if let Some(ct) = ci.create_time {
-                        obj.insert("create_time".into(), filetime_to_iso(ct).into());
-                    }
-                    if let Some(es) = ci.thread_exit_status {
-                        obj.insert("thread_exit_status".into(), format!("0x{es:08X}").into());
-                    }
-                    ctx
-                });
-                let prcb = dmp.and_then(|d| d.triage_prcb_info.as_ref()).map(|p| {
-                    serde_json::json!({
-                        "current_thread": format!("0x{:X}", p.current_thread),
-                        "processor_number": p.processor_number,
-                        "mhz": p.mhz,
-                        "cpu_type": p.cpu_type,
-                        "vendor_string": p.vendor_string,
-                    })
-                });
+                let crash_context = ctx.backend.triage_crash_info().map(crash_context_json);
+                let prcb = dmp.and_then(|d| d.triage_prcb_info.as_ref()).map(prcb_json);
 
                 Ok(serde_json::json!({
                     "status": status,
