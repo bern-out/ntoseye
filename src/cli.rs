@@ -3,6 +3,8 @@ use argh::{FromArgValue, FromArgs};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+#[cfg(feature = "mcp")]
+use crate::mcp;
 use crate::{
     dbg_backend::DebugBackend,
     diagnostics,
@@ -15,8 +17,6 @@ use crate::{
     repl::start_repl,
     session, symbols, virsh,
 };
-#[cfg(feature = "mcp")]
-use crate::mcp;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BackendKind {
@@ -261,11 +261,10 @@ fn run() -> Result<()> {
             .clone();
         // A dump is read-only, so no per-target lock: any number of sessions
         // can analyse dumps alongside a live debugger.
-        let mut ctx = session::Session::connect(
-            phys,
-            None,
-            || -> Result<Box<dyn DebugBackend>> { Ok(Box::new(DmpBackend::new(&info))) },
-        )?;
+        let mut ctx =
+            session::Session::connect(phys, None, || -> Result<Box<dyn DebugBackend>> {
+                Ok(Box::new(DmpBackend::new(&info)))
+            })?;
         return start_repl(&mut ctx);
     }
 
@@ -284,12 +283,8 @@ fn run() -> Result<()> {
         target.as_deref(),
         || -> Result<Box<dyn DebugBackend>> {
             Ok(match args.backend {
-                BackendKind::Gdb => {
-                    Box::new(GdbClient::connect(target.as_deref().unwrap())?)
-                }
-                BackendKind::Kd => {
-                    Box::new(KdBackend::connect(target.as_deref().unwrap())?)
-                }
+                BackendKind::Gdb => Box::new(GdbClient::connect(target.as_deref().unwrap())?),
+                BackendKind::Kd => Box::new(KdBackend::connect(target.as_deref().unwrap())?),
                 BackendKind::Memory => {
                     if args.connect.is_some() {
                         return Err(Error::DebugInfo(

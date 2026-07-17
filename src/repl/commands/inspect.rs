@@ -7,8 +7,10 @@ use owo_colors::OwoColorize;
 use crate::error::{Error, Result};
 use crate::expr::Expr;
 use crate::target::{irp_major_function_name, kthread_state_name, wait_reason_name};
+use crate::trapframe::read_ktrap_frame_at_or_current;
 use crate::types::VirtAddr;
 use crate::ui;
+use crate::unwind::{format_symbol, resolve_thread_trace_context};
 
 use crate::repl::*;
 
@@ -128,6 +130,21 @@ repl_command! {
     completion: Expression,
 }
 
+repl_command! {
+    cmd_trap;
+    names: ["trap", ".trap"],
+    usage: "trap [address-expression]",
+    summary: "Decode and display a _KTRAP_FRAME (defaults to the current thread's saved frame).",
+    completion: Expression,
+}
+
+repl_command! {
+    cmd_analyze();
+    names: ["analyze", "!analyze"],
+    usage: "analyze",
+    summary: "Analyze the current bugcheck (BSOD) from nt!KiBugCheckData.",
+}
+
 impl ReplState<'_> {
     fn cmd_pte(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
         let expr = require_arg!(invocation, 0, "pte");
@@ -171,6 +188,54 @@ impl ReplState<'_> {
             Err(e) => {
                 error!("{}\n", e);
             }
+        }
+
+        Ok(())
+    }
+
+    fn cmd_trap(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        let address = match invocation.arg(0) {
+            Some(expr) => match Expr::eval(expr, &self.ctx.target) {
+                Ok(address) => Some(address),
+                Err(e) => {
+                    error!("{}", e);
+                    return Ok(());
+                }
+            },
+            None => None,
+        };
+        match read_ktrap_frame_at_or_current(&self.ctx.target, address) {
+            Ok(frame) => {
+                // Trap frames are kernel structures; resolve the interrupted
+                // rip against the kernel address space like the bugcheck
+                // analysis does.
+                let trace = resolve_thread_trace_context(
+                    &self.ctx.target,
+                    self.ctx.target.guest.ntoskrnl.dtb(),
+                );
+                let symbol = format_symbol(&self.ctx.target, &trace, frame.rip);
+                print_ktrap_frame(&frame, Some(&symbol));
+                println!();
+            }
+            Err(e) => {
+                error!("{}", e);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn cmd_analyze(&mut self) -> Result<()> {
+        // Same decode path the stop banner and the SDK/MCP use; on demand so an
+        // already-frozen guest (or a scrolled-away banner) can be re-analyzed.
+        match current_bugcheck(&self.ctx.target) {
+            Some(analysis) => {
+                print_bugcheck_analysis(&analysis);
+                println!();
+            }
+            None => println!(
+                "no bugcheck: nt!KiBugCheckData has no plausible code (guest is not bugchecking)\n"
+            ),
         }
 
         Ok(())

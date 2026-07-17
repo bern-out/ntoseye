@@ -8,8 +8,9 @@ use std::{
 use dialoguer::{Confirm, Select};
 
 use crate::{
+    DEFAULT_KD_SOCKET as KD_SOCKET,
     error::{Error, Result},
-    symbols, DEFAULT_KD_SOCKET as KD_SOCKET,
+    symbols,
 };
 const QEMU_NS: &str = "http://libvirt.org/schemas/domain/qemu/1.0";
 

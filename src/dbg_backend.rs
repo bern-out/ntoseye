@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::gdb::RegisterMap;
 use crate::target::Target;
 use crate::types::VirtAddr;
@@ -162,6 +162,113 @@ pub struct StopEvent {
     pub assisted_breakin: bool,
 }
 
+/// What memory access a hardware (debug-register) breakpoint traps on. The x86
+/// debug registers have no read-only condition, so a "read" watch is really
+/// read/write ([`Self::ReadWrite`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HwBreakpointAccess {
+    /// Instruction execution at the address (DR7 R/W = 00, length forced to 1).
+    Execute,
+    /// Data write to the address (DR7 R/W = 01).
+    Write,
+    /// Data read or write at the address (DR7 R/W = 11).
+    ReadWrite,
+}
+
+impl HwBreakpointAccess {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Execute => "execute",
+            Self::Write => "write",
+            Self::ReadWrite => "read/write",
+        }
+    }
+
+    /// The WinDbg-style access letter (`e`/`w`/`r`).
+    pub fn letter(self) -> char {
+        match self {
+            Self::Execute => 'e',
+            Self::Write => 'w',
+            Self::ReadWrite => 'r',
+        }
+    }
+}
+
+/// Semantic data-watch access exposed by host APIs. The transport may
+/// implement this with x86 debug registers, but callers request a watchpoint,
+/// not a software-vs-hardware breakpoint implementation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WatchpointAccess {
+    Write,
+    /// x86 has no read-only data watch, so reads also trap writes.
+    ReadWrite,
+}
+
+impl WatchpointAccess {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Write => "write",
+            Self::ReadWrite => "read/write",
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Write => "write",
+            Self::ReadWrite => "read_write",
+        }
+    }
+}
+
+impl std::str::FromStr for WatchpointAccess {
+    type Err = Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "write" => Ok(Self::Write),
+            "read_write" | "read/write" => Ok(Self::ReadWrite),
+            _ => Err(Error::Rsp(format!(
+                "invalid watchpoint access '{value}' (use 'write' or 'read_write')"
+            ))),
+        }
+    }
+}
+
+impl From<WatchpointAccess> for HwBreakpointAccess {
+    fn from(access: WatchpointAccess) -> Self {
+        match access {
+            WatchpointAccess::Write => Self::Write,
+            WatchpointAccess::ReadWrite => Self::ReadWrite,
+        }
+    }
+}
+
+/// Number of x86 debug-register breakpoint slots (DR0-DR3).
+pub const HW_BREAKPOINT_SLOTS: u8 = 4;
+
+/// Validate a hardware breakpoint's access/length/address against x86's rules,
+/// backend-independent: execute breakpoints are one byte; data widths are
+/// 1/2/4/8; and the address must be aligned to its length (an unaligned DR
+/// address silently never fires). `Err` carries a user-facing reason.
+pub fn validate_hw_breakpoint(access: HwBreakpointAccess, len: u8, addr: u64) -> Result<()> {
+    if matches!(access, HwBreakpointAccess::Execute) && len != 1 {
+        return Err(Error::Rsp(
+            "execute hardware breakpoints must be 1 byte".into(),
+        ));
+    }
+    if !matches!(len, 1 | 2 | 4 | 8) {
+        return Err(Error::Rsp(format!(
+            "invalid hardware breakpoint length {len} (use 1, 2, 4, or 8)"
+        )));
+    }
+    if !addr.is_multiple_of(len as u64) {
+        return Err(Error::Rsp(format!(
+            "hardware breakpoint address {addr:#x} must be {len}-byte aligned"
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DebugCapability {
     MemoryIntrospection,
@@ -174,6 +281,7 @@ pub enum DebugCapability {
     ThreadSelection,
     KernelBreakpoints,
     UserModeBreakpoints,
+    Watchpoints,
     TargetReloadDetection,
     KernelBaseHint,
     BugcheckDetection,
@@ -194,6 +302,7 @@ impl DebugCapability {
             Self::ThreadSelection => "context selection",
             Self::KernelBreakpoints => "kernel breakpoints",
             Self::UserModeBreakpoints => "usermode breakpoints",
+            Self::Watchpoints => "data watchpoints",
             Self::TargetReloadDetection => "target reload detection",
             Self::KernelBaseHint => "kernel base hint",
             Self::BugcheckDetection => "bugcheck stop detection",
@@ -239,11 +348,38 @@ pub trait DebugBackend {
         false
     }
 
+    /// Whether the backend can install global data watchpoints. KD implements
+    /// these with x86 debug registers; other transports report `false`.
+    fn supports_watchpoints(&self) -> bool {
+        false
+    }
+
+    /// Program debug-register slot `slot` (0-3) to trap on `access` at `addr`
+    /// over `len` bytes (1/2/4/8; execute forces 1), on every processor.
+    fn set_hardware_breakpoint(
+        &mut self,
+        _slot: u8,
+        _addr: u64,
+        _access: HwBreakpointAccess,
+        _len: u8,
+    ) -> Result<()> {
+        Err(Error::NotSupported)
+    }
+
+    /// Disable debug-register slot `slot` on every processor.
+    fn clear_hardware_breakpoint(&mut self, _slot: u8) -> Result<()> {
+        Err(Error::NotSupported)
+    }
+
     fn optional_capabilities(&self) -> Vec<BackendCapability> {
         vec![
             BackendCapability {
                 capability: DebugCapability::UserModeBreakpoints,
                 supported: self.supports_user_mode_breakpoints(),
+            },
+            BackendCapability {
+                capability: DebugCapability::Watchpoints,
+                supported: self.supports_watchpoints(),
             },
             BackendCapability::unsupported(DebugCapability::TargetReloadDetection),
             BackendCapability::unsupported(DebugCapability::KernelBaseHint),
@@ -398,5 +534,63 @@ mod tests {
         assert!(page.dropped);
         // A reader caught up to the retained window does not
         assert!(!log.read_since(1).dropped);
+    }
+
+    #[test]
+    fn validate_hw_execute_must_be_one_byte() {
+        // Execute at any address with len 1 is legal regardless of alignment.
+        assert!(validate_hw_breakpoint(HwBreakpointAccess::Execute, 1, 0x1003).is_ok());
+        // Any other length for an execute breakpoint is rejected (checked before length/alignment).
+        assert!(validate_hw_breakpoint(HwBreakpointAccess::Execute, 4, 0x1000).is_err());
+        assert!(validate_hw_breakpoint(HwBreakpointAccess::Execute, 2, 0x1000).is_err());
+        assert!(validate_hw_breakpoint(HwBreakpointAccess::Execute, 8, 0x1000).is_err());
+    }
+
+    #[test]
+    fn validate_hw_data_widths_when_aligned() {
+        // Every legal data width at a correctly aligned address is accepted.
+        for access in [HwBreakpointAccess::Write, HwBreakpointAccess::ReadWrite] {
+            assert!(validate_hw_breakpoint(access, 1, 0x1003).is_ok());
+            assert!(validate_hw_breakpoint(access, 2, 0x1000).is_ok());
+            assert!(validate_hw_breakpoint(access, 4, 0x1000).is_ok());
+            assert!(validate_hw_breakpoint(access, 8, 0x2000).is_ok());
+        }
+    }
+
+    #[test]
+    fn validate_hw_rejects_invalid_lengths() {
+        // Lengths outside {1,2,4,8} are rejected for data breakpoints.
+        for len in [0u8, 3, 5, 16] {
+            assert!(validate_hw_breakpoint(HwBreakpointAccess::Write, len, 0x1000).is_err());
+            assert!(validate_hw_breakpoint(HwBreakpointAccess::ReadWrite, len, 0x1000).is_err());
+        }
+    }
+
+    #[test]
+    fn validate_hw_requires_length_alignment() {
+        // An address not aligned to the watch length never fires in hardware, so it's rejected.
+        assert!(validate_hw_breakpoint(HwBreakpointAccess::Write, 4, 0x1002).is_err());
+        assert!(validate_hw_breakpoint(HwBreakpointAccess::Write, 2, 0x1001).is_err());
+        assert!(validate_hw_breakpoint(HwBreakpointAccess::ReadWrite, 8, 0x1004).is_err());
+        // Single-byte watches align to every address.
+        assert!(validate_hw_breakpoint(HwBreakpointAccess::Write, 1, 0x1001).is_ok());
+        assert!(validate_hw_breakpoint(HwBreakpointAccess::ReadWrite, 1, 0x1003).is_ok());
+    }
+
+    #[test]
+    fn semantic_watchpoint_access_parses() {
+        assert_eq!(
+            "write".parse::<WatchpointAccess>().unwrap(),
+            WatchpointAccess::Write
+        );
+        assert_eq!(
+            "read_write".parse::<WatchpointAccess>().unwrap(),
+            WatchpointAccess::ReadWrite
+        );
+        assert_eq!(
+            "read/write".parse::<WatchpointAccess>().unwrap(),
+            WatchpointAccess::ReadWrite
+        );
+        assert!("read".parse::<WatchpointAccess>().is_err());
     }
 }

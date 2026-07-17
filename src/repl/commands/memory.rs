@@ -8,7 +8,7 @@ use crate::expr::Expr;
 use crate::symbols::{FieldValue, ParsedType};
 use crate::types::{Value, VirtAddr};
 use crate::ui;
-use crate::unwind::{format_symbol, resolve_thread_trace_context};
+use crate::unwind::{format_symbol, resolve_thread_trace_context, try_format_symbol};
 
 use crate::repl::*;
 
@@ -33,6 +33,31 @@ repl_command! {
     names: ["dq"],
     usage: "dq <address> [length or end]",
     summary: "Display memory as quadwords (8 bytes).",
+    completion: Expression,
+}
+
+repl_command! {
+    cmd_dqs;
+    names: ["dqs", "dps"],
+    usage: "dqs <address> [count or end]",
+    summary: "Display memory as quadwords, annotating values that resolve to symbols.",
+    details: "raw stack triage: dqs @rsp scrapes return addresses when the unwinder can't",
+    completion: Expression,
+}
+
+repl_command! {
+    cmd_da;
+    names: ["da"],
+    usage: "da <address> [max-chars]",
+    summary: "Display a NUL-terminated ASCII string.",
+    completion: Expression,
+}
+
+repl_command! {
+    cmd_du;
+    names: ["du"],
+    usage: "du <address> [max-chars]",
+    summary: "Display a NUL-terminated UTF-16 string (e.g. a UNICODE_STRING Buffer).",
     completion: Expression,
 }
 
@@ -92,6 +117,28 @@ repl_command! {
     summary: "Search memory for a byte pattern.",
     details: "hex bytes: 4883792000740a or \\x48\\x83\\x79\\x20\\x00\\x74\\x0a",
     completion: [Expression, None, Expression],
+}
+
+fn page_bounded_unit_read_len(
+    address: VirtAddr,
+    remaining_units: usize,
+    unit_size: usize,
+) -> usize {
+    debug_assert!(remaining_units > 0);
+    debug_assert!(unit_size > 0);
+
+    let page_remaining = (0x1000 - (address.0 & 0xfff)) as usize;
+    let bounded = remaining_units
+        .saturating_mul(unit_size)
+        .min(page_remaining);
+    let whole_units = bounded - bounded % unit_size;
+    // A unit beginning at the final byte of a page must be read whole across
+    // the boundary; otherwise every read ends on a unit boundary.
+    if whole_units == 0 {
+        unit_size
+    } else {
+        whole_units
+    }
 }
 
 impl ReplState<'_> {
@@ -190,6 +237,131 @@ impl ReplState<'_> {
 
     fn cmd_dq(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
         self.display_memory_command(&invocation, 8, 8, MemoryDisplayMode::qwords())
+    }
+
+    fn cmd_dqs(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        let range = match AddressRange::parse(&invocation, &self.ctx.target, 16, 8) {
+            Ok(r) => r,
+            Err(e) => {
+                error!("{}", e);
+                return Ok(());
+            }
+        };
+
+        let mut data: Vec<u8> = vec![0u8; range.len()];
+        if let Err(e) = self.read_for_display(range.start, &mut data) {
+            println!("{e}\n");
+            return Ok(());
+        }
+
+        let dtb = self.ctx.target.current_process().dtb();
+        let trace = resolve_thread_trace_context(&self.ctx.target, dtb);
+        for (i, chunk) in data.chunks_exact(8).enumerate() {
+            let value = u64::from_le_bytes(chunk.try_into().unwrap());
+            let addr = (range.start + (i as u64) * 8).0;
+            match try_format_symbol(&self.ctx.target, &trace, value) {
+                Some(symbol) => println!(
+                    "{}  {:016x}  {}",
+                    ui::addr(addr),
+                    value,
+                    ui::symbol(&symbol)
+                ),
+                None => println!("{}  {:016x}", ui::addr(addr), value),
+            }
+        }
+        println!();
+
+        Ok(())
+    }
+
+    fn cmd_da(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        self.display_string_command(&invocation, "da", 1)
+    }
+
+    fn cmd_du(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        self.display_string_command(&invocation, "du", 2)
+    }
+
+    /// Shared `da`/`du` body: read a NUL-terminated string of `char_size`-wide
+    /// units, chunking reads at page boundaries so a string ending near an
+    /// unmapped page still displays up to the readable part.
+    fn display_string_command(
+        &mut self,
+        invocation: &CommandInvocation<'_>,
+        command: &str,
+        char_size: usize,
+    ) -> Result<()> {
+        let Some(start_arg) = invocation.arg(0) else {
+            println!("{}\n", command_help(command));
+            return Ok(());
+        };
+        let start = match Expr::eval(start_arg, &self.ctx.target) {
+            Ok(a) => a,
+            Err(e) => {
+                error!("{}", e);
+                return Ok(());
+            }
+        };
+        let max_chars = match invocation.arg(1) {
+            Some(arg) => match Expr::eval(arg, &self.ctx.target) {
+                Ok(v) if v.0 > 0 => v.0 as usize,
+                Ok(_) => {
+                    error!("invalid max-chars: {}", arg);
+                    return Ok(());
+                }
+                Err(e) => {
+                    error!("{}", e);
+                    return Ok(());
+                }
+            },
+            None => 256,
+        };
+
+        let mut units: Vec<u16> = Vec::new();
+        let mut terminated = false;
+        let mut failed_at = None;
+        let mut addr = start;
+        while units.len() < max_chars && !terminated {
+            // End each ordinary read at both a page boundary and a whole-unit
+            // boundary. If one UTF-16 unit itself straddles pages, read that
+            // unit whole so neither byte is discarded.
+            let want = page_bounded_unit_read_len(addr, max_chars - units.len(), char_size);
+            let mut buf = vec![0u8; want];
+            if let Err(e) = self.read_for_display(addr, &mut buf) {
+                failed_at = Some((addr, e));
+                break;
+            }
+            terminated = push_string_units(&buf, char_size, max_chars, &mut units);
+            addr += want as u64;
+        }
+
+        if units.is_empty()
+            && let Some((addr, e)) = failed_at
+        {
+            error!("failed to read string at {:#x}: {}", addr, e);
+            return Ok(());
+        }
+
+        let text: String = if char_size == 1 {
+            units.iter().map(|&u| u as u8 as char).collect()
+        } else {
+            String::from_utf16_lossy(&units)
+        };
+        let suffix = if failed_at.is_some() {
+            " <unreadable>".red().to_string()
+        } else if !terminated {
+            "...".bright_black().to_string()
+        } else {
+            String::new()
+        };
+        println!(
+            "{}  \"{}\"{}\n",
+            ui::addr(start.0),
+            text.escape_debug(),
+            suffix
+        );
+
+        Ok(())
     }
 
     fn cmd_disasm(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
@@ -536,5 +708,26 @@ impl ReplState<'_> {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::page_bounded_unit_read_len;
+    use crate::types::VirtAddr;
+
+    #[test]
+    fn utf16_page_chunks_never_drop_an_unaligned_unit_byte() {
+        // An unaligned string with three bytes left in the page reads one full
+        // unit, then reads the straddling unit whole across the boundary.
+        assert_eq!(page_bounded_unit_read_len(VirtAddr(0xffd), 8, 2), 2);
+        assert_eq!(page_bounded_unit_read_len(VirtAddr(0xfff), 7, 2), 2);
+    }
+
+    #[test]
+    fn string_page_chunks_respect_unit_budget() {
+        assert_eq!(page_bounded_unit_read_len(VirtAddr(0x100), 3, 2), 6);
+        assert_eq!(page_bounded_unit_read_len(VirtAddr(0x100), 3, 1), 3);
+        assert_eq!(page_bounded_unit_read_len(VirtAddr(0xffe), 1, 2), 2);
     }
 }

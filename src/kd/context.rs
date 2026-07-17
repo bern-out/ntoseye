@@ -102,6 +102,16 @@ pub fn build_register_map() -> RegisterMap {
         next_reg("es", OFFSET_SEG_ES, 2),
         next_reg("fs", OFFSET_SEG_FS, 2),
         next_reg("gs", OFFSET_SEG_GS, 2),
+        // Debug registers (native CONTEXT fields; GetContext/SetContext use
+        // CONTEXT_ALL, which includes CONTEXT_DEBUG_REGISTERS, so these
+        // round-trip). dr6 is the #DB status, dr7 the control word; dr0-dr3
+        // hold the linear breakpoint addresses.
+        next_reg("dr0", OFFSET_DR0, 8),
+        next_reg("dr1", OFFSET_DR1, 8),
+        next_reg("dr2", OFFSET_DR2, 8),
+        next_reg("dr3", OFFSET_DR3, 8),
+        next_reg("dr6", OFFSET_DR6, 8),
+        next_reg("dr7", OFFSET_DR7, 8),
         // Control registers come from AMD64 KSpecialRegisters
         next_reg("cr0", OFFSET_CR0, 8),
         next_reg("cr2", OFFSET_CR2, 8),

@@ -1,10 +1,12 @@
 // Derived from Microsoft Learn Windows driver debugger docs.
 // Source: https://learn.microsoft.com/windows-hardware/drivers/debugger/bug-check-code-reference2
+// Audited against all 379 linked code pages on 2026-07-16.
 
 use crate::backend::MemoryOps;
 use crate::dbg_backend::BugcheckInfo;
 use crate::error::Result;
 use crate::target::Target;
+use crate::trapframe::{KtrapFrame, read_ktrap_frame};
 use crate::types::VirtAddr;
 use crate::unwind::{ThreadTraceContext, format_symbol, resolve_thread_trace_context};
 
@@ -12,6 +14,8 @@ use crate::unwind::{ThreadTraceContext, format_symbol, resolve_thread_trace_cont
 pub struct BugcheckDescriptor {
     pub name: &'static str,
     pub description: Option<&'static str>,
+    /// Code-only fallback meanings. Use [`bugcheck_argument_descriptions`] for
+    /// a concrete stop because some parameter schemas depend on parameter 1.
     pub arguments: [&'static str; 4],
 }
 
@@ -36,6 +40,18 @@ pub struct BugcheckFault {
     pub driver: Option<String>,
 }
 
+/// A trap-frame address carried by a bugcheck parameter, with either the
+/// decoded `_KTRAP_FRAME` or the reason decoding failed.
+#[derive(Clone, Debug)]
+pub struct BugcheckTrapFrame {
+    pub address: u64,
+    pub frame: Option<KtrapFrame>,
+    /// Symbol for the frame's `Rip`, when the frame decoded.
+    pub rip_symbol: Option<String>,
+    /// Decode failure reason; `None` exactly when `frame` is present.
+    pub error: Option<String>,
+}
+
 /// A decoded, presentation-free bugcheck: the code resolved to a name and
 /// per-argument descriptions, the responsible driver (from the KD stream or the
 /// fault site), and the fault instruction when derivable. Hosts (REPL/SDK/MCP)
@@ -48,8 +64,26 @@ pub struct BugcheckAnalysis {
     pub driver: Option<String>,
     pub args: Vec<BugcheckArg>,
     pub fault: Option<BugcheckFault>,
+    /// Trap frames named by the bugcheck parameters, decoded from the guest.
+    pub trap_frames: Vec<BugcheckTrapFrame>,
     /// Where the data came from (e.g. an indirection through `nt!KiBugCheckData`).
     pub source: Option<String>,
+}
+
+/// Detailed result of resolving the frozen guest's `nt!KiBugCheckData`.
+/// Public hosts use [`current_bugcheck`]'s compact `Option`; the REPL also
+/// consumes failures so a bugcheck stop can explain missing or malformed data.
+pub(crate) enum CurrentBugcheckResolution {
+    Resolved(BugcheckAnalysis),
+    SymbolUnavailable,
+    Unresolved(CurrentBugcheckFailure),
+}
+
+pub(crate) struct CurrentBugcheckFailure {
+    pub address: VirtAddr,
+    pub slots: Option<[u64; BUGCHECK_DATA_SLOTS]>,
+    pub dereferenced_slots: Option<[u64; BUGCHECK_DATA_SLOTS]>,
+    pub reason: String,
 }
 
 pub fn plausible_bugcheck_code(code: u64) -> bool {
@@ -104,18 +138,223 @@ pub fn driver_filename_for_address(
 
 pub fn bugcheck_fault_ip(info: &BugcheckInfo) -> Option<u64> {
     let ip = match info.code {
-        // IRQL_NOT_LESS_OR_EQUAL / DRIVER_IRQL_NOT_LESS_OR_EQUAL:
-        // parameter 4 is the instruction address that referenced memory.
-        0x0000_000a | 0x0000_00d1 => info.parameters[3],
-        // PAGE_FAULT_IN_NONPAGED_AREA: parameter 3 is the instruction address
-        // when non-zero.
-        0x0000_0050 => info.parameters[2],
+        // The instruction address is parameter 1.
+        0x0000_0151 => info.parameters[0],
+        // The instruction address is parameter 2.
+        0x0000_001e | 0x0000_003b | 0x0000_007e | 0x0000_008e | 0x1000_007e | 0x1000_008e => {
+            info.parameters[1]
+        }
+        // The instruction address is parameter 3, when known.
+        0x0000_0050 | 0x0000_00cc | 0x0000_00cd | 0x0000_00ce | 0x0000_00cf | 0x0000_00d5
+        | 0x0000_00d6 => info.parameters[2],
+        // The instruction address is parameter 4.
+        0x0000_000a | 0x0000_002e | 0x0000_00c5 | 0x0000_00d0 | 0x0000_00d1 | 0x0000_00d3
+        | 0x0000_00d4 | 0x0000_01ea => info.parameters[3],
         // Other bugchecks may carry addresses, but not necessarily a faulting
         // instruction. For example, 0x4a arg1 is the system-call routine and
         // often resolves to an ntdll syscall stub, not the responsible driver.
         _ => 0,
     };
     (ip != 0).then_some(ip)
+}
+
+/// The trap-frame address a bugcheck's parameters carry, per the documented
+/// parameter meanings (mirrors the descriptor text in [`bugcheck_descriptor`]).
+/// Filtered to kernel pointers so a zeroed/garbage parameter is never chased.
+pub fn bugcheck_trap_frame_address(info: &BugcheckInfo) -> Option<u64> {
+    let addr = match info.code {
+        // PANIC_STACK_SWITCH: parameter 1 is the trap frame.
+        0x0000_002b => info.parameters[0],
+        // SET_OF_INVALID_CONTEXT: parameter 3 is the trap frame address.
+        0x0000_0030 => info.parameters[2],
+        // KERNEL_MODE_EXCEPTION_NOT_HANDLED and its minidump alias:
+        // parameter 3 is the trap frame.
+        0x0000_008e | 0x1000_008e => info.parameters[2],
+        // KERNEL_SECURITY_CHECK_FAILURE: parameter 2 is the trap frame address.
+        0x0000_0139 => info.parameters[1],
+        // UNSUPPORTED_INSTRUCTION_MODE: parameter 2 is the trap frame.
+        0x0000_0151 => info.parameters[1],
+        _ => return None,
+    };
+    looks_like_kernel_pointer(addr).then_some(addr)
+}
+
+/// Resolve parameter meanings that vary by bugcheck parameter values.
+///
+/// [`BugcheckDescriptor::arguments`] stays a code-only, conservative fallback;
+/// this function provides the precise schema used for a concrete stop.
+pub fn bugcheck_argument_descriptions(info: &BugcheckInfo) -> [&'static str; 4] {
+    match info.code {
+        0x0000_0077 if matches!(info.parameters[0], 0..=2) => [
+            "page retrieval result: 0 = page cache; 1 = disk; 2 = disk success with a short transfer",
+            "value where the kernel-stack signature should be",
+            "zero",
+            "address of the kernel-stack signature",
+        ],
+        0x0000_0077 => [
+            "status code",
+            "I/O status code",
+            "page-file number",
+            "offset into the page file",
+        ],
+        0x0000_007a if matches!(info.parameters[0], 1..=3) && info.parameters[2] == 0 => [
+            "lock type held (1, 2, or 3)",
+            "error status, usually an I/O status code",
+            "current process when parameter 1 is 1; zero when it is 2 or 3",
+            "virtual address that could not be paged into memory",
+        ],
+        0x0000_007a if matches!(info.parameters[0], 3..=4) && info.parameters[2] != 0 => [
+            "lock type held (3 or 4)",
+            "error status, typically an I/O status code",
+            "address of the InPageSupport structure",
+            "faulting memory address",
+        ],
+        0x0000_007a => [
+            "address of the page-table entry (PTE)",
+            "error status, usually an I/O status code",
+            "PTE contents",
+            "faulting memory address",
+        ],
+        0x0000_009f => match info.parameters[0] {
+            0x1 => [
+                "violation type: device freed with an outstanding power request",
+                "device object",
+                "reserved",
+                "reserved",
+            ],
+            0x2 => [
+                "violation type: power IRP completed without PoStartNextPowerIrp",
+                "target device object, if available",
+                "device object",
+                "driver object, if available",
+            ],
+            0x3 => [
+                "violation type: a device blocked a power IRP for too long",
+                "physical device object (PDO) of the stack",
+                "nt!_TRIAGE_9F_POWER",
+                "blocked IRP",
+            ],
+            0x4 => [
+                "violation type: power transition timed out waiting for PnP synchronization",
+                "timeout in seconds",
+                "thread holding the Plug-and-Play lock",
+                "nt!_TRIAGE_9F_PNP",
+            ],
+            0x5 => [
+                "violation type: directed power transition timed out",
+                "physical device object (PDO) of the stack",
+                "POP_FX_DEVICE object",
+                "reserved (zero)",
+            ],
+            0x6 => [
+                "violation type: directed power transition callback failed",
+                "POP_FX_DEVICE object",
+                "directed power down (1) or power up (0)",
+                "reserved (zero)",
+            ],
+            0x500 => [
+                "violation type: power IRP completed without PoStartNextPowerIrp",
+                "reserved",
+                "target device object, if available",
+                "device object",
+            ],
+            _ => [
+                "power-state violation type",
+                "meaning depends on parameter 1",
+                "meaning depends on parameter 1",
+                "meaning depends on parameter 1",
+            ],
+        },
+        0x0000_012b if info.parameters[2] == 0 && info.parameters[3] == 0 => [
+            "virtual address mapped to the corrupted page",
+            "physical page number",
+            "zero",
+            "zero",
+        ],
+        0x0000_012b => [
+            "compressed-store failure status",
+            "compressed size of the page being read",
+            "source buffer",
+            "target buffer",
+        ],
+        0x0000_0131 => match info.parameters[0] {
+            0 => [
+                "failure type: invalid feature mask or extended processor state is disabled",
+                "nonzero if extended state is enabled",
+                "low 32 bits of the feature mask",
+                "high 32 bits of the feature mask",
+            ],
+            1 => [
+                "failure type: save or restore attempted above DISPATCH_LEVEL",
+                "IRQL",
+                "reserved",
+                "reserved",
+            ],
+            2 => [
+                "failure type: saved state is for an equal or higher level",
+                "saved level",
+                "current level",
+                "reserved",
+            ],
+            3 => [
+                "failure type: saved state is for a different thread",
+                "saved thread",
+                "current thread",
+                "reserved",
+            ],
+            4 => [
+                "failure type: saved state is for a different level",
+                "saved level",
+                "current level",
+                "reserved",
+            ],
+            _ => [
+                "extended-processor-state failure type",
+                "meaning depends on parameter 1",
+                "meaning depends on parameter 1",
+                "meaning depends on parameter 1",
+            ],
+        },
+        0x0000_0133 if info.parameters[0] == 0 => [
+            "violation type: a single DPC or ISR exceeded its time allotment",
+            "DPC time count in ticks",
+            "DPC time allotment in ticks",
+            "nt!DPC_WATCHDOG_GLOBAL_TRIAGE_BLOCK",
+        ],
+        0x0000_0133 if info.parameters[0] == 1 => [
+            "violation type: cumulative time at DISPATCH_LEVEL or above was excessive",
+            "watchdog period",
+            "nt!DPC_WATCHDOG_GLOBAL_TRIAGE_BLOCK",
+            "reserved",
+        ],
+        0x0000_0143 if info.parameters[0] == 1 => [
+            "failure type: PEP rejected a required notification",
+            "PEP runtime notification type",
+            "notification message",
+            "processor device context issuing the notification",
+        ],
+        0x0000_0143 if info.parameters[0] == 2 => [
+            "failure type: PEP returned an invalid processor idle state",
+            "invalid-state subtype",
+            "meaning depends on parameter 2",
+            "meaning depends on parameter 2",
+        ],
+        0x0000_0159 if info.parameters[0] & 0xf000 == 0x3000 => [
+            "IOMMU vendor disambiguation (0x3xxx)",
+            "status",
+            "PASID",
+            "directory base",
+        ],
+        0x0000_0159 => [
+            "IOMMU vendor disambiguation",
+            "fault packet",
+            "vendor-specific fault-packet data",
+            "vendor-specific fault-packet data",
+        ],
+        _ => bugcheck_descriptor(info.code)
+            .map(|descriptor| descriptor.arguments)
+            .unwrap_or(GENERIC_BUGCHECK_ARGS),
+    }
 }
 
 pub fn bugcheck_site(
@@ -139,9 +378,7 @@ pub fn analyze_bugcheck(debugger: &Target, info: &BugcheckInfo) -> BugcheckAnaly
         .unwrap_or("UNKNOWN_BUGCHECK")
         .to_string();
     let description = descriptor.and_then(|d| d.description).map(str::to_string);
-    let arg_descriptions = descriptor
-        .map(|d| d.arguments)
-        .unwrap_or(GENERIC_BUGCHECK_ARGS);
+    let arg_descriptions = bugcheck_argument_descriptions(info);
     let driver = info
         .driver
         .clone()
@@ -156,6 +393,24 @@ pub fn analyze_bugcheck(debugger: &Target, info: &BugcheckInfo) -> BugcheckAnaly
         })
         .collect();
     let fault = site.map(|(ip, symbol, driver)| BugcheckFault { ip, symbol, driver });
+    let trap_frames = bugcheck_trap_frame_address(info)
+        .map(|address| {
+            let (frame, error) = match read_ktrap_frame(debugger, VirtAddr(address)) {
+                Ok(frame) => (Some(frame), None),
+                Err(error) => (None, Some(error.to_string())),
+            };
+            let rip_symbol = frame
+                .as_ref()
+                .map(|frame| format_symbol(debugger, &trace, frame.rip));
+            BugcheckTrapFrame {
+                address,
+                frame,
+                rip_symbol,
+                error,
+            }
+        })
+        .into_iter()
+        .collect();
 
     BugcheckAnalysis {
         code: info.code,
@@ -164,37 +419,77 @@ pub fn analyze_bugcheck(debugger: &Target, info: &BugcheckInfo) -> BugcheckAnaly
         driver,
         args,
         fault,
+        trap_frames,
         source: None,
     }
 }
 
-/// Read `nt!KiBugCheckData` from the frozen guest and decode it, following one
+/// Read and resolve `nt!KiBugCheckData` from the frozen guest, following one
 /// level of pointer indirection (some builds store the data behind a pointer in
-/// the first slot). Returns `None` when no plausible bugcheck code is present
-/// (i.e. the guest is not bugchecking, or the symbol/memory is unavailable).
-pub fn current_bugcheck(debugger: &Target) -> Option<BugcheckAnalysis> {
+/// the first slot). Unlike [`current_bugcheck`], this preserves diagnostics for
+/// the REPL's bugcheck-stop banner.
+pub(crate) fn resolve_current_bugcheck(debugger: &Target) -> CurrentBugcheckResolution {
     let kernel_dtb = debugger.guest.ntoskrnl.dtb();
-    let addr = debugger
+    let Some(address) = debugger
         .symbols
-        .find_symbol_across_modules(kernel_dtb, "KiBugCheckData")?;
+        .find_symbol_across_modules(kernel_dtb, "KiBugCheckData")
+    else {
+        return CurrentBugcheckResolution::SymbolUnavailable;
+    };
     let mem = debugger.guest.ntoskrnl.memory();
-    let direct = read_bugcheck_data(&mem, addr).ok()?;
+    let direct = match read_bugcheck_data(&mem, address) {
+        Ok(data) => data,
+        Err(error) => {
+            return CurrentBugcheckResolution::Unresolved(CurrentBugcheckFailure {
+                address,
+                slots: None,
+                dereferenced_slots: None,
+                reason: format!("failed to read nt!KiBugCheckData: {error}"),
+            });
+        }
+    };
 
     let (data, source) = if plausible_bugcheck_code(direct[0]) {
         (direct, None)
     } else if looks_like_kernel_pointer(direct[0]) {
-        let indirect_addr = VirtAddr(direct[0]);
-        let indirect = read_bugcheck_data(&mem, indirect_addr).ok()?;
-        if plausible_bugcheck_code(indirect[0]) {
-            (
+        let indirect_address = VirtAddr(direct[0]);
+        match read_bugcheck_data(&mem, indirect_address) {
+            Ok(indirect) if plausible_bugcheck_code(indirect[0]) => (
                 indirect,
-                Some(format!("nt!KiBugCheckData -> {indirect_addr:#x}")),
-            )
-        } else {
-            return None;
+                Some(format!("nt!KiBugCheckData -> {indirect_address:#x}")),
+            ),
+            Ok(indirect) => {
+                return CurrentBugcheckResolution::Unresolved(CurrentBugcheckFailure {
+                    address,
+                    slots: Some(direct),
+                    dereferenced_slots: Some(indirect),
+                    reason: format!(
+                        "first slot looks like a pointer to {indirect_address:#x}, but dereferenced first slot {:#x} is not a plausible bugcheck code",
+                        indirect[0]
+                    ),
+                });
+            }
+            Err(error) => {
+                return CurrentBugcheckResolution::Unresolved(CurrentBugcheckFailure {
+                    address,
+                    slots: Some(direct),
+                    dereferenced_slots: None,
+                    reason: format!(
+                        "first slot looks like a pointer to {indirect_address:#x}, but reading that address failed: {error}"
+                    ),
+                });
+            }
         }
     } else {
-        return None;
+        return CurrentBugcheckResolution::Unresolved(CurrentBugcheckFailure {
+            address,
+            slots: Some(direct),
+            dereferenced_slots: None,
+            reason: format!(
+                "first slot {:#x} is not a plausible bugcheck code",
+                direct[0]
+            ),
+        });
     };
 
     let info = BugcheckInfo {
@@ -204,7 +499,19 @@ pub fn current_bugcheck(debugger: &Target) -> Option<BugcheckAnalysis> {
     };
     let mut analysis = analyze_bugcheck(debugger, &info);
     analysis.source = source;
-    Some(analysis)
+    CurrentBugcheckResolution::Resolved(analysis)
+}
+
+/// Read `nt!KiBugCheckData` from the frozen guest and decode it. Returns `None`
+/// when no plausible bugcheck code is present or the symbol/memory is
+/// unavailable.
+pub fn current_bugcheck(debugger: &Target) -> Option<BugcheckAnalysis> {
+    match resolve_current_bugcheck(debugger) {
+        CurrentBugcheckResolution::Resolved(analysis) => Some(analysis),
+        CurrentBugcheckResolution::SymbolUnavailable | CurrentBugcheckResolution::Unresolved(_) => {
+            None
+        }
+    }
 }
 
 pub fn bugcheck_descriptor(code: u32) -> Option<BugcheckDescriptor> {
@@ -250,7 +557,9 @@ pub fn bugcheck_descriptor(code: u32) -> Option<BugcheckDescriptor> {
         }),
         0x00000006 => Some(BugcheckDescriptor {
             name: "INVALID_PROCESS_DETACH_ATTEMPT",
-            description: None,
+            description: Some(
+                "This can occur when KeStackAttachProcess is followed by KeUnstackDetachProcess from a load-image notification callback.",
+            ),
             arguments: ["", "", "", ""],
         }),
         0x00000007 => Some(BugcheckDescriptor {
@@ -299,7 +608,9 @@ pub fn bugcheck_descriptor(code: u32) -> Option<BugcheckDescriptor> {
         }),
         0x0000000e => Some(BugcheckDescriptor {
             name: "NO_USER_MODE_CONTEXT",
-            description: None,
+            description: Some(
+                "If control returns from the initial procedure while starting a system thread, this bug check occurs.",
+            ),
             arguments: ["", "", "", ""],
         }),
         0x0000000f => Some(BugcheckDescriptor {
@@ -404,7 +715,7 @@ pub fn bugcheck_descriptor(code: u32) -> Option<BugcheckDescriptor> {
                 "the exception code that wasn't handled",
                 "the address where the exception occurred",
                 "exception information parameter 0 of the exception record",
-                "exception information parameter 0 of the exception record",
+                "exception information parameter 1 of the exception record",
             ],
         }),
         0x0000001f => Some(BugcheckDescriptor {
@@ -803,10 +1114,10 @@ pub fn bugcheck_descriptor(code: u32) -> Option<BugcheckDescriptor> {
                 "Invalid system memory was referenced. This cannot be protected by try-except. Typically the address is just plain bad or it is pointing at freed memory.",
             ),
             arguments: [
-                "memory referenced",
-                "value 0 = read operation, 1 = write operation",
-                "if non-zero, the instruction address which referenced the bad memory",
-                "(reserved)",
+                "memory address referenced",
+                "access type (x64: 0 = read; 1 = legacy write; 2 = modern write; 0x10 = execute)",
+                "address that referenced memory, if known",
+                "page-fault subtype on newer Windows; reserved on older versions",
             ],
         }),
         0x00000051 => Some(BugcheckDescriptor {
@@ -878,7 +1189,9 @@ pub fn bugcheck_descriptor(code: u32) -> Option<BugcheckDescriptor> {
         }),
         0x0000005c => Some(BugcheckDescriptor {
             name: "HAL_INITIALIZATION_FAILED",
-            description: None,
+            description: Some(
+                "This indicates that initialization of the hardware abstraction layer (HAL) failed.",
+            ),
             arguments: ["", "", "", ""],
         }),
         0x0000005d => Some(BugcheckDescriptor {
@@ -1091,15 +1404,17 @@ pub fn bugcheck_descriptor(code: u32) -> Option<BugcheckDescriptor> {
                 "This bug check indicates that the requested page of kernel data from the paging file could not be read into memory.",
             ),
             arguments: [
-                "0: The page of kernel data was retrieved from page cache. 1: The page was retrieved from a disk",
-                "the value that appears in the stack where the signature should be",
-                "0",
-                "the address of the signature on the kernel stack",
+                "page retrieval result or status code",
+                "meaning depends on parameter 1",
+                "meaning depends on parameter 1",
+                "meaning depends on parameter 1",
             ],
         }),
         0x00000078 => Some(BugcheckDescriptor {
             name: "PHASE0_EXCEPTION",
-            description: None,
+            description: Some(
+                "This occurs when an unexpected break is encountered during HAL initialization, such as using the /break boot option without enabling kernel debugging.",
+            ),
             arguments: ["", "", "", ""],
         }),
         0x00000079 => Some(BugcheckDescriptor {
@@ -1115,10 +1430,10 @@ pub fn bugcheck_descriptor(code: u32) -> Option<BugcheckDescriptor> {
                 "This bug check indicates that the requested page of kernel data from the paging file couldn't be read into memory.",
             ),
             arguments: [
-                "the lock type that was held (1, 2, or 3)",
-                "the error status (usually an I/O status code)",
-                "if lock type is 1: current process; if lock type is 2 or 3: 0",
-                "the virtual address that couldn't be paged into memory",
+                "lock type or PTE address; schema also depends on parameter 3",
+                "error status",
+                "process, InPageSupport address, or PTE contents",
+                "faulting memory address or page-file offset",
             ],
         }),
         0x0000007b => Some(BugcheckDescriptor {
@@ -1316,10 +1631,10 @@ pub fn bugcheck_descriptor(code: u32) -> Option<BugcheckDescriptor> {
                 "This bug check indicates that a fatal machine check exception has occurred.",
             ),
             arguments: [
-                "the low 32 bits of P5_MC_TYPE Machine Service Report (MSR)",
-                "the address of the MCA_EXCEPTION structure",
-                "the high 32 bits of P5_MC_ADDR MSR",
-                "the low 32 bits of P5_MC_ADDR MSR",
+                "MCA bank number",
+                "address of the MCA_EXCEPTION structure",
+                "high 32 bits of the MCA bank's MCi_STATUS MSR",
+                "low 32 bits of the MCA bank's MCi_STATUS MSR",
             ],
         }),
         0x0000009e => Some(BugcheckDescriptor {
@@ -1340,10 +1655,10 @@ pub fn bugcheck_descriptor(code: u32) -> Option<BugcheckDescriptor> {
                 "A driver has failed to complete a power IRP within a specific time.",
             ),
             arguments: [
-                "a device object has been blocking an Irp for too long a time",
-                "physical Device Object of the stack",
-                "nt!_TRIAGE_9F_POWER on Win7 and higher, otherwise the Functional Device Object of the stack",
-                "the blocked IRP",
+                "power-state violation type",
+                "meaning depends on parameter 1",
+                "meaning depends on parameter 1",
+                "meaning depends on parameter 1",
             ],
         }),
         0x000000a0 => Some(BugcheckDescriptor {
@@ -1681,7 +1996,7 @@ pub fn bugcheck_descriptor(code: u32) -> Option<BugcheckDescriptor> {
             arguments: [
                 "memory referenced",
                 "IRQL",
-                "value 0 = read operation, 1 = write operation",
+                "value 0 = read operation, 1 = write operation, 2 or 8 = execute operation",
                 "address which referenced memory",
             ],
         }),
@@ -2477,10 +2792,10 @@ pub fn bugcheck_descriptor(code: u32) -> Option<BugcheckDescriptor> {
                 "This bug check indicates that the Windows memory manager detected corruption. That corruption could only have been caused by a component accessing memory using physical addressing.",
             ),
             arguments: [
-                "virtual address maps to the corrupted page",
-                "physical page number",
-                "zero",
-                "zero",
+                "memory-manager address or compressed-store failure status",
+                "physical page number or compressed page size",
+                "zero or compressed-store source buffer",
+                "zero or compressed-store target buffer",
             ],
         }),
         0x0000012c => Some(BugcheckDescriptor {
@@ -2534,10 +2849,10 @@ pub fn bugcheck_descriptor(code: u32) -> Option<BugcheckDescriptor> {
                 "This indicates that an invalid combination of parameters was detected while saving or restoring extended processor state.",
             ),
             arguments: [
-                "0 - Invalid feature mask was passed or extended processor state is not enabled",
-                "nonzero if extended state is enabled",
-                "the low 32 bits of the feature mask",
-                "the high 32 bits of the feature mask",
+                "extended-processor-state failure type",
+                "meaning depends on parameter 1",
+                "meaning depends on parameter 1",
+                "meaning depends on parameter 1",
             ],
         }),
         0x00000132 => Some(BugcheckDescriptor {
@@ -2558,10 +2873,10 @@ pub fn bugcheck_descriptor(code: u32) -> Option<BugcheckDescriptor> {
                 "The DPC watchdog detected a prolonged run time at an IRQL of DISPATCH_LEVEL or above.",
             ),
             arguments: [
-                "a single DPC or ISR exceeded its time allotment. The offending",
-                "the DPC time count (in ticks)",
-                "the DPC time allotment (in ticks)",
-                "",
+                "watchdog violation type",
+                "meaning depends on parameter 1",
+                "meaning depends on parameter 1",
+                "meaning depends on parameter 1",
             ],
         }),
         0x00000134 => Some(BugcheckDescriptor {
@@ -2680,10 +2995,10 @@ pub fn bugcheck_descriptor(code: u32) -> Option<BugcheckDescriptor> {
                 "This indicates that the Processor Power Management (PPM) driver encountered a fatal error.",
             ),
             arguments: [
-                "1 - Power Engine Plugin(PEP) failed to accept a required notification",
-                "PEP runtime Notification type",
-                "pointer to notification message",
-                "pointer to processor device context (FDO_DATA) issuing the notification",
+                "processor-driver failure type",
+                "meaning depends on parameter 1",
+                "meaning depends on parameter 1",
+                "meaning depends on parameter 1",
             ],
         }),
         0x00000144 => Some(BugcheckDescriptor {
@@ -2872,10 +3187,10 @@ pub fn bugcheck_descriptor(code: u32) -> Option<BugcheckDescriptor> {
                 "This indicates that the IOMMU has delivered a page fault against an ASID that was in the process of being freed. The driver was responsible for completing any inflight requests before this point in time and this bugcheck indicates a driver in the system did not do so.",
             ),
             arguments: [
-                "IOMMU Vendor disambiguation",
-                "pointer to fault packet",
-                "vendor specific fault packet data",
-                "vendor specific fault packet data",
+                "IOMMU vendor disambiguation",
+                "fault packet or status, depending on parameter 1",
+                "vendor-specific data or PASID, depending on parameter 1",
+                "vendor-specific data or directory base, depending on parameter 1",
             ],
         }),
         0x0000015a => Some(BugcheckDescriptor {
@@ -3083,7 +3398,9 @@ pub fn bugcheck_descriptor(code: u32) -> Option<BugcheckDescriptor> {
         }),
         0x0000018d => Some(BugcheckDescriptor {
             name: "SECURE_FAULT_UNHANDLED",
-            description: None,
+            description: Some(
+                "This indicates that a secure fault originating in the secure kernel could not be handled.",
+            ),
             arguments: [
                 "secure fault code bitmask - values below",
                 "secure fault VA (only applicable to certain secure fault types)",
@@ -3093,7 +3410,9 @@ pub fn bugcheck_descriptor(code: u32) -> Option<BugcheckDescriptor> {
         }),
         0x0000018e => Some(BugcheckDescriptor {
             name: "KERNEL_PARTITION_REFERENCE_VIOLATION",
-            description: None,
+            description: Some(
+                "This indicates that a partition was improperly dereferenced, usually by a kernel-mode driver, or that serious kernel data corruption occurred.",
+            ),
             arguments: ["", "", "", ""],
         }),
         0x00000191 => Some(BugcheckDescriptor {
@@ -3177,10 +3496,10 @@ pub fn bugcheck_descriptor(code: u32) -> Option<BugcheckDescriptor> {
                 "This indicates that Win32k did not turn the monitor on in a timely manner.",
             ),
             arguments: [
-                "failure type (win32kbase!POWER_WATCHDOG_TYPE) 0x10 : The power request queue is not making progress 2 - Pointer to the thread processing power requests,",
-                "see parameter 1",
-                "see parameter 1",
-                "see parameter 1",
+                "win32k power-watchdog failure type",
+                "meaning depends on parameter 1",
+                "meaning depends on parameter 1",
+                "meaning depends on parameter 1",
             ],
         }),
         0x000001a0 => Some(BugcheckDescriptor {
@@ -3210,14 +3529,24 @@ pub fn bugcheck_descriptor(code: u32) -> Option<BugcheckDescriptor> {
             description: Some(
                 "This BugCheck indicates that exception dispatch crossed over into an invalid kernel stack. This might indicate that the kernel stack pointer has become corrupted during exception dispatch or unwind (e.g. due to stack corruption of a frame pointer), or that a driver is executing off of a stack that is not a legal kernel stack.",
             ),
-            arguments: ["", "", "", ""],
+            arguments: [
+                "pointer to the current stack",
+                "estimated active kernel stack-limit type",
+                "context record for the active exception dispatch",
+                "exception record for the active exception",
+            ],
         }),
         0x000001ab => Some(BugcheckDescriptor {
             name: "UNWIND_ON_INVALID_STACK",
             description: Some(
                 "It indicates that an attempt was made to access memory outside of the valid kernel stack range. In particular, this BugCheck indicates that stack unwinding crossed over into an invalid kernel stack. This might indicate that the kernel stack pointer has become corrupted during exception dispatch or unwind (e.g. due to stack corruption of a frame pointer), or that a driver is executing off of a stack that is not a legal kernel stack.",
             ),
-            arguments: ["", "", "", ""],
+            arguments: [
+                "pointer to the current stack",
+                "estimated active kernel stack-limit type",
+                "context record active when the invalid stack was encountered",
+                "reserved (zero)",
+            ],
         }),
         0x000001c6 => Some(BugcheckDescriptor {
             name: "FAST_ERESOURCE_PRECONDITION_VIOLATION",
@@ -3317,7 +3646,9 @@ pub fn bugcheck_descriptor(code: u32) -> Option<BugcheckDescriptor> {
         }),
         0x000001d2 => Some(BugcheckDescriptor {
             name: "WORKER_THREAD_INVALID_STATE",
-            description: None,
+            description: Some(
+                "This indicates that an executive worker thread is in an invalid state.",
+            ),
             arguments: [
                 "type of failure",
                 "address of the worker thread",
@@ -3451,9 +3782,9 @@ pub fn bugcheck_descriptor(code: u32) -> Option<BugcheckDescriptor> {
                 "This indicates that the operating system encountered an error caused by a networking driver managed by WiFiCx. The Wi-Fi WDF class extensions (WiFiCx) supports KMDF-based Wi-Fi client driver for Wi-Fi devices. For more information, see Introduction to the Wi-Fi WDF class extension (WiFiCx).",
             ),
             arguments: [
-                "",
-                "dependent on Param 1",
-                "dependent on Param 1",
+                "WiFiCx bugcheck subtype",
+                "meaning depends on parameter 1",
+                "meaning depends on parameter 1",
                 "reserved",
             ],
         }),
@@ -3550,17 +3881,19 @@ pub fn bugcheck_descriptor(code: u32) -> Option<BugcheckDescriptor> {
         }),
         0x00000356 => Some(BugcheckDescriptor {
             name: "XBOX_ERACTRL_CS_TIMEOUT",
-            description: None,
+            description: Some(
+                "The eractrl.sys driver could not transition an Xbox console to or from connected standby within the allowed time.",
+            ),
             arguments: ["CS exit", "reserved", "reserved", "reserved"],
         }),
         0x00000bfe => Some(BugcheckDescriptor {
             name: "BC_BLUETOOTH_VERIFIER_FAULT",
             description: Some("This indicates that a driver has caused a violation."),
             arguments: [
-                "the subtype of the Bluetooth verifier fault. 0x1 : An attempt was made to submit a Bluetooth Request Block that is already in use 2 - Brb pointer 3 - Reserved 4 - Reserved 0x2 : An attempt was made to free a Bluetooth",
-                "see parameter 1",
-                "see parameter 1",
-                "see parameter 1",
+                "Bluetooth verifier fault subtype",
+                "meaning depends on parameter 1",
+                "meaning depends on parameter 1",
+                "meaning depends on parameter 1",
             ],
         }),
         0x00000bff => Some(BugcheckDescriptor {
@@ -3569,10 +3902,10 @@ pub fn bugcheck_descriptor(code: u32) -> Option<BugcheckDescriptor> {
                 "This indicates that The Bluetooth miniport extensible driver verifier has caught a violation.",
             ),
             arguments: [
-                "the subtype of the Bluetooth verifier fault. 0x1 : An attempt was made to return a packet with type that mis-matched its original request",
-                "see parameter 1",
-                "see parameter 1",
-                "see parameter 1",
+                "Bluetooth miniport verifier fault subtype",
+                "meaning depends on parameter 1",
+                "meaning depends on parameter 1",
+                "meaning depends on parameter 1",
             ],
         }),
         0x00020001 => Some(BugcheckDescriptor {
@@ -3585,7 +3918,12 @@ pub fn bugcheck_descriptor(code: u32) -> Option<BugcheckDescriptor> {
             description: Some(
                 "This indicates that a system thread generated an exception which the error handler did not catch.",
             ),
-            arguments: ["", "", "", ""],
+            arguments: [
+                "the exception code that wasn't handled",
+                "the address where the exception occurred",
+                "the address of the exception record",
+                "the address of the context record",
+            ],
         }),
         0x1000007f => Some(BugcheckDescriptor {
             name: "UNEXPECTED_KERNEL_MODE_TRAP_M",
@@ -3599,14 +3937,24 @@ pub fn bugcheck_descriptor(code: u32) -> Option<BugcheckDescriptor> {
             description: Some(
                 "This indicates that a kernel-mode program generated an exception which the error handler did not catch.",
             ),
-            arguments: ["", "", "", ""],
+            arguments: [
+                "the exception code that was not handled",
+                "the address where the exception occurred",
+                "the trap frame",
+                "reserved",
+            ],
         }),
         0x100000ea => Some(BugcheckDescriptor {
             name: "THREAD_STUCK_IN_DEVICE_DRIVER_M",
             description: Some(
                 "This indicates that a thread in a device driver is endlessly spinning.",
             ),
-            arguments: ["", "", "", ""],
+            arguments: [
+                "a pointer to the stuck thread object",
+                "a pointer to the DEFERRED_WATCHDOG object",
+                "a pointer to the offending driver name",
+                "in the kernel debugger: The number of times the \"intercepted\" bug check 0xEA was hit On the blue screen: 1",
+            ],
         }),
         0x4000008a => Some(BugcheckDescriptor {
             name: "THREAD_TERMINATE_HELD_MUTEX",
@@ -3653,5 +4001,174 @@ pub fn bugcheck_descriptor(code: u32) -> Option<BugcheckDescriptor> {
             arguments: ["reserved", "reserved", "reserved", "reserved"],
         }),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(code: u32, parameters: [u64; 4]) -> BugcheckInfo {
+        BugcheckInfo {
+            code,
+            parameters,
+            driver: None,
+        }
+    }
+
+    #[test]
+    fn trap_frame_parameter_mapping_matches_descriptors() {
+        let frame = 0xffff_b000_1234_5000u64;
+        // PANIC_STACK_SWITCH: arg1.
+        assert_eq!(
+            bugcheck_trap_frame_address(&info(0x2b, [frame, 0, 0, 0])),
+            Some(frame)
+        );
+        // SET_OF_INVALID_CONTEXT: arg3.
+        assert_eq!(
+            bugcheck_trap_frame_address(&info(0x30, [1, 2, frame, 0])),
+            Some(frame)
+        );
+        // KERNEL_MODE_EXCEPTION_NOT_HANDLED: arg3.
+        assert_eq!(
+            bugcheck_trap_frame_address(&info(0x8e, [0xc0000005, 0, frame, 0])),
+            Some(frame)
+        );
+        // KERNEL_SECURITY_CHECK_FAILURE: arg2.
+        assert_eq!(
+            bugcheck_trap_frame_address(&info(0x139, [3, frame, 0, 0])),
+            Some(frame)
+        );
+        // KERNEL_MODE_EXCEPTION_NOT_HANDLED_M: arg3.
+        assert_eq!(
+            bugcheck_trap_frame_address(&info(0x1000008e, [0xc0000005, 0, frame, 0])),
+            Some(frame)
+        );
+        // UNSUPPORTED_INSTRUCTION_MODE: arg2.
+        assert_eq!(
+            bugcheck_trap_frame_address(&info(0x151, [0, frame, 0, 0])),
+            Some(frame)
+        );
+    }
+
+    #[test]
+    fn trap_frame_requires_kernel_pointer() {
+        // A zeroed or user-mode parameter is not chased.
+        assert_eq!(
+            bugcheck_trap_frame_address(&info(0x139, [3, 0, 0, 0])),
+            None
+        );
+        assert_eq!(
+            bugcheck_trap_frame_address(&info(0x8e, [0xc0000005, 0, 0x7ffe_0000, 0])),
+            None
+        );
+    }
+
+    #[test]
+    fn codes_without_documented_trap_frames_yield_none() {
+        let kernel_ptr = 0xffff_b000_1234_5000u64;
+        for code in [0x0a, 0x1e, 0x3b, 0x50, 0x7e, 0xd1] {
+            assert_eq!(
+                bugcheck_trap_frame_address(&info(code, [kernel_ptr; 4])),
+                None,
+                "code {code:#x} must not claim a trap frame"
+            );
+        }
+    }
+
+    #[test]
+    fn fault_ip_parameter_mapping_matches_descriptors() {
+        let parameters = [0x1111, 0x2222, 0x3333, 0x4444];
+        assert_eq!(bugcheck_fault_ip(&info(0x151, parameters)), Some(0x1111));
+        for code in [0x1e, 0x3b, 0x7e, 0x8e, 0x1000007e, 0x1000008e] {
+            assert_eq!(bugcheck_fault_ip(&info(code, parameters)), Some(0x2222));
+        }
+        for code in [0x50, 0xcc, 0xcd, 0xce, 0xcf, 0xd5, 0xd6] {
+            assert_eq!(bugcheck_fault_ip(&info(code, parameters)), Some(0x3333));
+        }
+        for code in [0x0a, 0x2e, 0xc5, 0xd0, 0xd1, 0xd3, 0xd4, 0x1ea] {
+            assert_eq!(bugcheck_fault_ip(&info(code, parameters)), Some(0x4444));
+        }
+        assert_eq!(bugcheck_fault_ip(&info(0xdead, parameters)), None);
+    }
+
+    #[test]
+    fn conditional_argument_descriptions_follow_parameter_values() {
+        assert_eq!(
+            bugcheck_argument_descriptions(&info(0x77, [1, 0, 0, 0]))[1],
+            "value where the kernel-stack signature should be"
+        );
+        assert_eq!(
+            bugcheck_argument_descriptions(&info(0x77, [0xc000000e, 0, 0, 0]))[1],
+            "I/O status code"
+        );
+        assert_eq!(
+            bugcheck_argument_descriptions(&info(0x7a, [3, 0, 0, 0]))[2],
+            "current process when parameter 1 is 1; zero when it is 2 or 3"
+        );
+        assert_eq!(
+            bugcheck_argument_descriptions(&info(0x7a, [3, 0, 1, 0]))[2],
+            "address of the InPageSupport structure"
+        );
+        assert_eq!(
+            bugcheck_argument_descriptions(&info(0x7a, [5, 0, 0, 0]))[0],
+            "address of the page-table entry (PTE)"
+        );
+        assert_eq!(
+            bugcheck_argument_descriptions(&info(0x9f, [4, 0, 0, 0]))[1],
+            "timeout in seconds"
+        );
+        assert_eq!(
+            bugcheck_argument_descriptions(&info(0x12b, [0, 0, 1, 1]))[0],
+            "compressed-store failure status"
+        );
+        assert_eq!(
+            bugcheck_argument_descriptions(&info(0x131, [3, 0, 0, 0]))[1],
+            "saved thread"
+        );
+        assert_eq!(
+            bugcheck_argument_descriptions(&info(0x133, [1, 0, 0, 0]))[1],
+            "watchdog period"
+        );
+        assert_eq!(
+            bugcheck_argument_descriptions(&info(0x143, [2, 0, 0, 0]))[1],
+            "invalid-state subtype"
+        );
+        assert_eq!(
+            bugcheck_argument_descriptions(&info(0x159, [0x3001, 0, 0, 0]))[2],
+            "PASID"
+        );
+    }
+
+    #[test]
+    fn minidump_aliases_reuse_base_parameter_schemas() {
+        for (alias, base) in [
+            (0x1000007e, 0x7e),
+            (0x1000007f, 0x7f),
+            (0x1000008e, 0x8e),
+            (0x100000ea, 0xea),
+        ] {
+            assert_eq!(
+                bugcheck_descriptor(alias).unwrap().arguments,
+                bugcheck_descriptor(base).unwrap().arguments
+            );
+        }
+    }
+
+    #[test]
+    fn page_fault_descriptor_covers_current_x64_values_and_subtype() {
+        let descriptor = bugcheck_descriptor(0x50).unwrap();
+        assert!(descriptor.arguments[1].contains("2 = modern write"));
+        assert!(descriptor.arguments[1].contains("0x10 = execute"));
+        assert!(descriptor.arguments[3].contains("page-fault subtype"));
+    }
+
+    #[test]
+    fn d1_access_argument_documents_execute_faults() {
+        let descriptor = bugcheck_descriptor(0xd1).unwrap();
+        assert_eq!(
+            descriptor.arguments[2],
+            "value 0 = read operation, 1 = write operation, 2 or 8 = execute operation"
+        );
     }
 }

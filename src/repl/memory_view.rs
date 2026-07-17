@@ -102,6 +102,26 @@ pub fn repeat_pattern(pattern: &[u8], length: usize) -> Vec<u8> {
     filled
 }
 
+/// Append `char_size`-wide (1 or 2 bytes, little-endian) string units from
+/// `buf` to `out` until a NUL unit, `max` total units, or the buffer runs out
+/// of whole units. Returns true when the NUL terminator was reached.
+pub fn push_string_units(buf: &[u8], char_size: usize, max: usize, out: &mut Vec<u16>) -> bool {
+    for unit in buf.chunks_exact(char_size) {
+        if out.len() >= max {
+            return false;
+        }
+        let value = match char_size {
+            1 => unit[0] as u16,
+            _ => u16::from_le_bytes([unit[0], unit[1]]),
+        };
+        if value == 0 {
+            return true;
+        }
+        out.push(value);
+    }
+    false
+}
+
 pub enum ItemFormat {
     Bytes,
     Dwords,
@@ -211,4 +231,67 @@ pub fn display_memory(start_address: VirtAddr, data: &[u8], mode: &MemoryDisplay
     }
 
     println!();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::push_string_units;
+
+    #[test]
+    fn ascii_stops_at_nul_without_pushing_it() {
+        let mut out = Vec::new();
+        let terminated = push_string_units(b"hi\0junk", 1, 64, &mut out);
+        assert!(terminated);
+        assert_eq!(out, vec![b'h' as u16, b'i' as u16]);
+    }
+
+    #[test]
+    fn utf16_decodes_little_endian_units() {
+        let mut out = Vec::new();
+        let terminated = push_string_units(b"H\0i\0\0\0", 2, 64, &mut out);
+        assert!(terminated);
+        assert_eq!(out, vec![0x48, 0x69]);
+    }
+
+    #[test]
+    fn utf16_decodes_non_ascii_unit() {
+        let mut out = Vec::new();
+        // U+4E2D in little-endian bytes, then a NUL unit.
+        let terminated = push_string_units(&[0x2D, 0x4E, 0x00, 0x00], 2, 64, &mut out);
+        assert!(terminated);
+        assert_eq!(out, vec![0x4E2D]);
+    }
+
+    #[test]
+    fn max_cap_stops_before_nul() {
+        let mut out = Vec::new();
+        let terminated = push_string_units(b"abcdef", 1, 3, &mut out);
+        assert!(!terminated);
+        assert_eq!(out, vec![b'a' as u16, b'b' as u16, b'c' as u16]);
+
+        // Already at the cap: further input pushes nothing.
+        let terminated = push_string_units(b"def\0", 1, 3, &mut out);
+        assert!(!terminated);
+        assert_eq!(out.len(), 3);
+    }
+
+    #[test]
+    fn buffer_exhaustion_ignores_incomplete_unit() {
+        let mut out = Vec::new();
+        // Two whole UTF-16 units plus a trailing odd byte (incomplete unit).
+        let terminated = push_string_units(b"A\0B\0C", 2, 64, &mut out);
+        assert!(!terminated);
+        assert_eq!(out, vec![0x41, 0x42]);
+    }
+
+    #[test]
+    fn streaming_accumulates_across_buffers() {
+        let mut out = Vec::new();
+        // "Hi\0" in UTF-16, split across two page-bounded reads.
+        let terminated = push_string_units(b"H\0i\0", 2, 64, &mut out);
+        assert!(!terminated);
+        let terminated = push_string_units(b"\0\0", 2, 64, &mut out);
+        assert!(terminated);
+        assert_eq!(out, vec![0x48, 0x69]);
+    }
 }

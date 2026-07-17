@@ -19,11 +19,12 @@ use crate::kd::wire::{read_u16, read_u32, read_u64};
 use crate::types::VirtAddr;
 
 use super::{
-    BUGCHECK_MANUALLY_INITIATED_CRASH, BUGCHECK_REFRESH_ASSIST_GRACE, BugcheckCapture,
-    DBG_KD_COMMAND_STRING_STATE_CHANGE, DBG_KD_EXCEPTION_STATE_CHANGE,
-    DBG_KD_LOAD_SYMBOLS_STATE_CHANGE, KD_INITIAL_PROGRESS_INTERVAL, KD_INITIAL_TIMEOUT_DEFAULT,
-    KD_INITIAL_PROBE_TIMEOUT, KD_INITIAL_TIMEOUT_ENV, KD_REFRESH_BREAKIN_INTERVAL,
-    KD_REFRESH_BREAKIN_TRACE_EVERY, KD_REQUEST_TIMEOUT, PUMP_POLL, StateChange,
+    AMD64_DEBUG_CONTROL_SPACE_KSPECIAL, BUGCHECK_MANUALLY_INITIATED_CRASH,
+    BUGCHECK_REFRESH_ASSIST_GRACE, BugcheckCapture, DBG_KD_COMMAND_STRING_STATE_CHANGE,
+    DBG_KD_EXCEPTION_STATE_CHANGE, DBG_KD_LOAD_SYMBOLS_STATE_CHANGE, KD_INITIAL_PROBE_TIMEOUT,
+    KD_INITIAL_PROGRESS_INTERVAL, KD_INITIAL_TIMEOUT_DEFAULT, KD_INITIAL_TIMEOUT_ENV,
+    KD_REFRESH_BREAKIN_INTERVAL, KD_REFRESH_BREAKIN_TRACE_EVERY, KD_REQUEST_TIMEOUT,
+    KSPECIAL_REGISTERS_DR7_OFFSET, KSPECIAL_REGISTERS_MIN_SIZE, PUMP_POLL, StateChange,
     handle_debug_io_with_output, handle_file_io,
 };
 
@@ -287,9 +288,36 @@ pub fn continue_transparent_state_change(
     framing
         .transport_mut()
         .set_read_timeout(Some(KD_REQUEST_TIMEOUT))?;
-    let result = api::continue_api2(framing, stop.processor, api::DBG_CONTINUE, false);
+    let result = continue_preserving_dr7(framing, stop.processor, api::DBG_CONTINUE, false);
     let _ = framing.transport_mut().set_read_timeout(prev);
     result
+}
+
+/// Read `KernelDr7` from the processor's `KSPECIAL_REGISTERS` and continue
+/// with it preserved, so existing data watchpoints keep firing across a
+/// transparent state change. The pump holds only the framing (no backend
+/// cache), hence the extra wire read; `KdBackend::continue_preserving_dr7`
+/// is the cached equivalent.
+fn continue_preserving_dr7(
+    framing: &mut KdFraming<UnixStream>,
+    processor: u16,
+    continue_status: u32,
+    trace: bool,
+) -> Result<()> {
+    let special = api::read_control_space(
+        framing,
+        processor,
+        AMD64_DEBUG_CONTROL_SPACE_KSPECIAL,
+        KSPECIAL_REGISTERS_MIN_SIZE as u32,
+    )?;
+    if special.len() < KSPECIAL_REGISTERS_DR7_OFFSET + 8 {
+        return Err(Error::Kd(format!(
+            "KSPECIAL_REGISTERS buffer too short for KernelDr7: {} bytes",
+            special.len()
+        )));
+    }
+    let dr7 = read_u64(&special, KSPECIAL_REGISTERS_DR7_OFFSET);
+    api::continue_api2(framing, processor, continue_status, trace, dr7)
 }
 
 /// Receive packets until a state-change we should surface arrives.

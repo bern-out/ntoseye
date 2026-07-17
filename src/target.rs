@@ -10,8 +10,8 @@ use crate::{
         Guest, ModuleInfo, ModuleSymbolLoadReport, ProcessInfo, StructRef, WinObject,
         section_name_at,
     },
-    phys::PhysMem,
     memory::{AddressSpace, PAGE_SIZE},
+    phys::PhysMem,
     symbols::{ParsedType, SymbolIndex, SymbolStore, TypeInfo},
     types::{Dtb, PageTableEntry, Value, VirtAddr},
 };
@@ -930,6 +930,12 @@ impl Target {
                 .context_dtb_override
                 .unwrap_or_else(|| self.guest.ntoskrnl.dtb()),
         }
+    }
+
+    /// Memory view for the active inspection address space. An explicit process
+    /// attach wins; otherwise this follows the halted thread's CR3.
+    pub fn context_memory(&self) -> AddressSpace<'_, PhysMem> {
+        AddressSpace::new(&self.phys, self.current_dtb())
     }
 
     pub fn closest_symbol_current_context(&self, address: VirtAddr) -> Option<String> {

@@ -282,7 +282,7 @@ impl MyCompleter {
                         match_indices: None,
                         span: Span::new(input.span_start, input.pos),
                         append_whitespace: false,
-                    display_override: None,
+                        display_override: None,
                     })
                     .collect()
             }
@@ -323,7 +323,7 @@ impl MyCompleter {
                             match_indices: None,
                             span: Span::new(input.span_start, input.pos),
                             append_whitespace: false,
-                        display_override: None,
+                            display_override: None,
                         }
                     })
                     .collect()
@@ -342,7 +342,7 @@ impl MyCompleter {
                         match_indices: None,
                         span: Span::new(input.span_start, input.pos),
                         append_whitespace: false,
-                    display_override: None,
+                        display_override: None,
                     })
                     .collect()
             }
@@ -362,7 +362,7 @@ impl MyCompleter {
                             match_indices: None,
                             span: Span::new(input.span_start, input.pos),
                             append_whitespace: false,
-                        display_override: None,
+                            display_override: None,
                         }
                     })
                     .collect()
@@ -388,7 +388,7 @@ impl MyCompleter {
                         match_indices: None,
                         span: Span::new(input.arg_start, input.pos),
                         append_whitespace: false,
-                    display_override: None,
+                        display_override: None,
                     })
                     .collect()
             }
@@ -410,7 +410,7 @@ impl MyCompleter {
                 match_indices: None,
                 span: Span::new(input.span_start, input.pos),
                 append_whitespace: false,
-            display_override: None,
+                display_override: None,
             })
             .collect()
     }
@@ -533,7 +533,7 @@ impl MyCompleter {
                 match_indices: None,
                 span: Span::new(input.span_start, input.pos),
                 append_whitespace: false,
-            display_override: None,
+                display_override: None,
             })
             .collect()
     }
@@ -551,7 +551,7 @@ impl MyCompleter {
                 match_indices: None,
                 span: Span::new(input.span_start, input.pos),
                 append_whitespace: false,
-            display_override: None,
+                display_override: None,
             })
             .collect()
     }
@@ -832,12 +832,12 @@ mod tests {
     fn alias_completion_uses_target_command_arg_index() {
         let mut completer = completer();
         add_alias(&mut completer, "cbc", "bc ${1}");
-        completer
-            .caches
-            .breakpoints
-            .write()
-            .unwrap()
-            .push((12, true, VirtAddr(0x1234), Some("nt!Foo".into())));
+        completer.caches.breakpoints.write().unwrap().push((
+            12,
+            true,
+            VirtAddr(0x1234),
+            Some("nt!Foo".into()),
+        ));
 
         assert_eq!(values(completer.complete("cbc 1", 5)), vec!["12"]);
     }

@@ -1,9 +1,11 @@
-use crate::bugchecks::BugcheckAnalysis;
+use crate::bugchecks::{BugcheckAnalysis, BugcheckTrapFrame};
+use crate::gdb::breakpoints::Breakpoint;
 use crate::target::{
     AddressDescription, AddressModule, DeviceObjectDetail, DriverObjectDetail, IoStackLocationInfo,
     IrpHit, IrpInfo, MemoryRegionInfo, MemorySearchMatch, NotifyCallback, ObjectHeaderDetail,
     PteLevel, SsdtTable, Target, irp_major_function_name, kthread_state_name, wait_reason_name,
 };
+use crate::trapframe::KtrapFrame;
 
 // Shared shape for SDK/MCP structure rendering; surfaces disagree only on how
 // address-like values are encoded.
@@ -105,7 +107,10 @@ fn io_stack(s: &IoStackLocationInfo) -> View {
         ("major_function", View::Num(s.major_function as u64)),
         (
             "major_function_name",
-            View::Str(format!("IRP_MJ_{}", irp_major_function_name(s.major_function))),
+            View::Str(format!(
+                "IRP_MJ_{}",
+                irp_major_function_name(s.major_function)
+            )),
         ),
         ("minor_function", View::Num(s.minor_function as u64)),
         ("device_object", View::Hex(s.device_object.0)),
@@ -390,6 +395,7 @@ pub fn bugcheck(a: &BugcheckAnalysis) -> View {
             ("driver", View::OptStr(f.driver.clone())),
         ])
     });
+    let trap_frames = a.trap_frames.iter().map(bugcheck_trap_frame).collect();
     View::Object(vec![
         ("code", View::Num(a.code as u64)),
         ("code_hex", View::Str(format!("{:#010x}", a.code))),
@@ -399,5 +405,128 @@ pub fn bugcheck(a: &BugcheckAnalysis) -> View {
         ("source", View::OptStr(a.source.clone())),
         ("args", View::List(args)),
         ("fault", fault),
+        ("trap_frames", View::List(trap_frames)),
     ])
+}
+
+fn ktrap_frame_registers(frame: &KtrapFrame) -> View {
+    View::Object(vec![
+        ("rax", View::Hex(frame.rax)),
+        ("rbx", View::Hex(frame.rbx)),
+        ("rcx", View::Hex(frame.rcx)),
+        ("rdx", View::Hex(frame.rdx)),
+        ("rsi", View::Hex(frame.rsi)),
+        ("rdi", View::Hex(frame.rdi)),
+        ("rbp", View::Hex(frame.rbp)),
+        ("rsp", View::Hex(frame.rsp)),
+        ("r8", View::Hex(frame.r8)),
+        ("r9", View::Hex(frame.r9)),
+        ("r10", View::Hex(frame.r10)),
+        ("r11", View::Hex(frame.r11)),
+        ("rip", View::Hex(frame.rip)),
+        ("cs", View::Hex(frame.cs as u64)),
+        ("ss", View::Hex(frame.ss as u64)),
+        ("eflags", View::Hex(frame.eflags as u64)),
+        ("error_code", View::Hex(frame.error_code)),
+        ("previous_mode", View::Num(frame.previous_mode as u64)),
+        ("previous_irql", View::Num(frame.previous_irql as u64)),
+    ])
+}
+
+/// A decoded `_KTRAP_FRAME` shared by structured host APIs.
+pub fn trap_frame(frame: &KtrapFrame, rip_symbol: Option<String>) -> View {
+    View::Object(vec![
+        ("address", View::Hex(frame.address)),
+        ("rip_symbol", View::OptStr(rip_symbol)),
+        ("frame", ktrap_frame_registers(frame)),
+    ])
+}
+
+/// A trap frame carried by a bugcheck parameter: its address, the symbol at
+/// the interrupted `rip`, and either the decoded `_KTRAP_FRAME` registers or
+/// the reason decoding failed.
+pub fn bugcheck_trap_frame(tf: &BugcheckTrapFrame) -> View {
+    View::Object(vec![
+        ("address", View::Hex(tf.address)),
+        ("rip_symbol", View::OptStr(tf.rip_symbol.clone())),
+        (
+            "frame",
+            tf.frame.as_ref().map_or(View::Null, ktrap_frame_registers),
+        ),
+        ("error", View::OptStr(tf.error.clone())),
+    ])
+}
+
+/// One code-breakpoint/data-watchpoint row (MCP `list_breakpoints`); the
+/// `watch_*` fields are null for code breakpoints, and the Python handle keeps
+/// the same field set in its cached snapshot.
+pub fn breakpoint(bp: &Breakpoint) -> View {
+    View::Object(vec![
+        ("id", View::Num(bp.id.into())),
+        ("address", View::Hex(bp.address.0)),
+        ("enabled", View::Bool(bp.enabled)),
+        ("symbol", View::OptStr(bp.symbol.clone())),
+        ("scope", View::Str(bp.scope.label())),
+        ("condition", View::OptStr(bp.condition.clone())),
+        ("temporary", View::Bool(bp.temporary)),
+        (
+            "watch_access",
+            View::OptStr(bp.watch_access_name().map(str::to_string)),
+        ),
+        (
+            "watch_length",
+            View::OptNum(bp.watch_length().map(u64::from)),
+        ),
+    ])
+}
+
+#[cfg(all(test, feature = "mcp"))]
+mod tests {
+    use super::{bugcheck_trap_frame, to_json, trap_frame};
+    use crate::bugchecks::BugcheckTrapFrame;
+    use crate::trapframe::KtrapFrame;
+
+    #[test]
+    fn bugcheck_trap_frame_exposes_decode_failure() {
+        let view = bugcheck_trap_frame(&BugcheckTrapFrame {
+            address: 0xffff_8000_1234_5000,
+            frame: None,
+            rip_symbol: None,
+            error: Some("type `_KTRAP_FRAME` not found".to_string()),
+        });
+        let json = to_json(&view);
+        assert!(json["frame"].is_null());
+        assert_eq!(json["error"], "type `_KTRAP_FRAME` not found");
+    }
+
+    #[test]
+    fn standalone_trap_frame_has_shared_structured_shape() {
+        let frame = KtrapFrame {
+            address: 0xffff_f800_1234_5000,
+            rax: 1,
+            rbx: 2,
+            rcx: 3,
+            rdx: 4,
+            rsi: 5,
+            rdi: 6,
+            rbp: 7,
+            rsp: 8,
+            r8: 9,
+            r9: 10,
+            r10: 11,
+            r11: 12,
+            rip: 0xffff_f800_4321_1000,
+            cs: 0x10,
+            ss: 0x18,
+            eflags: 0x202,
+            error_code: 0,
+            previous_mode: 0,
+            previous_irql: 2,
+        };
+        let json = to_json(&trap_frame(&frame, Some("nt!KiDispatchException".into())));
+        assert_eq!(json["address"], "0xfffff80012345000");
+        assert_eq!(json["rip_symbol"], "nt!KiDispatchException");
+        assert_eq!(json["frame"]["rip"], "0xfffff80043211000");
+        assert_eq!(json["frame"]["previous_irql"], 2);
+    }
 }

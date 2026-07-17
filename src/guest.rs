@@ -1,8 +1,8 @@
 use crate::{
     backend::MemoryOps,
     error::{Error, Result},
-    phys::PhysMem,
     memory::{self, AddressSpace, PAGE_SIZE},
+    phys::PhysMem,
     symbols::{
         DownloadJob, FieldInfo, ModuleSymbolDiscovery, ModuleSymbolLoad, ModuleSymbolSource,
         ModuleSymbolStatus, ParsedType, SymbolStore, TypeInfo, download_jobs_parallel,
@@ -846,10 +846,8 @@ impl Guest {
         symbols: Arc<SymbolStore>,
         kernel_dtb: Dtb,
     ) -> Result<Self> {
-        let ntoskrnl_va = find_ntoskrnl_va(kernel_dtb, &phys)?
-            .ok_or(Error::NtoskrnlNotFound)?;
-        let ntoskrnl = WinObject::new(phys, symbols, kernel_dtb, ntoskrnl_va)
-            .load_symbols()?;
+        let ntoskrnl_va = find_ntoskrnl_va(kernel_dtb, &phys)?.ok_or(Error::NtoskrnlNotFound)?;
+        let ntoskrnl = WinObject::new(phys, symbols, kernel_dtb, ntoskrnl_va).load_symbols()?;
         ntoskrnl.register_as_kernel();
         Ok(Self { ntoskrnl })
     }

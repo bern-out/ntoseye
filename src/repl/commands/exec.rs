@@ -3,7 +3,10 @@ use std::sync::atomic::Ordering;
 use owo_colors::OwoColorize;
 
 use crate::error::Result;
-use crate::session::{BreakpointStopAction, StepKind};
+use crate::gdb::breakpoints::Breakpoint;
+use crate::session::{
+    BreakpointStopAction, StepKind, WatchpointStopAction, resolve_watchpoint_stop,
+};
 use crate::types::VirtAddr;
 use crate::ui;
 
@@ -172,6 +175,42 @@ impl ReplState<'_> {
                         }
                         continue;
                     }
+                    // Claim watchpoint stops before the stray-single-step
+                    // absorber. Core owns backend acknowledgement, context
+                    // refresh, condition evaluation, and false-hit resume.
+                    let watchpoint_action = match resolve_watchpoint_stop(
+                        &mut *self.ctx.backend,
+                        &self.ctx.register_map,
+                        &self.ctx.breakpoints,
+                        &mut self.ctx.target,
+                        &mut self.ctx.current_thread,
+                        &event,
+                    ) {
+                        Ok(action) => action,
+                        Err(e) => {
+                            error!("failed to handle watchpoint hit: {e}");
+                            break;
+                        }
+                    };
+                    match watchpoint_action {
+                        WatchpointStopAction::Hit {
+                            breakpoint: bp,
+                            condition_error,
+                        } => {
+                            self.caches.refresh_symbol_context(&self.ctx.target);
+                            refresh_windows_thread_context_for_backend_thread(
+                                &mut self.ctx.target,
+                                &self.ctx.current_thread,
+                            );
+                            if let Some(error) = condition_error {
+                                error!("watchpoint condition failed: {error}");
+                            }
+                            self.surface_hardware_breakpoint_hit(&bp);
+                            break;
+                        }
+                        WatchpointStopAction::Resumed => continue,
+                        WatchpointStopAction::NotBreakpoint => {}
+                    }
                     // A stray single-step (STATUS_SINGLE_STEP, not at a user
                     // breakpoint) is a debugger artifact from a managed step-over
                     // on SMP KD, not a stop to surface; clear TF on its processor
@@ -280,8 +319,12 @@ impl ReplState<'_> {
                             id,
                             symbol,
                             temporary,
+                            condition_error,
                             ..
                         } => {
+                            if let Some(error) = condition_error {
+                                error!("breakpoint condition failed: {error}");
+                            }
                             println!();
                             if !temporary {
                                 println!(
@@ -352,6 +395,35 @@ impl ReplState<'_> {
         }
 
         Ok(())
+    }
+
+    /// Print a hardware (DR) breakpoint hit, mirroring the software-breakpoint
+    /// `Hit` rendering. The address the breakpoint watches is unrelated to
+    /// `rip` for data watches, so the banner names the breakpoint while the
+    /// break context shows where execution actually stopped.
+    fn surface_hardware_breakpoint_hit(&mut self, bp: &Breakpoint) {
+        println!();
+        let access = bp
+            .hardware
+            .map(|hw| format!(" {}{}", hw.access.letter(), hw.len))
+            .unwrap_or_default();
+        println!(
+            "{} {}{} {}",
+            ui::label("hardware breakpoint:"),
+            ui::bp_id(bp.id),
+            access.bright_black(),
+            bp.symbol
+                .as_ref()
+                .map(|s| format!("({})", ui::symbol(s)))
+                .unwrap_or_default()
+        );
+        print_break_context(
+            &mut *self.ctx.backend,
+            &self.ctx.register_map,
+            &mut self.ctx.target,
+            &self.ctx.breakpoints,
+            &self.ctx.current_thread,
+        );
     }
 
     fn single_step(&mut self) -> Result<()> {
@@ -435,23 +507,5 @@ impl ReplState<'_> {
                 Ok(())
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::session::split_condition_operator;
-
-    #[test]
-    fn condition_operator_splitter_prefers_two_char_operators() {
-        assert_eq!(
-            split_condition_operator("$rax >= 0x10"),
-            Some(("$rax", ">=", "0x10"))
-        );
-        assert_eq!(
-            split_condition_operator("$rax == $rbx"),
-            Some(("$rax", "==", "$rbx"))
-        );
-        assert_eq!(split_condition_operator("$rax"), None);
     }
 }

@@ -177,11 +177,7 @@ fn parse_alias_body(body: &str) -> std::result::Result<(&str, &str), String> {
 }
 
 fn validate_alias_name(name: &str) -> std::result::Result<(), String> {
-    if name.is_empty()
-        || name
-            .chars()
-            .any(|ch| ch.is_whitespace() || ch == ';')
-    {
+    if name.is_empty() || name.chars().any(|ch| ch.is_whitespace() || ch == ';') {
         return Err("invalid alias name".to_string());
     }
     if command_registry().get(name).is_some() {

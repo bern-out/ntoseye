@@ -10,11 +10,11 @@ use std::sync::Arc;
 use crate::backend::MemoryOps;
 use crate::bugchecks::{CURRENT_KERNEL_RELOAD_WINDOW, looks_like_kernel_pointer};
 use crate::dbg_backend::{
-    BackendCapability, BugcheckInfo, DebugBackend, DebugCapability, DebugOutputPage, StopEvent,
+    BackendCapability, BugcheckInfo, DebugBackend, DebugCapability, DebugOutputPage,
+    HW_BREAKPOINT_SLOTS, HwBreakpointAccess, StopEvent, WatchpointAccess,
 };
 use crate::disasm::{DisasmRow, decode_rows, disasm_formatter};
 use crate::error::{Error, Result};
-use crate::expr::Expr;
 use crate::gdb::breakpoints::Breakpoint;
 use crate::gdb::{BreakpointHitResult, BreakpointManager, RegisterMap};
 use crate::kd::trace_enabled;
@@ -48,6 +48,8 @@ pub enum ContinueOutcome {
         symbol: Option<String>,
         temporary: bool,
         rip: u64,
+        /// Runtime condition failure. The stop is surfaced rather than skipped.
+        condition_error: Option<String>,
     },
     /// The guest is processing a bugcheck (BSOD). `info` carries the code +
     /// parameters when the backend decoded them from the KD stream; otherwise
@@ -167,6 +169,8 @@ pub enum BreakpointStopAction {
         address: u64,
         symbol: Option<String>,
         temporary: bool,
+        /// Runtime condition failure. The stop is surfaced rather than skipped.
+        condition_error: Option<String>,
     },
     /// The stop was absorbed: a wrong-process shared-page int3 or a false
     /// conditional breakpoint. It has been stepped over and the VM resumed, so
@@ -174,6 +178,38 @@ pub enum BreakpointStopAction {
     Resumed,
     /// `rip` is not one of our breakpoints (a genuine exception or manual pause).
     NotBreakpoint,
+}
+
+/// Disposition of a data-watch stop after backend status, inspection context,
+/// and an optional condition have been handled.
+#[derive(Debug, Clone)]
+pub enum WatchpointStopAction {
+    /// A watchpoint whose condition held or failed to evaluate.
+    Hit {
+        breakpoint: Breakpoint,
+        condition_error: Option<String>,
+    },
+    /// A false conditional hit was resumed in place.
+    Resumed,
+    /// The stop was not raised by one of our watchpoints.
+    NotBreakpoint,
+}
+
+fn update_target_context_from_registers(
+    target: &mut Target,
+    register_map: &RegisterMap,
+    registers: Result<Vec<u8>>,
+) {
+    let Ok(registers) = registers else {
+        target.registers = None;
+        target.clear_context_dtb_override();
+        return;
+    };
+    target.registers = Some(register_map.to_hashmap(&registers));
+    match register_map.read_u64("cr3", &registers) {
+        Ok(cr3) if cr3 != 0 => target.set_context_dtb_override(cr3),
+        _ => target.clear_context_dtb_override(),
+    }
 }
 
 /// A backend execution context (vCPU) and the guest code it is currently
@@ -270,11 +306,7 @@ impl Session {
     /// is taken *before* `make_backend` runs, so a second instance fails fast
     /// instead of racing on the transport handshake. Backend selection
     /// (gdb/kd/memory/dmp) stays a frontend concern, in the closure.
-    pub fn connect<F>(
-        phys: Arc<PhysMem>,
-        target: Option<&str>,
-        make_backend: F,
-    ) -> Result<Self>
+    pub fn connect<F>(phys: Arc<PhysMem>, target: Option<&str>, make_backend: F) -> Result<Self>
     where
         F: FnOnce() -> Result<Box<dyn DebugBackend>>,
     {
@@ -388,35 +420,21 @@ impl Session {
     }
 
     /// Align the inspection context to the currently selected thread's address
-    /// space: when halted, read that thread's registers and set `target.registers`
-    /// + `context_dtb_override` from its CR3, so reads / steps / breakpoint
-    /// installs scope to the focused thread rather than a stale context from an
-    /// earlier stop on another thread. Called from the thread-selection entry
+    /// space: when halted, read that thread's registers and set
+    /// `target.registers` and `context_dtb_override` from its CR3, so reads,
+    /// steps, and breakpoint installs scope to the focused thread rather than
+    /// an earlier stop on another thread. Called from the thread-selection entry
     /// points; `continue_until_break` establishes the same context inline. Best-
     /// effort and a no-op while the guest runs (no coherent register file).
     fn refresh_context_for_current_thread(&mut self) {
         if self.backend.is_running() {
             return;
         }
-        let regs = self
+        let registers = self
             .backend
             .set_current_thread(&self.current_thread)
             .and_then(|_| self.backend.read_registers());
-        let Ok(regs) = regs else {
-            // Can't read the selected thread's register file: drop stale
-            // register/DTB context so reads fall back to the attached-process /
-            // kernel default rather than a prior thread's leftover address space.
-            self.target.registers = None;
-            self.target.clear_context_dtb_override();
-            return;
-        };
-        self.target.registers = Some(self.register_map.to_hashmap(&regs));
-        match self.register_map.read_u64("cr3", &regs) {
-            Ok(cr3) if cr3 != 0 => self.target.set_context_dtb_override(cr3),
-            // No usable CR3: clear the override so reads scope to the default
-            // DTB, not whatever process a previous stop left behind.
-            _ => self.target.clear_context_dtb_override(),
-        }
+        update_target_context_from_registers(&mut self.target, &self.register_map, registers);
     }
 
     /// Decode the instruction at the current thread's RIP, masking our own
@@ -797,6 +815,49 @@ impl Session {
             .add(self.backend.as_mut(), &self.target, addr, symbol, condition)
     }
 
+    /// Watch data accesses at `addr`. Watches are global across guest address
+    /// spaces. Returns the stop-point id.
+    pub fn add_watchpoint(
+        &mut self,
+        addr: VirtAddr,
+        access: WatchpointAccess,
+        len: u8,
+    ) -> Result<u32> {
+        self.add_watchpoint_with_condition(addr, access, len, None)
+    }
+
+    /// Watch data accesses with an optional condition evaluated on each hit.
+    pub fn add_watchpoint_with_condition(
+        &mut self,
+        addr: VirtAddr,
+        access: WatchpointAccess,
+        len: u8,
+        condition: Option<String>,
+    ) -> Result<u32> {
+        self.add_watchpoint_with_symbol_condition(addr, access, len, None, condition)
+    }
+
+    /// Watch data accesses while retaining a host-resolved display symbol. This
+    /// is a semantic watchpoint API: hosts choose write or read/write behavior
+    /// while the backend implementation remains private.
+    pub fn add_watchpoint_with_symbol_condition(
+        &mut self,
+        addr: VirtAddr,
+        access: WatchpointAccess,
+        len: u8,
+        symbol: Option<String>,
+        condition: Option<String>,
+    ) -> Result<u32> {
+        self.breakpoints.add_hardware(
+            self.backend.as_mut(),
+            addr,
+            access.into(),
+            len,
+            symbol,
+            condition,
+        )
+    }
+
     /// Remove a breakpoint by id.
     pub fn remove_breakpoint(&mut self, id: u32) -> Result<()> {
         self.breakpoints
@@ -1081,21 +1142,22 @@ impl Session {
     pub fn resolve_breakpoint_stop(&mut self, rip: u64, cr3: u64) -> Result<BreakpointStopAction> {
         match self.breakpoints.check_breakpoint_hit(rip, cr3) {
             BreakpointHitResult::Hit(bp) => {
-                // Conditional breakpoint whose condition is false → step over and
-                // keep running. A condition that fails to evaluate counts as a
-                // hit (fail safe: surface it rather than silently skipping).
-                if let Some(condition) = &bp.condition
-                    && !eval_breakpoint_condition(condition, &self.target).unwrap_or(true)
-                {
-                    step_over_current_breakpoint(
-                        self.backend.as_mut(),
-                        &self.register_map,
-                        &self.target,
-                        &mut self.breakpoints,
-                    )?;
-                    self.backend.continue_execution()?;
-                    return Ok(BreakpointStopAction::Resumed);
-                }
+                // A false condition is absorbed. Evaluation errors fail safe:
+                // surface the stop and carry the error to every host.
+                let condition_error = match bp.evaluate_condition(&self.target) {
+                    Ok(false) => {
+                        step_over_current_breakpoint(
+                            self.backend.as_mut(),
+                            &self.register_map,
+                            &self.target,
+                            &mut self.breakpoints,
+                        )?;
+                        self.backend.continue_execution()?;
+                        return Ok(BreakpointStopAction::Resumed);
+                    }
+                    Ok(true) => None,
+                    Err(error) => Some(error.to_string()),
+                };
 
                 // The stub can drop non-hit breakpoints when the VM stops; re-arm
                 // so they survive the next resume.
@@ -1108,6 +1170,7 @@ impl Session {
                     address: bp.address.0,
                     symbol: bp.symbol.clone(),
                     temporary: bp.temporary,
+                    condition_error,
                 })
             }
             BreakpointHitResult::NotBreakpoint => {
@@ -1275,6 +1338,42 @@ impl Session {
                 ReloadDisposition::Ordinary => {}
             }
 
+            // Claim watchpoint stops before the stray-single-step absorber. The
+            // shared resolver refreshes target context, evaluates conditions,
+            // and resumes false hits so the REPL and SDK/MCP cannot drift.
+            match resolve_watchpoint_stop(
+                self.backend.as_mut(),
+                &self.register_map,
+                &self.breakpoints,
+                &mut self.target,
+                &mut self.current_thread,
+                &event,
+            )? {
+                WatchpointStopAction::Hit {
+                    breakpoint: bp,
+                    condition_error,
+                } => {
+                    // resolve_watchpoint_stop just refreshed target.registers;
+                    // read RIP from there instead of a second register round-trip.
+                    let rip = self
+                        .target
+                        .registers
+                        .as_ref()
+                        .and_then(|regs| regs.get("rip").copied())
+                        .unwrap_or(0);
+                    return Ok(ContinueOutcome::Breakpoint {
+                        id: bp.id,
+                        address: bp.address.0,
+                        symbol: bp.symbol,
+                        temporary: bp.temporary,
+                        rip,
+                        condition_error,
+                    });
+                }
+                WatchpointStopAction::Resumed => continue,
+                WatchpointStopAction::NotBreakpoint => {}
+            }
+
             // A stray single-step (STATUS_SINGLE_STEP, not at a user breakpoint)
             // is a debugger artifact, not a stop to surface: a managed step-over's
             // single-step that leaked here because KD single-steps the whole
@@ -1316,6 +1415,7 @@ impl Session {
                     address,
                     symbol,
                     temporary,
+                    condition_error,
                 } => {
                     return Ok(ContinueOutcome::Breakpoint {
                         id,
@@ -1323,6 +1423,7 @@ impl Session {
                         symbol,
                         temporary,
                         rip,
+                        condition_error,
                     });
                 }
                 BreakpointStopAction::Resumed => continue,
@@ -1652,6 +1753,8 @@ pub fn perform_target_reload(
     breakpoints: &mut BreakpointManager,
     event_hint: Option<VirtAddr>,
 ) -> TargetReloadOutcome {
+    // Release DR slots before dropping the manager; see BreakpointManager::clear_hardware_slots.
+    breakpoints.clear_hardware_slots(backend);
     *breakpoints = BreakpointManager::new();
     let hint = event_hint.or_else(|| backend.target_kernel_base_hint().ok().flatten());
     let report = target.reload_guest_with_kernel_base_hint(hint);
@@ -1765,6 +1868,105 @@ pub fn stop_is_stray_single_step(event: &StopEvent, breakpoints: &BreakpointMana
             .is_none_or(|pc| breakpoints.breakpoint_id_at_address(pc).is_none())
 }
 
+/// If `event` is a `#DB` (`STATUS_SINGLE_STEP`) raised by a hardware
+/// (debug-register) breakpoint, return the breakpoint that fired. Reads DR6 on
+/// the stopped processor (KD adopts the stopping processor in `record_stop`,
+/// so the selected context is the right one even before the caller adopts the
+/// stopped thread), maps a set status bit (B0-B3) to a registered slot, and
+/// clears the status bits so a later single-step can't re-report a stale hit —
+/// even when no slot matched, since a stale bit from the guest's own DR usage
+/// would wedge the same way. For an execute watch it also sets RF in RFLAGS:
+/// an instruction breakpoint is a *fault* (RIP still points at the watched
+/// instruction), so resuming without RF would re-raise the same `#DB` forever;
+/// the CPU clears RF once that instruction retires. Returns `None` for a plain
+/// trap-flag single-step or on a backend without DR support (its `RegisterMap`
+/// has no `dr6`). Must run *before* [`stop_is_stray_single_step`], which would
+/// otherwise absorb the same `#DB` as debugger noise.
+pub fn hardware_breakpoint_hit(
+    backend: &mut dyn DebugBackend,
+    register_map: &RegisterMap,
+    breakpoints: &BreakpointManager,
+    event: &StopEvent,
+) -> Result<Option<Breakpoint>> {
+    if event.exception_code != Some(STATUS_SINGLE_STEP)
+        || event.is_bugcheck
+        || !breakpoints.has_enabled_hardware_breakpoints()
+    {
+        return Ok(None);
+    }
+
+    let mut regs = backend.read_registers()?;
+    let dr6 = register_map.read_u64("dr6", &regs)?;
+
+    let hit = (0..HW_BREAKPOINT_SLOTS)
+        .filter(|slot| dr6 & (1u64 << slot) != 0)
+        .find_map(|slot| breakpoints.hardware_breakpoint_for_slot(slot));
+
+    let mut dirty = false;
+    // Clear the B0-B3 status bits so the next single-step is unambiguous; the
+    // CPU never clears them itself, but leave the rest of DR6 intact.
+    let cleared = dr6 & !0b1111u64;
+    if cleared != dr6 {
+        register_map.write_u64("dr6", &mut regs, cleared)?;
+        dirty = true;
+    }
+    if hit
+        .as_ref()
+        .and_then(|bp| bp.hardware)
+        .is_some_and(|hw| hw.access == HwBreakpointAccess::Execute)
+    {
+        let eflags = register_map.read_u64("eflags", &regs)?;
+        const RF: u64 = 1 << 16;
+        if eflags & RF == 0 {
+            register_map.write_u64("eflags", &mut regs, eflags | RF)?;
+            dirty = true;
+        }
+    }
+
+    if dirty {
+        backend.write_registers(&regs)?;
+    }
+
+    Ok(hit)
+}
+
+/// Resolve one stop against the watchpoint manager. This owns the behavior
+/// common to every host: claim and acknowledge backend status, adopt the
+/// stopped thread, refresh register/CR3 context before condition evaluation,
+/// and resume a false conditional hit. Condition errors fail safe by surfacing
+/// the hit with error metadata.
+pub fn resolve_watchpoint_stop(
+    backend: &mut dyn DebugBackend,
+    register_map: &RegisterMap,
+    breakpoints: &BreakpointManager,
+    target: &mut Target,
+    current_thread: &mut String,
+    event: &StopEvent,
+) -> Result<WatchpointStopAction> {
+    let Some(breakpoint) = hardware_breakpoint_hit(backend, register_map, breakpoints, event)?
+    else {
+        return Ok(WatchpointStopAction::NotBreakpoint);
+    };
+
+    set_current_thread_from_stop(backend, event, current_thread);
+    let registers = backend.read_registers();
+    update_target_context_from_registers(target, register_map, registers);
+
+    let condition_error = match breakpoint.evaluate_condition(target) {
+        Ok(false) => {
+            backend.continue_execution()?;
+            return Ok(WatchpointStopAction::Resumed);
+        }
+        Ok(true) => None,
+        Err(error) => Some(error.to_string()),
+    };
+
+    Ok(WatchpointStopAction::Hit {
+        breakpoint,
+        condition_error,
+    })
+}
+
 /// Rewind every thread that is parked one byte past one of our breakpoints back
 /// onto the breakpoint address. An `int3` advances RIP by one when it executes,
 /// so a thread that hit a BP reports `addr + 1`; the breakpoint-hit check matches
@@ -1810,39 +2012,6 @@ pub fn rewind_threads_off_breakpoints(
     let _ = backend.set_current_thread(restore_thread);
 }
 
-/// Split a breakpoint condition like `$rax == 0x10` into `(left, op, right)`, or
-/// `None` for a bare expression. Shared by the REPL and [`eval_breakpoint_condition`].
-pub fn split_condition_operator(condition: &str) -> Option<(&str, &str, &str)> {
-    const OPS: [&str; 6] = ["==", "!=", "<=", ">=", "<", ">"];
-    for op in OPS {
-        if let Some((left, right)) = condition.split_once(op) {
-            return Some((left.trim(), op, right.trim()));
-        }
-    }
-    None
-}
-
-/// Evaluate a breakpoint condition against the current context: either a
-/// comparison (`left op right`) or a bare expression treated as "non-zero is
-/// true". Canonical definition shared by the REPL and run-control.
-pub fn eval_breakpoint_condition(condition: &str, debugger: &Target) -> Result<bool> {
-    if let Some((left, op, right)) = split_condition_operator(condition) {
-        let left = Expr::eval(left, debugger)?.0;
-        let right = Expr::eval(right, debugger)?.0;
-        return Ok(match op {
-            "==" => left == right,
-            "!=" => left != right,
-            "<=" => left <= right,
-            ">=" => left >= right,
-            "<" => left < right,
-            ">" => left > right,
-            _ => false,
-        });
-    }
-
-    Ok(Expr::eval(condition, debugger)?.0 != 0)
-}
-
 /// Adopt the thread reported by a stop event (falling back to the backend's
 /// stopped-thread query) as the current thread, and select it on the backend.
 pub fn set_current_thread_from_stop(
@@ -1882,12 +2051,28 @@ pub fn step_one_and_clear_tf(
 /// reported after a different processor's break and leak out with `TF` still set
 /// on its processor (see [`stop_is_stray_single_step`]). Without clearing it,
 /// that processor keeps trapping after every instruction on the next resume.
+///
+/// Also clears DR6's B0-B3 status bits when the backend exposes `dr6`: a step
+/// over an instruction that touched a hardware watch sets them, the CPU never
+/// clears them, and [`hardware_breakpoint_hit`] would misread the stale bits as
+/// a fresh hit on the next continue. Both stray-single-step absorbers and the
+/// step path funnel through here, so absorbed `#DB`s can't leave residue.
 pub fn clear_trap_flag(backend: &mut dyn DebugBackend, register_map: &RegisterMap) -> Result<()> {
-    if let Ok(mut regs) = backend.read_registers()
-        && let Ok(eflags) = register_map.read_u64("eflags", &regs)
-    {
-        let cleared = eflags & !(1u64 << 8);
-        if cleared != eflags && register_map.write_u64("eflags", &mut regs, cleared).is_ok() {
+    if let Ok(mut regs) = backend.read_registers() {
+        let mut dirty = false;
+        if let Ok(eflags) = register_map.read_u64("eflags", &regs) {
+            let cleared = eflags & !(1u64 << 8);
+            if cleared != eflags && register_map.write_u64("eflags", &mut regs, cleared).is_ok() {
+                dirty = true;
+            }
+        }
+        if let Ok(dr6) = register_map.read_u64("dr6", &regs) {
+            let cleared = dr6 & !0b1111u64;
+            if cleared != dr6 && register_map.write_u64("dr6", &mut regs, cleared).is_ok() {
+                dirty = true;
+            }
+        }
+        if dirty {
             backend.write_registers(&regs)?;
         }
     }
@@ -1936,4 +2121,311 @@ pub fn step_over_current_breakpoint(
         }
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gdb::breakpoints::HardwareBreakpoint;
+    use crate::kd::context::{REGISTER_BUFFER_SIZE, build_register_map};
+
+    /// DR6.BS (bit 14): a status bit outside B0-B3 that the functions under
+    /// test must leave untouched.
+    const DR6_BS: u64 = 1 << 14;
+    /// RFLAGS.RF (bit 16), the resume flag an execute hit must set.
+    const RF: u64 = 1 << 16;
+    /// RFLAGS.TF (bit 8), the trap flag `clear_trap_flag` clears.
+    const TF: u64 = 1 << 8;
+    /// An eflags value with a few innocent bits (IF | reserved bit 1) that
+    /// must survive every rewrite.
+    const EFLAGS_BASE: u64 = 0x202;
+
+    /// Minimal register-file backend: a KD-layout register buffer the map's
+    /// offsets index into, plus a write counter for no-op assertions. Every
+    /// non-register operation is out of scope for these tests.
+    struct MockBackend {
+        register_map: RegisterMap,
+        regs: Vec<u8>,
+        writes: usize,
+        fail_writes: bool,
+    }
+
+    impl MockBackend {
+        fn new() -> Self {
+            Self {
+                register_map: build_register_map(),
+                regs: vec![0u8; REGISTER_BUFFER_SIZE],
+                writes: 0,
+                fail_writes: false,
+            }
+        }
+
+        fn set(&mut self, name: &str, value: u64) {
+            self.register_map
+                .write_u64(name, &mut self.regs, value)
+                .unwrap();
+        }
+
+        fn get(&self, name: &str) -> u64 {
+            self.register_map.read_u64(name, &self.regs).unwrap()
+        }
+    }
+
+    impl DebugBackend for MockBackend {
+        fn register_map(&self) -> &RegisterMap {
+            &self.register_map
+        }
+        fn read_registers(&mut self) -> Result<Vec<u8>> {
+            Ok(self.regs.clone())
+        }
+        fn write_registers(&mut self, data: &[u8]) -> Result<()> {
+            self.writes += 1;
+            if self.fail_writes {
+                return Err(Error::Kd("injected register write failure".into()));
+            }
+            self.regs = data.to_vec();
+            Ok(())
+        }
+        fn set_breakpoint(&mut self, _addr: u64) -> Result<()> {
+            Err(Error::NotSupported)
+        }
+        fn remove_breakpoint(&mut self, _addr: u64) -> Result<()> {
+            Err(Error::NotSupported)
+        }
+        fn continue_execution(&mut self) -> Result<()> {
+            Err(Error::NotSupported)
+        }
+        fn step(&mut self) -> Result<()> {
+            Err(Error::NotSupported)
+        }
+        fn interrupt(&mut self) -> Result<StopEvent> {
+            Err(Error::NotSupported)
+        }
+        fn wait_for_stop(&mut self) -> Result<StopEvent> {
+            Err(Error::NotSupported)
+        }
+        fn try_wait_for_stop(&mut self, _timeout: Duration) -> Result<Option<StopEvent>> {
+            Ok(None)
+        }
+        fn thread_list(&mut self) -> Result<Vec<String>> {
+            Err(Error::NotSupported)
+        }
+        fn set_current_thread(&mut self, _thread_id: &str) -> Result<()> {
+            Err(Error::NotSupported)
+        }
+        fn stopped_thread_id(&mut self) -> Result<String> {
+            Err(Error::NotSupported)
+        }
+        fn is_running(&self) -> bool {
+            false
+        }
+    }
+
+    fn single_step_event() -> StopEvent {
+        StopEvent {
+            thread_id: None,
+            exception_code: Some(STATUS_SINGLE_STEP),
+            program_counter: None,
+            is_bugcheck: false,
+            bugcheck: None,
+            target_reloaded: false,
+            target_kernel_base_hint: None,
+            assisted_breakin: false,
+        }
+    }
+
+    fn manager_with_hw(slot: u8, access: HwBreakpointAccess, enabled: bool) -> BreakpointManager {
+        let mut manager = BreakpointManager::new();
+        let len = match access {
+            HwBreakpointAccess::Execute => 1,
+            _ => 4,
+        };
+        manager.insert_for_test(
+            7,
+            VirtAddr(0x1000),
+            enabled,
+            Some(HardwareBreakpoint { access, len, slot }),
+        );
+        manager
+    }
+
+    #[test]
+    fn hardware_breakpoint_hit_claims_matching_dr6_bit_and_clears_status() {
+        let manager = manager_with_hw(2, HwBreakpointAccess::Write, true);
+        let mut backend = MockBackend::new();
+        backend.set("dr6", (1 << 2) | DR6_BS);
+        backend.set("eflags", EFLAGS_BASE);
+
+        let map = build_register_map();
+        let hit = hardware_breakpoint_hit(&mut backend, &map, &manager, &single_step_event())
+            .expect("register update must succeed")
+            .expect("slot 2 #DB must be claimed by the registered watch");
+        assert_eq!(hit.id, 7);
+        assert_eq!(hit.hardware.expect("hw params").slot, 2);
+
+        // B0-B3 are flushed in the written registers; BS survives.
+        assert_eq!(backend.get("dr6"), DR6_BS);
+        assert_eq!(backend.writes, 1);
+        // A data watch is a trap (RIP already past the access): no RF.
+        assert_eq!(backend.get("eflags"), EFLAGS_BASE);
+    }
+
+    #[test]
+    fn hardware_breakpoint_hit_sets_resume_flag_only_for_execute_watches() {
+        for (access, want_rf) in [
+            (HwBreakpointAccess::Execute, true),
+            (HwBreakpointAccess::Write, false),
+            (HwBreakpointAccess::ReadWrite, false),
+        ] {
+            let manager = manager_with_hw(0, access, true);
+            let mut backend = MockBackend::new();
+            backend.set("dr6", 1);
+            backend.set("eflags", EFLAGS_BASE);
+
+            let map = build_register_map();
+            let hit = hardware_breakpoint_hit(&mut backend, &map, &manager, &single_step_event())
+                .unwrap();
+            assert!(hit.is_some(), "{access:?} hit must be claimed");
+
+            let eflags = backend.get("eflags");
+            assert_eq!(eflags & RF != 0, want_rf, "{access:?}: RF mismatch");
+            // Everything but RF is preserved either way.
+            assert_eq!(eflags & !RF, EFLAGS_BASE, "{access:?}: eflags clobbered");
+            assert_eq!(backend.get("dr6"), 0, "{access:?}: B0 not cleared");
+        }
+    }
+
+    #[test]
+    fn hardware_breakpoint_hit_propagates_required_register_write_failure() {
+        let manager = manager_with_hw(0, HwBreakpointAccess::Execute, true);
+        let mut backend = MockBackend::new();
+        backend.set("dr6", 1);
+        backend.set("eflags", EFLAGS_BASE);
+        backend.fail_writes = true;
+
+        let map = build_register_map();
+        assert!(
+            hardware_breakpoint_hit(&mut backend, &map, &manager, &single_step_event()).is_err()
+        );
+        assert_eq!(backend.get("dr6"), 1);
+        assert_eq!(backend.get("eflags"), EFLAGS_BASE);
+        assert_eq!(backend.writes, 1);
+    }
+
+    #[test]
+    fn hardware_breakpoint_hit_ignores_non_single_step_stops() {
+        let manager = manager_with_hw(0, HwBreakpointAccess::Write, true);
+        let mut backend = MockBackend::new();
+        backend.set("dr6", 1); // would match slot 0 if the gate were open
+        let before = backend.regs.clone();
+        let map = build_register_map();
+
+        // A software breakpoint exception is not a #DB.
+        let mut event = single_step_event();
+        event.exception_code = Some(0x8000_0003);
+        assert!(
+            hardware_breakpoint_hit(&mut backend, &map, &manager, &event)
+                .unwrap()
+                .is_none()
+        );
+
+        // No exception code at all.
+        event.exception_code = None;
+        assert!(
+            hardware_breakpoint_hit(&mut backend, &map, &manager, &event)
+                .unwrap()
+                .is_none()
+        );
+
+        // A bugcheck stop never resolves to a hardware hit.
+        event.exception_code = Some(STATUS_SINGLE_STEP);
+        event.is_bugcheck = true;
+        assert!(
+            hardware_breakpoint_hit(&mut backend, &map, &manager, &event)
+                .unwrap()
+                .is_none()
+        );
+
+        assert_eq!(backend.writes, 0);
+        assert_eq!(backend.regs, before);
+    }
+
+    #[test]
+    fn hardware_breakpoint_hit_requires_an_enabled_hardware_breakpoint() {
+        let map = build_register_map();
+        let mut backend = MockBackend::new();
+        backend.set("dr6", 1);
+        let before = backend.regs.clone();
+
+        // No breakpoints at all: gate closed, registers untouched.
+        let empty = BreakpointManager::new();
+        assert!(
+            hardware_breakpoint_hit(&mut backend, &map, &empty, &single_step_event())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(backend.writes, 0);
+        assert_eq!(backend.regs, before);
+
+        // A disabled hardware breakpoint keeps the gate closed too.
+        let manager = manager_with_hw(0, HwBreakpointAccess::Write, false);
+        assert!(
+            hardware_breakpoint_hit(&mut backend, &map, &manager, &single_step_event())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(backend.writes, 0);
+        assert_eq!(backend.regs, before);
+    }
+
+    #[test]
+    fn hardware_breakpoint_hit_clears_stale_dr6_bits_for_unregistered_slots() {
+        // An enabled watch in slot 1 opens the gate, but the #DB reports
+        // slot 3, which nothing occupies (e.g. the guest's own DR usage).
+        let manager = manager_with_hw(1, HwBreakpointAccess::Write, true);
+        let mut backend = MockBackend::new();
+        backend.set("dr6", (1 << 3) | DR6_BS);
+
+        let map = build_register_map();
+        assert!(
+            hardware_breakpoint_hit(&mut backend, &map, &manager, &single_step_event())
+                .unwrap()
+                .is_none()
+        );
+        // The stale status bit is still flushed so it can't be misread as a
+        // fresh hit on the next stop; BS survives.
+        assert_eq!(backend.get("dr6"), DR6_BS);
+        assert_eq!(backend.writes, 1);
+    }
+
+    #[test]
+    fn clear_trap_flag_clears_tf_and_dr6_status_in_one_write() {
+        let mut backend = MockBackend::new();
+        backend.set("eflags", TF | EFLAGS_BASE);
+        backend.set("dr6", 0b1011 | DR6_BS);
+
+        let map = build_register_map();
+        clear_trap_flag(&mut backend, &map).unwrap();
+
+        // TF gone, innocent flags preserved.
+        assert_eq!(backend.get("eflags"), EFLAGS_BASE);
+        // B0-B3 gone, BS preserved.
+        assert_eq!(backend.get("dr6"), DR6_BS);
+        // Both fixes folded into a single register write.
+        assert_eq!(backend.writes, 1);
+    }
+
+    #[test]
+    fn clear_trap_flag_skips_the_write_when_nothing_is_set() {
+        let mut backend = MockBackend::new();
+        backend.set("eflags", EFLAGS_BASE);
+        backend.set("dr6", DR6_BS);
+        let before = backend.regs.clone();
+
+        let map = build_register_map();
+        clear_trap_flag(&mut backend, &map).unwrap();
+
+        assert_eq!(backend.writes, 0);
+        assert_eq!(backend.regs, before);
+    }
 }

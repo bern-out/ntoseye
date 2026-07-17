@@ -13,8 +13,8 @@ Windows kernel debugger for Linux hosts running Windows under KVM/QEMU. Essentia
 - WinDbg style commands
 - Kernel debugging
 - PDB fetching & parsing for offsets
-- Breakpointing (kernel, usermode)
-- Bugcheck analysis (decodes the bug check code, parameters, and faulting site on a guest crash)
+- Breakpointing and watchpoints (kernel and user mode)
+- Bugcheck analysis
 - Crash dump analysis (`--dump` opens a Windows kernel `.dmp` file for offline inspection)
 - Three backends: Windows KD over a serial pipe (KDCOM, default), QEMU's `gdbstub`, and passive memory introspection (see [Choosing a backend](#choosing-a-backend))
 - [Python SDK](#python-sdk)
@@ -105,10 +105,16 @@ Field access in `ev` needs an explicit cast so ntoseye knows the layout. The `dt
 dt _EPROCESS poi(nt!PsInitialSystemProcess) UniqueProcessId
 ```
 
-Breakpoints accept conditions which are written directly after the address expression:
+Breakpoints and data watchpoints accept conditions written directly after the address expression. Conditions use the normal expression grammar: comparisons, bitwise operations, and short-circuiting `!`, `&&`, and `||` can be combined with parentheses. Write ranges explicitly (`0 < @rax && @rax < 10`) rather than as chained comparisons.
 
 ```text
-bp nt!KeBugCheckEx @rcx == 0x50
+bp nt!KeBugCheckEx @rcx == 0x50 && (@rdx & 0xff) != 0
+```
+
+Data watchpoints use `ba <access><size> <address>` (`w` = write, `r` = read/write, `e` = execute; sizes 1, 2, 4, or 8 with natural alignment; KD backend only). For a quick live test, watch a global the kernel writes to frequently:
+
+```text
+ba w8 nt!KiBalanceSetManagerLastCheckTick
 ```
 
 Aliases use `alias <name> <expansion>`. `${1}` is the first argument passed to the alias, `${2}` is the second, and `${*}` expands to all alias arguments separated by spaces. Alias expansions can contain command lists separated by semicolons.
@@ -233,7 +239,7 @@ ntoseye --dump /path/to/MEMORY.DMP
 
 Full and kernel memory dumps are supported. The dump's `DirectoryTableBase` and `CONTEXT` record are used automatically: for BSOD dumps the crash registers, stack trace, and bugcheck analysis are available, while live system dumps (bugcheck 0x161) have memory but no exception context.
 
-Available commands include `ps`, `lm`, `dt`, `dq`/`db`/`dd`, `x`, `ev`, `drivers`, and `s`. Execution control, breakpoints, and register/memory writes are not available (the dump is read-only).
+Available commands include `ps`, `lm`, `dt`, `dq`/`db`/`dd`, `dqs`, `da`/`du`, `analyze`, `trap`, `x`, `ev`, `drivers`, and `s`. Execution control, breakpoints, and register/memory writes are not available (the dump is read-only).
 
 The Python SDK supports dump analysis as well:
 
@@ -283,7 +289,9 @@ Note: BSOD crash dumps are staged through the page file, so with paging disabled
 
 ## Python SDK
 
-Drive the debugger from Python with the `ntoseye` module: the same introspection and run-control surface as the REPL (memory/struct reads, expression eval, symbol/type lookup, disassembly, backtraces, breakpoints, execution control, process enumeration), with Python owning the loop. The wheel is self-contained, so this needs neither the `ntoseye` CLI nor a build with the embedded interpreter.
+Drive the debugger from Python with the `ntoseye` module: the same introspection and run-control surface as the REPL (memory/struct reads, expression eval, symbol/type lookup, disassembly, backtraces, trap-frame decoding, code breakpoints, data watchpoints, execution control, process enumeration), with Python owning the loop. `dbg.watchpoint(target, access="write"|"read_write", length=1|2|4|8)` returns the same live handle type as `dbg.breakpoint(...)`; `dbg.inspect_trap_frame()` decodes the current thread's saved `_KTRAP_FRAME`, or accepts an explicit address. The wheel is self-contained, so this needs neither the `ntoseye` CLI nor a build with the embedded interpreter.
+
+Data watchpoints currently require KD, apply globally across guest address spaces, and consume one of the four x86 debug-register slots.
 
 ### Install via pip
 
@@ -331,6 +339,8 @@ See [`commands/`](commands/) for more examples.
 ## MCP integration
 
 `ntoseye` can run as an [MCP](https://modelcontextprotocol.io) server, exposing the debugger as tools to MCP clients. It reads the top-level `--backend`/`--connect` flags to choose how to attach, so the VM and its debug transport must be set up exactly as for the REPL (see [Choosing a backend](#choosing-a-backend)). Only one consumer of the VM can run at a time.
+
+The structured tool surface includes `inspect_trap_frame` and `set_watchpoint`; watchpoints report `stop: "watchpoint"` with access/length metadata and use the existing breakpoint lifecycle tools for list, disable, enable, and clear operations.
 
 > [!IMPORTANT]
 > The server attaches on launch, so bring up the guest and its debug transport before starting the client.

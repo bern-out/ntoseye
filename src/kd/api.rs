@@ -23,6 +23,7 @@ pub const DBGKD_SET_CONTEXT: u32 = 0x0000_3133;
 pub const DBGKD_WRITE_BREAKPOINT: u32 = 0x0000_3134;
 pub const DBGKD_RESTORE_BREAKPOINT: u32 = 0x0000_3135;
 pub const DBGKD_READ_CONTROL_SPACE: u32 = 0x0000_3137;
+pub const DBGKD_WRITE_CONTROL_SPACE: u32 = 0x0000_3138;
 pub const DBGKD_CONTINUE_API2: u32 = 0x0000_313C;
 pub const DBGKD_GET_VERSION: u32 = 0x0000_3146;
 pub const DBGKD_SWITCH_PROCESSOR: u32 = 0x0000_3150;
@@ -243,6 +244,21 @@ pub fn read_control_space<T: Read + Write>(
     Ok(data)
 }
 
+/// `DbgKdWriteControlSpaceApi`
+pub fn write_control_space<T: Read + Write>(
+    framing: &mut KdFraming<T>,
+    processor: u16,
+    base: u64,
+    data: &[u8],
+) -> Result<u32> {
+    let mut header = make_header(DBGKD_WRITE_CONTROL_SPACE, processor);
+    write_u64(&mut header, UNION_OFFSET, base);
+    write_u32(&mut header, UNION_OFFSET + 8, data.len() as u32);
+    let (parsed, reply_header, _) = send_manipulate(framing, &header, data)?;
+    check_status(&parsed, DBGKD_WRITE_CONTROL_SPACE)?;
+    Ok(read_u32(&reply_header, UNION_OFFSET + 12))
+}
+
 /// `DbgKdWriteVirtualMemoryApi`
 pub fn write_virtual_memory<T: Read + Write>(
     framing: &mut KdFraming<T>,
@@ -302,11 +318,14 @@ pub fn continue_api2<T: Read + Write>(
     processor: u16,
     continue_status: u32,
     trace: bool,
+    dr7: u64,
 ) -> Result<()> {
     let mut header = make_header(DBGKD_CONTINUE_API2, processor);
-    // AMD64_DBGKD_CONTROL_SET follows ContinueStatus
+    // Packed AMD64_DBGKD_CONTROL_SET follows ContinueStatus:
+    // TraceFlag (u32), Dr7 (u64), CurrentSymbolStart/End (u64 each).
     write_u32(&mut header, UNION_OFFSET, continue_status);
     write_u32(&mut header, UNION_OFFSET + 4, if trace { 1 } else { 0 });
+    write_u64(&mut header, UNION_OFFSET + 8, dr7);
     let payload_len = MANIPULATE_HEADER_SIZE;
     let mut payload = Vec::with_capacity(payload_len);
     payload.extend_from_slice(&header);
@@ -504,6 +523,38 @@ mod tests {
     }
 
     #[test]
+    fn write_control_space_sends_special_registers() {
+        let data: Vec<u8> = (0..168u32).map(|i| (i & 0xff) as u8).collect();
+        let mut union_body = vec![0u8; 16];
+        union_body[0..8].copy_from_slice(&2u64.to_le_bytes());
+        union_body[8..12].copy_from_slice(&(data.len() as u32).to_le_bytes());
+        union_body[12..16].copy_from_slice(&(data.len() as u32).to_le_bytes());
+        let reply = build_reply(DBGKD_WRITE_CONTROL_SPACE, 2, &union_body, &[]);
+        let stream = ack_then_reply(
+            (INITIAL_PACKET_ID | SYNC_PACKET_ID) & !SYNC_PACKET_ID,
+            INITIAL_PACKET_ID,
+            &reply,
+        );
+
+        let mut framing = KdFraming::new(Loopback::new(stream));
+        let actual = write_control_space(&mut framing, 2, 2, &data).unwrap();
+        assert_eq!(actual, data.len() as u32);
+
+        let out = &framing.transport_ref().outbound;
+        let payload_start = 16;
+        let req_header = &out[payload_start..payload_start + MANIPULATE_HEADER_SIZE];
+        assert_eq!(read_u32(req_header, 0), DBGKD_WRITE_CONTROL_SPACE);
+        assert_eq!(read_u16(req_header, 6), 2);
+        assert_eq!(read_u64(req_header, UNION_OFFSET), 2);
+        assert_eq!(read_u32(req_header, UNION_OFFSET + 8), data.len() as u32);
+        assert_eq!(
+            &out[payload_start + MANIPULATE_HEADER_SIZE
+                ..payload_start + MANIPULATE_HEADER_SIZE + data.len()],
+            data
+        );
+    }
+
+    #[test]
     fn write_breakpoint_returns_handle() {
         // Reply union: BreakPointAddress (echoed) + BreakPointHandle = 7
         let mut union_body = vec![0u8; 12];
@@ -542,13 +593,14 @@ mod tests {
             hdr.to_vec()
         };
         let mut framing = KdFraming::new(Loopback::new(ack));
-        continue_api2(&mut framing, 0, DBG_CONTINUE, false).unwrap();
+        continue_api2(&mut framing, 0, DBG_CONTINUE, false, 0x0000_0400).unwrap();
 
         let out = &framing.transport_ref().outbound;
         let req_header = &out[16..16 + MANIPULATE_HEADER_SIZE];
         assert_eq!(read_u32(req_header, 0), DBGKD_CONTINUE_API2);
         assert_eq!(read_u32(req_header, UNION_OFFSET), DBG_CONTINUE);
         assert_eq!(read_u32(req_header, UNION_OFFSET + 4), 0); // trace flag
+        assert_eq!(read_u64(req_header, UNION_OFFSET + 8), 0x0000_0400);
     }
 
     #[test]
@@ -562,11 +614,12 @@ mod tests {
             hdr.to_vec()
         };
         let mut framing = KdFraming::new(Loopback::new(ack));
-        continue_api2(&mut framing, 0, DBG_CONTINUE, true).unwrap();
+        continue_api2(&mut framing, 0, DBG_CONTINUE, true, 0xdead_beef).unwrap();
 
         let out = &framing.transport_ref().outbound;
         let req_header = &out[16..16 + MANIPULATE_HEADER_SIZE];
         assert_eq!(read_u32(req_header, UNION_OFFSET + 4), 1);
+        assert_eq!(read_u64(req_header, UNION_OFFSET + 8), 0xdead_beef);
     }
 
     #[test]

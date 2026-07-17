@@ -376,6 +376,71 @@ fn test_parse_at_register() {
 }
 
 #[test]
+fn test_parse_boolean_precedence_and_module_symbols() {
+    let expr = Expr::parse("nt!Flag == 1 || $rbx == 2 && !$rcx").unwrap();
+    assert_eq!(
+        expr,
+        Expr::Binary(
+            Box::new(Expr::Binary(
+                Box::new(Expr::Symbol("nt!Flag".to_string())),
+                ExprBinaryOp::Equal,
+                lit(1),
+            )),
+            ExprBinaryOp::LogicalOr,
+            Box::new(Expr::Binary(
+                Box::new(Expr::Binary(
+                    Box::new(Expr::Register("rbx".to_string())),
+                    ExprBinaryOp::Equal,
+                    lit(2),
+                )),
+                ExprBinaryOp::LogicalAnd,
+                Box::new(Expr::Unary(
+                    ExprUnaryOp::LogicalNot,
+                    Box::new(Expr::Register("rcx".to_string())),
+                )),
+            )),
+        )
+    );
+}
+
+#[test]
+fn test_parse_not_equal_without_spaces_after_module_symbol() {
+    let expr = Expr::parse("nt!Flag!=0").unwrap();
+    assert_eq!(
+        expr,
+        Expr::Binary(
+            Box::new(Expr::Symbol("nt!Flag".to_string())),
+            ExprBinaryOp::NotEqual,
+            lit(0),
+        )
+    );
+}
+
+#[test]
+fn test_parse_grouped_boolean_and_bitwise_expression() {
+    let expr = Expr::parse("($rax & 0xff) == 0x42 && ($rdx >> 4) != 0").unwrap();
+    assert!(matches!(expr, Expr::Binary(_, ExprBinaryOp::LogicalAnd, _)));
+}
+
+#[test]
+fn test_parse_rejects_chained_relational_comparison() {
+    let err = Expr::parse_detailed("0 < $rax < 10").unwrap_err();
+    assert!(
+        err.label
+            .contains("chained relational comparisons are ambiguous")
+    );
+}
+
+#[test]
+fn test_parse_rejects_chained_equality_comparison() {
+    let err = Expr::parse_detailed("$rax == 1 == $rbx").unwrap_err();
+    assert!(
+        err.label
+            .contains("chained equality comparisons are ambiguous")
+    );
+}
+
+#[test]
 fn test_parse_error_labels_register_name() {
     let err = Expr::parse_detailed("rax + @").unwrap_err();
     assert_eq!(err.span, 6..7);

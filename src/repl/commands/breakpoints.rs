@@ -3,9 +3,9 @@ use tabled::settings::Padding;
 
 use owo_colors::OwoColorize;
 
-use crate::error::Result;
+use crate::dbg_backend::HwBreakpointAccess;
+use crate::error::{Error, Result};
 use crate::expr::Expr;
-use crate::session::split_condition_operator;
 use crate::ui;
 
 use crate::repl::*;
@@ -16,6 +16,16 @@ repl_command! {
     usage: "bp <address> [<expr>]",
     summary: "Set a breakpoint.",
     completion: Expression,
+    run_state: Halted,
+}
+
+repl_command! {
+    cmd_ba;
+    names: ["ba"],
+    usage: "ba <access><size> <address> [<expr>]",
+    summary: "Set a hardware (debug-register) breakpoint (KD backend only).",
+    details: "access: e=execute, r=read/write, w=write; size: 1,2,4,8 bytes (execute is 1). e.g. ba w4 nt!MyGlobal",
+    completion: [None, Expression],
     run_state: Halted,
 }
 
@@ -53,25 +63,38 @@ repl_command! {
     run_state: Halted,
 }
 
-fn breakpoint_condition(
-    invocation: &CommandInvocation<'_>,
-) -> Result<Option<String>> {
-    if invocation.argv.len() <= 1 {
-        return Ok(None);
-    }
-    let condition = invocation.join_args(1);
-    validate_breakpoint_condition(&condition)?;
-    Ok(Some(condition))
+fn breakpoint_condition(invocation: &CommandInvocation<'_>, start: usize) -> Option<String> {
+    (invocation.argv.len() > start).then(|| invocation.join_args(start))
 }
 
-fn validate_breakpoint_condition(condition: &str) -> Result<()> {
-    if let Some((left, _op, right)) = split_condition_operator(condition) {
-        Expr::parse(left)?;
-        Expr::parse(right)?;
-    } else {
-        Expr::parse(condition)?;
-    }
-    Ok(())
+/// Parse a WinDbg-style `ba` access/size token like `w4`, `r1`, `e1`: a leading
+/// access letter (`e`/`r`/`w`) followed by the watch width in bytes.
+fn parse_hw_breakpoint_spec(spec: &str) -> Result<(HwBreakpointAccess, u8)> {
+    let mut chars = spec.chars();
+    let access = match chars.next().map(|c| c.to_ascii_lowercase()) {
+        Some('e') => HwBreakpointAccess::Execute,
+        Some('w') => HwBreakpointAccess::Write,
+        Some('r') => HwBreakpointAccess::ReadWrite,
+        _ => {
+            return Err(Error::Rsp(format!(
+                "invalid access in '{spec}' (use e=execute, r=read/write, w=write)"
+            )));
+        }
+    };
+    let size: String = chars.collect();
+    let len = match size.as_str() {
+        // Execute watches are always a single byte; allow the bare `e`.
+        "" if matches!(access, HwBreakpointAccess::Execute) => 1,
+        "" => {
+            return Err(Error::Rsp(format!(
+                "missing size in '{spec}' (e.g. ba w4 <address>)"
+            )));
+        }
+        other => other
+            .parse()
+            .map_err(|_| Error::Rsp(format!("invalid size '{other}' (use 1, 2, 4, or 8)")))?,
+    };
+    Ok((access, len))
 }
 
 impl ReplState<'_> {
@@ -90,19 +113,74 @@ impl ReplState<'_> {
         }
     }
 
+    fn cmd_ba(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        let spec_str = require_arg!(invocation, 0, "ba");
+        let addr_str = require_arg!(invocation, 1, "ba");
+
+        let (access, len) = match parse_hw_breakpoint_spec(spec_str) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                error!("{}", e);
+                return Ok(());
+            }
+        };
+        let address = match Expr::eval(addr_str, &self.ctx.target) {
+            Ok(a) => a,
+            Err(e) => {
+                error!("{}", e);
+                return Ok(());
+            }
+        };
+        let condition = breakpoint_condition(&invocation, 2);
+
+        let symbol = self
+            .ctx
+            .target
+            .symbols
+            .format_closest_symbol_for_address(self.ctx.target.current_dtb(), address);
+
+        match self.ctx.breakpoints.add_hardware(
+            &mut *self.ctx.backend,
+            address,
+            access,
+            len,
+            symbol.clone(),
+            condition.clone(),
+        ) {
+            Ok(id) => {
+                self.caches.refresh_breakpoints(&self.ctx.breakpoints);
+                let condition_label = condition
+                    .as_ref()
+                    .map(|condition| format!(" if {condition}"))
+                    .unwrap_or_default();
+                println!(
+                    "hardware breakpoint {} ({} {}b) set at {}{}{}\n",
+                    ui::bp_id(id),
+                    access.label(),
+                    len,
+                    ui::addr(address.0),
+                    symbol
+                        .map(|s| format!(" ({s})"))
+                        .unwrap_or_default()
+                        .green(),
+                    condition_label.bright_black(),
+                );
+            }
+            Err(e) => {
+                error!("{}", e);
+            }
+        }
+
+        Ok(())
+    }
+
     fn cmd_bp(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
         // Process-scope BP support is per-backend; the
         // manager returns `Error::NotSupported` for
         // backends that can't honour them.
 
         let addr_str = require_arg!(invocation, 0, "bp");
-        let condition = match breakpoint_condition(&invocation) {
-            Ok(condition) => condition,
-            Err(e) => {
-                error!("{}", e);
-                return Ok(());
-            }
-        };
+        let condition = breakpoint_condition(&invocation, 1);
         let address = match Expr::eval(addr_str, &self.ctx.target) {
             Ok(a) => a,
             Err(e) => {
@@ -169,6 +247,7 @@ impl ReplState<'_> {
             builder.push_record(vec![
                 "ID".to_string(),
                 "Status".to_string(),
+                "Type".to_string(),
                 "Address".to_string(),
                 "Symbol".to_string(),
                 "Condition".to_string(),
@@ -178,10 +257,15 @@ impl ReplState<'_> {
             for bp in bps {
                 let status = if bp.enabled { "enabled" } else { "disabled" };
                 let scope = bp.scope.label();
+                let kind = match bp.hardware {
+                    Some(hw) => format!("hw {}{}", hw.access.letter(), hw.len),
+                    None => "sw".to_string(),
+                };
 
                 builder.push_record(vec![
                     bp.id.to_string(),
                     status.to_string(),
+                    kind,
                     ui::addr(bp.address.0),
                     bp.symbol.as_deref().unwrap_or("-").to_string(),
                     bp.condition.as_deref().unwrap_or("-").to_string(),
@@ -285,15 +369,18 @@ mod tests {
         let invocation = bp_invocation(&["nt!Foo", "$rax", "==", "1"]);
 
         assert_eq!(
-            breakpoint_condition(&invocation).unwrap().as_deref(),
+            breakpoint_condition(&invocation, 1).as_deref(),
             Some("$rax == 1")
         );
     }
 
     #[test]
-    fn breakpoint_condition_rejects_malformed_tail() {
-        let invocation = bp_invocation(&["nt!Foo", "$rax", "=="]);
+    fn breakpoint_condition_preserves_chained_expression_tail() {
+        let invocation = bp_invocation(&["nt!Foo", "$rax", "==", "1", "&&", "$rcx", "!=", "0"]);
 
-        assert!(breakpoint_condition(&invocation).is_err());
+        assert_eq!(
+            breakpoint_condition(&invocation, 1).as_deref(),
+            Some("$rax == 1 && $rcx != 0")
+        );
     }
 }

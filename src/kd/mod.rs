@@ -10,12 +10,12 @@ use owo_colors::OwoColorize;
 
 use crate::dbg_backend::{
     BackendCapability, BugcheckInfo, DebugBackend, DebugCapability, DebugLog, DebugOutputPage,
-    StopEvent,
+    HW_BREAKPOINT_SLOTS, HwBreakpointAccess, StopEvent,
 };
 use crate::error::{Error, Result};
 use crate::gdb::RegisterMap;
-use crate::session::clear_trap_flag;
 use crate::kd::framing::{BREAKIN_BYTE, KdFraming};
+use crate::session::clear_trap_flag;
 use crate::types::VirtAddr;
 
 macro_rules! kd_trace {
@@ -47,6 +47,7 @@ pub fn trace_bytes_enabled() -> bool {
 pub mod api;
 pub mod context;
 pub mod framing;
+pub mod hwbp;
 
 mod debug_io;
 pub use debug_io::*;
@@ -92,6 +93,12 @@ const KSPECIAL_REGISTERS_CR0_OFFSET: usize = 0x00;
 const KSPECIAL_REGISTERS_CR2_OFFSET: usize = 0x08;
 const KSPECIAL_REGISTERS_CR3_OFFSET: usize = 0x10;
 const KSPECIAL_REGISTERS_CR4_OFFSET: usize = 0x18;
+const KSPECIAL_REGISTERS_DR0_OFFSET: usize = 0x20;
+const KSPECIAL_REGISTERS_DR1_OFFSET: usize = 0x28;
+const KSPECIAL_REGISTERS_DR2_OFFSET: usize = 0x30;
+const KSPECIAL_REGISTERS_DR3_OFFSET: usize = 0x38;
+const KSPECIAL_REGISTERS_DR6_OFFSET: usize = 0x40;
+const KSPECIAL_REGISTERS_DR7_OFFSET: usize = 0x48;
 const KSPECIAL_REGISTERS_CR8_OFFSET: usize = 0xA0;
 const KSPECIAL_REGISTERS_MIN_SIZE: usize = KSPECIAL_REGISTERS_CR8_OFFSET + 8;
 const STATUS_BREAKPOINT: u32 = 0x8000_0003;
@@ -188,7 +195,37 @@ fn append_control_registers_from_special(ctx: &mut Vec<u8>, special: &[u8]) -> R
     copy_reg(ctx, context::OFFSET_CR2, KSPECIAL_REGISTERS_CR2_OFFSET);
     copy_reg(ctx, context::OFFSET_CR3, KSPECIAL_REGISTERS_CR3_OFFSET);
     copy_reg(ctx, context::OFFSET_CR4, KSPECIAL_REGISTERS_CR4_OFFSET);
+    copy_reg(ctx, context::OFFSET_DR0, KSPECIAL_REGISTERS_DR0_OFFSET);
+    copy_reg(ctx, context::OFFSET_DR1, KSPECIAL_REGISTERS_DR1_OFFSET);
+    copy_reg(ctx, context::OFFSET_DR2, KSPECIAL_REGISTERS_DR2_OFFSET);
+    copy_reg(ctx, context::OFFSET_DR3, KSPECIAL_REGISTERS_DR3_OFFSET);
+    copy_reg(ctx, context::OFFSET_DR6, KSPECIAL_REGISTERS_DR6_OFFSET);
+    copy_reg(ctx, context::OFFSET_DR7, KSPECIAL_REGISTERS_DR7_OFFSET);
     copy_reg(ctx, context::OFFSET_CR8, KSPECIAL_REGISTERS_CR8_OFFSET);
+    Ok(())
+}
+
+fn update_special_debug_registers_from_context(special: &mut [u8], ctx: &[u8]) -> Result<()> {
+    if special.len() < KSPECIAL_REGISTERS_MIN_SIZE {
+        return Err(Error::Kd(format!(
+            "KSPECIAL_REGISTERS buffer too short: {} bytes, expected at least {}",
+            special.len(),
+            KSPECIAL_REGISTERS_MIN_SIZE
+        )));
+    }
+    context_payload(ctx)?;
+
+    for (ctx_offset, special_offset) in [
+        (context::OFFSET_DR0, KSPECIAL_REGISTERS_DR0_OFFSET),
+        (context::OFFSET_DR1, KSPECIAL_REGISTERS_DR1_OFFSET),
+        (context::OFFSET_DR2, KSPECIAL_REGISTERS_DR2_OFFSET),
+        (context::OFFSET_DR3, KSPECIAL_REGISTERS_DR3_OFFSET),
+        (context::OFFSET_DR6, KSPECIAL_REGISTERS_DR6_OFFSET),
+        (context::OFFSET_DR7, KSPECIAL_REGISTERS_DR7_OFFSET),
+    ] {
+        special[special_offset..special_offset + 8]
+            .copy_from_slice(&ctx[ctx_offset..ctx_offset + 8]);
+    }
     Ok(())
 }
 
@@ -215,6 +252,12 @@ fn stop_event(stop: StateChange) -> StopEvent {
         target_kernel_base_hint: stop.kernel_base_hint,
         assisted_breakin: stop.assisted_breakin,
     }
+}
+
+#[derive(Clone, Copy)]
+struct DebugRegisterSlotState {
+    address: u64,
+    dr7: u64,
 }
 
 pub struct KdBackend {
@@ -481,8 +524,8 @@ impl KdBackend {
         if self.managed_bp_addresses.contains(&stop.program_counter) {
             return false;
         }
-        let raw_rebreak_in_place = stop.exception_code == STATUS_BREAKPOINT
-            && stop.program_counter == resumed_from_rip;
+        let raw_rebreak_in_place =
+            stop.exception_code == STATUS_BREAKPOINT && stop.program_counter == resumed_from_rip;
         raw_rebreak_in_place || self.known_breakin_stop(stop)
     }
 
@@ -624,20 +667,166 @@ impl KdBackend {
         Ok(())
     }
 
+    fn read_dr_slot_state(&mut self, slot: u8) -> Result<DebugRegisterSlotState> {
+        let special = self.read_special_registers_uncached(self.current_processor)?;
+        Ok(DebugRegisterSlotState {
+            address: wire::read_u64(&special, Self::kspecial_dr_offset(slot)),
+            dr7: wire::read_u64(&special, KSPECIAL_REGISTERS_DR7_OFFSET),
+        })
+    }
+
+    fn apply_dr_restore(&mut self, slot: u8, state: DebugRegisterSlotState) -> Result<()> {
+        let mut special = self.read_special_registers_uncached(self.current_processor)?;
+        wire::write_u64(&mut special, Self::kspecial_dr_offset(slot), state.address);
+        wire::write_u64(&mut special, KSPECIAL_REGISTERS_DR7_OFFSET, state.dr7);
+        self.write_special_registers(special)
+    }
+
+    fn rollback_dr_slot_states(
+        &mut self,
+        slot: u8,
+        states: &[(u16, DebugRegisterSlotState)],
+    ) -> Result<()> {
+        let mut first_error = None;
+        for &(processor, state) in states.iter().rev() {
+            self.current_processor = processor;
+            if let Err(error) = self.apply_dr_restore(slot, state)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    /// Apply one DR-slot update to every processor as a transaction. The slot's
+    /// prior address and DR7 are captured before each write; any read/write
+    /// failure restores every processor that may have been modified, including
+    /// the one whose reply was lost. The caller's selected processor is always
+    /// restored.
+    fn update_dr_slot_on_all_processors(
+        &mut self,
+        slot: u8,
+        operation: &str,
+        mut update: impl FnMut(&mut Self) -> Result<()>,
+    ) -> Result<()> {
+        if slot >= HW_BREAKPOINT_SLOTS {
+            return Err(Error::Kd(format!(
+                "invalid hardware breakpoint slot {slot} (expected 0-{max})",
+                max = HW_BREAKPOINT_SLOTS - 1
+            )));
+        }
+
+        let saved = self.current_processor;
+        let result = (|| {
+            let mut applied = Vec::with_capacity(self.processor_count.max(1) as usize);
+            let mut failure = None;
+
+            for processor in 0..self.processor_count.max(1) {
+                self.current_processor = processor;
+                let previous = match self.read_dr_slot_state(slot) {
+                    Ok(previous) => previous,
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
+                };
+                applied.push((processor, previous));
+                if let Err(error) = update(self) {
+                    failure = Some(error);
+                    break;
+                }
+            }
+
+            let Some(error) = failure else {
+                return Ok(());
+            };
+            match self.rollback_dr_slot_states(slot, &applied) {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(Error::Kd(format!(
+                    "hardware breakpoint {operation} failed: {error}; rollback also failed: {rollback_error}"
+                ))),
+            }
+        })();
+        self.current_processor = saved;
+        result
+    }
+
+    fn kspecial_dr_offset(slot: u8) -> usize {
+        KSPECIAL_REGISTERS_DR0_OFFSET + slot as usize * 8
+    }
+
+    /// Program the currently selected processor's kernel debug-register state
+    /// to trap on `access` at `addr` (`len` bytes) via slot `slot`.
+    fn apply_dr_set(
+        &mut self,
+        slot: u8,
+        addr: u64,
+        access: HwBreakpointAccess,
+        len: u8,
+    ) -> Result<()> {
+        let mut special = self.read_special_registers_uncached(self.current_processor)?;
+        wire::write_u64(&mut special, Self::kspecial_dr_offset(slot), addr);
+        let dr7 = wire::read_u64(&special, KSPECIAL_REGISTERS_DR7_OFFSET);
+        let dr7 = hwbp::dr7_set_slot(dr7, slot, access, len);
+        wire::write_u64(&mut special, KSPECIAL_REGISTERS_DR7_OFFSET, dr7);
+        self.write_special_registers(special)
+    }
+
+    /// Disable slot `slot` on the currently selected processor and zero its
+    /// address register.
+    fn apply_dr_clear(&mut self, slot: u8) -> Result<()> {
+        let mut special = self.read_special_registers_uncached(self.current_processor)?;
+        let dr7 = wire::read_u64(&special, KSPECIAL_REGISTERS_DR7_OFFSET);
+        let dr7 = hwbp::dr7_clear_slot(dr7, slot);
+        wire::write_u64(&mut special, KSPECIAL_REGISTERS_DR7_OFFSET, dr7);
+        wire::write_u64(&mut special, Self::kspecial_dr_offset(slot), 0);
+        self.write_special_registers(special)
+    }
+
+    fn read_special_registers_uncached(&mut self, processor: u16) -> Result<Vec<u8>> {
+        with_framing_read_timeout(self.framing()?, KD_REQUEST_TIMEOUT, |framing| {
+            api::read_control_space(
+                framing,
+                processor,
+                AMD64_DEBUG_CONTROL_SPACE_KSPECIAL,
+                KSPECIAL_REGISTERS_MIN_SIZE as u32,
+            )
+        })
+    }
+
+    fn write_special_registers(&mut self, special: Vec<u8>) -> Result<()> {
+        let processor = self.current_processor;
+        let actual = with_framing_read_timeout(self.framing()?, KD_REQUEST_TIMEOUT, |framing| {
+            api::write_control_space(
+                framing,
+                processor,
+                AMD64_DEBUG_CONTROL_SPACE_KSPECIAL,
+                &special,
+            )
+        })?;
+        if actual as usize != special.len() {
+            return Err(Error::Kd(format!(
+                "short KSPECIAL_REGISTERS write on processor {}: wrote {} of {} bytes",
+                processor + 1,
+                actual,
+                special.len()
+            )));
+        }
+        self.special_register_cache.insert(processor, special);
+        Ok(())
+    }
+
     fn read_special_registers(&mut self) -> Result<&[u8]> {
         if !self
             .special_register_cache
             .contains_key(&self.current_processor)
         {
             let processor = self.current_processor;
-            let data = with_framing_read_timeout(self.framing()?, KD_REQUEST_TIMEOUT, |framing| {
-                api::read_control_space(
-                    framing,
-                    processor,
-                    AMD64_DEBUG_CONTROL_SPACE_KSPECIAL,
-                    KSPECIAL_REGISTERS_MIN_SIZE as u32,
-                )
-            })?;
+            let data = self.read_special_registers_uncached(processor)?;
             self.special_register_cache.insert(processor, data);
         }
 
@@ -652,6 +841,21 @@ impl KdBackend {
         append_control_registers_from_special(ctx, special)
     }
 
+    fn continue_preserving_dr7(&mut self, processor: u16, trace: bool) -> Result<()> {
+        if !self.special_register_cache.contains_key(&processor) {
+            let special = self.read_special_registers_uncached(processor)?;
+            self.special_register_cache.insert(processor, special);
+        }
+        let special = self
+            .special_register_cache
+            .get(&processor)
+            .expect("cache holds processor; we just inserted it on miss");
+        let dr7 = wire::read_u64(special, KSPECIAL_REGISTERS_DR7_OFFSET);
+        with_framing_read_timeout(self.framing()?, KD_REQUEST_TIMEOUT, |framing| {
+            api::continue_api2(framing, processor, api::DBG_CONTINUE, trace, dr7)
+        })
+    }
+
     fn continue_stopped_for_exit(&mut self) -> Result<()> {
         let processor = self.last_stop_processor;
         if should_advance_rip_before_continue(
@@ -660,9 +864,7 @@ impl KdBackend {
         ) {
             self.advance_rip_past_int3(processor)?;
         }
-        with_framing_read_timeout(self.framing()?, KD_REQUEST_TIMEOUT, |framing| {
-            api::continue_api2(framing, processor, api::DBG_CONTINUE, false)
-        })?;
+        self.continue_preserving_dr7(processor, false)?;
         self.record_running();
         // The resume consumed the current stop. Any stashed pending_stop from
         // an earlier break-in is stale now; keeping it can make exit issue
@@ -736,7 +938,14 @@ impl DebugBackend for KdBackend {
         let processor = self.current_processor;
         with_framing_read_timeout(self.framing()?, KD_REQUEST_TIMEOUT, |framing| {
             api::set_context(framing, processor, context)
-        })
+        })?;
+
+        // KD restores hardware-breakpoint state from KSPECIAL_REGISTERS, not
+        // the CONTEXT debug-register fields. Keep both views coherent so DR6
+        // clearing and DR7 updates survive ContinueApi2.
+        let mut special = self.read_special_registers_uncached(self.current_processor)?;
+        update_special_debug_registers_from_context(&mut special, data)?;
+        self.write_special_registers(special)
     }
 
     fn set_breakpoint(&mut self, addr: u64) -> Result<()> {
@@ -789,6 +998,30 @@ impl DebugBackend for KdBackend {
         result
     }
 
+    fn supports_watchpoints(&self) -> bool {
+        true
+    }
+
+    fn set_hardware_breakpoint(
+        &mut self,
+        slot: u8,
+        addr: u64,
+        access: HwBreakpointAccess,
+        len: u8,
+    ) -> Result<()> {
+        // DR state is per-processor, so program every CPU: watched code can run
+        // anywhere. The shared transaction prevents an untracked partial set.
+        self.update_dr_slot_on_all_processors(slot, "install", |backend| {
+            backend.apply_dr_set(slot, addr, access, len)
+        })
+    }
+
+    fn clear_hardware_breakpoint(&mut self, slot: u8) -> Result<()> {
+        // A failed disable/remove must leave the manager's still-enabled entry
+        // truthful, so clearing receives the same rollback guarantee as set.
+        self.update_dr_slot_on_all_processors(slot, "clear", |backend| backend.apply_dr_clear(slot))
+    }
+
     fn supports_user_mode_breakpoints(&self) -> bool {
         true
     }
@@ -796,6 +1029,7 @@ impl DebugBackend for KdBackend {
     fn optional_capabilities(&self) -> Vec<BackendCapability> {
         vec![
             BackendCapability::supported(DebugCapability::UserModeBreakpoints),
+            BackendCapability::supported(DebugCapability::Watchpoints),
             BackendCapability::supported(DebugCapability::TargetReloadDetection),
             BackendCapability::supported(DebugCapability::KernelBaseHint),
             BackendCapability::supported(DebugCapability::BugcheckDetection),
@@ -869,9 +1103,7 @@ impl DebugBackend for KdBackend {
                 "kd: continue: sending ContinueApi2 on p{}",
                 resume_processor + 1
             );
-            with_framing_read_timeout(self.framing()?, KD_REQUEST_TIMEOUT, |framing| {
-                api::continue_api2(framing, resume_processor, api::DBG_CONTINUE, false)
-            })?;
+            self.continue_preserving_dr7(resume_processor, false)?;
             kd_trace!("kd: continue: ContinueApi2 ACKed, VM should resume");
             self.record_running();
 
@@ -942,9 +1174,7 @@ impl DebugBackend for KdBackend {
         // single step stops almost immediately, so the caller's wait_for_stop
         // reads it synchronously; no pump needed
         let processor = self.current_processor;
-        with_framing_read_timeout(self.framing()?, KD_REQUEST_TIMEOUT, |framing| {
-            api::continue_api2(framing, processor, api::DBG_CONTINUE, true)
-        })?;
+        self.continue_preserving_dr7(processor, true)?;
         self.record_running();
         Ok(())
     }
@@ -1562,6 +1792,12 @@ mod tests {
             .copy_from_slice(&0x350ef8u64.to_le_bytes());
         special[KSPECIAL_REGISTERS_CR8_OFFSET..KSPECIAL_REGISTERS_CR8_OFFSET + 8]
             .copy_from_slice(&2u64.to_le_bytes());
+        special[KSPECIAL_REGISTERS_DR0_OFFSET..KSPECIAL_REGISTERS_DR0_OFFSET + 8]
+            .copy_from_slice(&0xffff_f804_1234_5678u64.to_le_bytes());
+        special[KSPECIAL_REGISTERS_DR6_OFFSET..KSPECIAL_REGISTERS_DR6_OFFSET + 8]
+            .copy_from_slice(&5u64.to_le_bytes());
+        special[KSPECIAL_REGISTERS_DR7_OFFSET..KSPECIAL_REGISTERS_DR7_OFFSET + 8]
+            .copy_from_slice(&0x402u64.to_le_bytes());
 
         append_control_registers_from_special(&mut ctx, &special).unwrap();
         let map = context::build_register_map();
@@ -1571,7 +1807,38 @@ mod tests {
         assert_eq!(map.read_u64("cr2", &ctx).unwrap(), 0x1111_2222);
         assert_eq!(map.read_u64("cr3", &ctx).unwrap(), 0x1234_5000);
         assert_eq!(map.read_u64("cr4", &ctx).unwrap(), 0x350ef8);
+        assert_eq!(map.read_u64("dr0", &ctx).unwrap(), 0xffff_f804_1234_5678);
+        assert_eq!(map.read_u64("dr6", &ctx).unwrap(), 5);
+        assert_eq!(map.read_u64("dr7", &ctx).unwrap(), 0x402);
         assert_eq!(map.read_u64("cr8", &ctx).unwrap(), 2);
+    }
+
+    #[test]
+    fn context_debug_registers_update_special_registers() {
+        let mut ctx = vec![0u8; context::REGISTER_BUFFER_SIZE];
+        let mut special = vec![0xa5; KSPECIAL_REGISTERS_MIN_SIZE];
+        let map = context::build_register_map();
+        map.write_u64("dr0", &mut ctx, 0xffff_f804_1234_5678)
+            .unwrap();
+        map.write_u64("dr6", &mut ctx, 3).unwrap();
+        map.write_u64("dr7", &mut ctx, 0xd0402).unwrap();
+
+        update_special_debug_registers_from_context(&mut special, &ctx).unwrap();
+
+        assert_eq!(
+            wire::read_u64(&special, KSPECIAL_REGISTERS_DR0_OFFSET),
+            0xffff_f804_1234_5678
+        );
+        assert_eq!(wire::read_u64(&special, KSPECIAL_REGISTERS_DR6_OFFSET), 3);
+        assert_eq!(
+            wire::read_u64(&special, KSPECIAL_REGISTERS_DR7_OFFSET),
+            0xd0402
+        );
+        assert_eq!(
+            wire::read_u64(&special, KSPECIAL_REGISTERS_CR0_OFFSET),
+            0xa5a5_a5a5_a5a5_a5a5,
+            "non-debug special registers must remain untouched"
+        );
     }
 
     #[test]
@@ -1765,6 +2032,21 @@ mod tests {
         payload
     }
 
+    fn read_special_registers_reply_payload(processor: u16) -> Vec<u8> {
+        const MANIPULATE_UNION_OFFSET: usize = 16;
+
+        let mut payload = vec![0u8; api::MANIPULATE_HEADER_SIZE + KSPECIAL_REGISTERS_MIN_SIZE];
+        payload[0..4].copy_from_slice(&api::DBGKD_READ_CONTROL_SPACE.to_le_bytes());
+        payload[6..8].copy_from_slice(&processor.to_le_bytes());
+        payload[MANIPULATE_UNION_OFFSET..MANIPULATE_UNION_OFFSET + 8]
+            .copy_from_slice(&AMD64_DEBUG_CONTROL_SPACE_KSPECIAL.to_le_bytes());
+        payload[MANIPULATE_UNION_OFFSET + 8..MANIPULATE_UNION_OFFSET + 12]
+            .copy_from_slice(&(KSPECIAL_REGISTERS_MIN_SIZE as u32).to_le_bytes());
+        payload[MANIPULATE_UNION_OFFSET + 12..MANIPULATE_UNION_OFFSET + 16]
+            .copy_from_slice(&(KSPECIAL_REGISTERS_MIN_SIZE as u32).to_le_bytes());
+        payload
+    }
+
     #[test]
     fn known_breakin_stop_is_marked_assisted_unless_managed() {
         let (_kernel, host) = UnixStream::pair().unwrap();
@@ -1806,8 +2088,8 @@ mod tests {
     fn continue_drains_in_place_rebreak_and_stale_breakin() {
         let (_kernel, host) = UnixStream::pair().unwrap();
         let mut backend = kd_backend_with_framing(host);
-        let resumed_from = 0xfffff800_1340c4;
-        let breakin = 0xfffff800_002f90d0;
+        let resumed_from = 0xffff_f800_0013_40c4;
+        let breakin = 0xffff_f800_002f_90d0;
         backend.breakin_addresses.insert(breakin);
 
         let stop_at = |code: u32, pc: u64| StateChange {
@@ -1824,24 +2106,37 @@ mod tests {
         };
 
         // Raw int3 re-break at the rip we resumed from: drain it.
-        assert!(backend
-            .is_spurious_continue_rebreak(&stop_at(STATUS_BREAKPOINT, resumed_from), resumed_from));
+        assert!(
+            backend.is_spurious_continue_rebreak(
+                &stop_at(STATUS_BREAKPOINT, resumed_from),
+                resumed_from
+            )
+        );
         // Stale break-in byte trapping at the KD break-in instruction: drain it,
         // even though it's nowhere near resumed_from.
         assert!(
-            backend.is_spurious_continue_rebreak(&stop_at(STATUS_BREAKPOINT, breakin), resumed_from)
+            backend
+                .is_spurious_continue_rebreak(&stop_at(STATUS_BREAKPOINT, breakin), resumed_from)
         );
 
         // A managed breakpoint hit is a real stop, never drained.
         backend.managed_bp_addresses.insert(breakin);
-        assert!(!backend
-            .is_spurious_continue_rebreak(&stop_at(STATUS_BREAKPOINT, breakin), resumed_from));
+        assert!(
+            !backend
+                .is_spurious_continue_rebreak(&stop_at(STATUS_BREAKPOINT, breakin), resumed_from)
+        );
 
         // An unrelated breakpoint elsewhere, and a single-step, are real stops.
-        assert!(!backend
-            .is_spurious_continue_rebreak(&stop_at(STATUS_BREAKPOINT, 0xdead_0000), resumed_from));
-        assert!(!backend
-            .is_spurious_continue_rebreak(&stop_at(STATUS_SINGLE_STEP, resumed_from), resumed_from));
+        assert!(
+            !backend.is_spurious_continue_rebreak(
+                &stop_at(STATUS_BREAKPOINT, 0xdead_0000),
+                resumed_from
+            )
+        );
+        assert!(!backend.is_spurious_continue_rebreak(
+            &stop_at(STATUS_SINGLE_STEP, resumed_from),
+            resumed_from
+        ));
     }
 
     #[test]
@@ -2011,12 +2306,43 @@ mod tests {
                 PACKET_TYPE_KD_ACKNOWLEDGE
             );
 
+            let read_special_packet = read_wire_packet(&mut kernel);
+            let read_special_request = &read_special_packet
+                [WIRE_HEADER_SIZE..WIRE_HEADER_SIZE + api::MANIPULATE_HEADER_SIZE];
+            assert_eq!(
+                u32::from_le_bytes(read_special_request[0..4].try_into().unwrap()),
+                api::DBGKD_READ_CONTROL_SPACE
+            );
+            let read_special_id =
+                u32::from_le_bytes(read_special_packet[8..12].try_into().unwrap());
+            kernel
+                .write_all(&wire_control_packet(
+                    PACKET_TYPE_KD_ACKNOWLEDGE,
+                    read_special_id,
+                ))
+                .unwrap();
+            kernel
+                .write_all(&wire_data_packet(
+                    PACKET_TYPE_KD_STATE_MANIPULATE,
+                    WIRE_FIRST_PACKET_ID ^ 1,
+                    &read_special_registers_reply_payload(0),
+                ))
+                .unwrap();
+            kernel.flush().unwrap();
+
+            let read_special_ack = read_wire_packet(&mut kernel);
+            assert_eq!(
+                u16::from_le_bytes(read_special_ack[4..6].try_into().unwrap()),
+                PACKET_TYPE_KD_ACKNOWLEDGE
+            );
+
             let continue_packet = read_wire_packet(&mut kernel);
+            let continue_id = u32::from_le_bytes(continue_packet[8..12].try_into().unwrap());
             continue_tx.send(continue_packet).unwrap();
             kernel
                 .write_all(&wire_control_packet(
                     PACKET_TYPE_KD_ACKNOWLEDGE,
-                    WIRE_FIRST_PACKET_ID,
+                    continue_id,
                 ))
                 .unwrap();
             kernel.flush().unwrap();
@@ -2108,6 +2434,9 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
         let mut backend = kd_backend_with_framing(host);
+        backend
+            .special_register_cache
+            .insert(0, vec![0; KSPECIAL_REGISTERS_MIN_SIZE]);
 
         backend.pending_stop = Some(StateChange {
             processor: 0,

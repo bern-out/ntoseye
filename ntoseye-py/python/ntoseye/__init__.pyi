@@ -4,7 +4,7 @@ Drive the ntoseye Windows kernel debugger from Python. See the project README
 and `examples/` for usage.
 """
 
-from typing import Any
+from typing import Any, Literal
 
 __version__: str
 
@@ -73,7 +73,7 @@ class MemorySearchMatch:
     def __repr__(self) -> str: ...
 
 class Breakpoint:
-    """A live breakpoint handle."""
+    """A live code-breakpoint or data-watchpoint handle."""
 
     @property
     def id(self) -> int: ...
@@ -87,6 +87,12 @@ class Breakpoint:
     def condition(self) -> str | None: ...
     @property
     def temporary(self) -> bool: ...
+    @property
+    def watchpoint(self) -> bool: ...
+    @property
+    def watch_access(self) -> Literal["write", "read_write"] | None: ...
+    @property
+    def watch_length(self) -> int | None: ...
     @property
     def valid(self) -> bool: ...
     def is_valid(self) -> bool: ...
@@ -115,6 +121,8 @@ class StopOutcome:
     def timed_out(self) -> bool: ...
     @property
     def breakpoint_stop(self) -> bool: ...
+    @property
+    def watchpoint(self) -> bool: ...
     @property
     def exception(self) -> bool: ...
     @property
@@ -147,6 +155,11 @@ class StopOutcome:
     def address(self) -> int | None: ...
     @property
     def temporary(self) -> bool | None: ...
+    @property
+    def condition_error(self) -> str | None:
+        """Error from evaluating a breakpoint/watchpoint condition. Such a stop
+        is surfaced rather than silently skipped."""
+        ...
     @property
     def exception_code(self) -> int | None: ...
     @property
@@ -232,6 +245,11 @@ class Debugger:
         ...
     def disassemble(self, addr: int, count: int) -> list[tuple[int, str, str, str | None]]:
         """Disassemble `count` instructions: `(ip, hex, asm, comment)` tuples."""
+        ...
+    def inspect_trap_frame(self, address: int | None = None) -> dict[str, Any]:
+        """Decode an x64 `_KTRAP_FRAME` at `address`, or the current Windows
+        thread's saved trap frame when omitted. Returns `{address, rip_symbol,
+        frame}` with the decoded register fields in `frame`."""
         ...
     def backtrace(self, limit: int = 64) -> list[tuple[int, int, str, str]]:
         """Walk the current thread's call stack: `(ip, sp, symbol, source)` tuples.
@@ -323,8 +341,10 @@ class Debugger:
         ...
     def bugcheck(self) -> dict[str, Any] | None:
         """Analyze the current bugcheck (BSOD) from `nt!KiBugCheckData`. Returns
-        `{code, code_hex, name, description, driver, args, fault, source}` or
-        `None` if the guest is not bugchecking."""
+        `{code, code_hex, name, description, driver, args, fault, trap_frames,
+        source}` (each trap frame is `{address, rip_symbol, frame, error}` with
+        decoded `_KTRAP_FRAME` registers in `frame`, or `None` plus an `error`
+        explaining why decoding failed) or `None` if the guest is not bugchecking."""
         ...
     def reload(self) -> None:
         """Rebuild guest state after a reboot/reload."""
@@ -334,31 +354,42 @@ class Debugger:
     def set_breakpoint(self, addr: int, condition: str | None = None) -> int:
         """Set a code breakpoint; returns its id. Requires the VM halted.
 
-        `condition` (optional) is re-evaluated each hit; the breakpoint only
-        surfaces when it holds (e.g. `"$rcx == 0x4"`, or a bare expression
-        treated as non-zero).
+        `condition` uses the normal expression grammar and is re-evaluated each
+        hit. Comparisons, bitwise operators, and short-circuiting `!`, `&&`, and
+        `||` may be combined; a bare expression is true when non-zero.
         """
         ...
     def breakpoint(self, target: int | str, condition: str | None = None) -> Breakpoint:
         """Set a code breakpoint from an address or expression; returns a live
         breakpoint handle. Requires the VM halted."""
         ...
+    def watchpoint(
+        self,
+        target: int | str,
+        *,
+        access: Literal["write", "read_write"] = "write",
+        length: Literal[1, 2, 4, 8] = 1,
+        condition: str | None = None,
+    ) -> Breakpoint:
+        """Watch data access at an address or expression; returns a live handle.
+        `read_write` reflects x86's inability to trap reads without writes.
+        Watches are global across guest address spaces and currently require KD.
+        Requires the VM halted."""
+        ...
     def clear_breakpoint(self, id: int | Breakpoint) -> None:
-        """Clear a breakpoint by id or handle. Requires the VM halted."""
+        """Clear a breakpoint or watchpoint by id or handle. Requires the VM halted."""
         ...
     def enable_breakpoint(self, id: int | Breakpoint) -> None:
-        """Re-arm a disabled breakpoint by id or handle. Requires the VM halted."""
+        """Re-arm a disabled breakpoint or watchpoint. Requires the VM halted."""
         ...
     def disable_breakpoint(self, id: int | Breakpoint) -> None:
-        """Disable a breakpoint without forgetting it (re-enable later).
+        """Disable a breakpoint or watchpoint without forgetting it.
         Requires the VM halted."""
         ...
     def breakpoints(self) -> list[Breakpoint]:
-        """The installed breakpoints as live `Breakpoint` handles (the same type
-        `breakpoint()` returns), so listed entries can be cleared/enabled/disabled
-        directly. Use a handle's properties, or `to_dict()` for the flat mapping
-        `{id, address, enabled, symbol, scope, condition, temporary}` (`scope` is
-        `"global"` or `"name (pid)"`)."""
+        """Installed code breakpoints and data watchpoints as live handles.
+        `watchpoint`, `watch_access`, and `watch_length` distinguish data
+        watches; every entry can be cleared/enabled/disabled directly."""
         ...
 
     # --- process context ---

@@ -1,8 +1,8 @@
 use std::ffi::CString;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyModule, PyString, PyTuple};
@@ -123,7 +123,10 @@ fn install_repl_module<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyModule>> {
     ntoseye.add("Struct", py.get_type::<Struct>())?;
     ntoseye.add("Type", py.get_type::<Type>())?;
     ntoseye.add("NtoseyeError", py.get_type::<super::NtoseyeError>())?;
-    ntoseye.add("MemoryAccessError", py.get_type::<super::MemoryAccessError>())?;
+    ntoseye.add(
+        "MemoryAccessError",
+        py.get_type::<super::MemoryAccessError>(),
+    )?;
     ntoseye.add("__version__", env!("CARGO_PKG_VERSION"))?;
     ntoseye.setattr("__path__", PyList::empty(py))?;
 

@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use crate::backend::MemoryOps;
 use crate::bugchecks::{analyze_bugcheck, current_bugcheck};
-use crate::dbg_backend::DebugBackend;
+use crate::dbg_backend::{DebugBackend, WatchpointAccess};
 use crate::dmp::DmpBackend;
 use crate::error::Error;
 use crate::expr::Expr;
@@ -29,6 +29,7 @@ use crate::phys::PhysMem;
 use crate::session::{ContinueOutcome, RunStatus, Session};
 use crate::symbols::{FieldValue, TypeInfo};
 use crate::target::{kthread_state_name, wait_reason_name};
+use crate::trapframe::read_ktrap_frame_at_or_current;
 use crate::types::VirtAddr;
 use crate::view;
 
@@ -112,15 +113,11 @@ fn spawn_session(
                 let phys = Arc::new(PhysMem::kvm()?);
                 Session::connect(phys, target.as_deref(), || {
                     let backend: Box<dyn DebugBackend> = match backend.as_str() {
-                        "gdb" => Box::new(GdbClient::connect(
-                            target.as_deref().unwrap(),
-                        )?),
-                        "kd" => Box::new(KdBackend::connect(
-                            target.as_deref().unwrap(),
-                        )?),
+                        "gdb" => Box::new(GdbClient::connect(target.as_deref().unwrap())?),
+                        "kd" => Box::new(KdBackend::connect(target.as_deref().unwrap())?),
                         "memory" => Box::new(MemoryBackend::new()),
                         other => {
-                            return Err(Error::DebugInfo(format!("unknown backend '{other}'")))
+                            return Err(Error::DebugInfo(format!("unknown backend '{other}'")));
                         }
                     };
                     Ok(backend)
@@ -239,10 +236,7 @@ impl OpeningGuard {
                 *guard = SessionSlot::Active(tx);
                 Ok(())
             }
-            _ => Err(McpError::internal_error(
-                "session open was cancelled",
-                None,
-            )),
+            _ => Err(McpError::internal_error("session open was cancelled", None)),
         }
     }
 }
@@ -282,6 +276,14 @@ struct AddressArgs {
         description = "Address as a debugger expression (symbol, register, hex, arithmetic)"
     )]
     address: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct TrapFrameArgs {
+    #[schemars(
+        description = "Optional trap-frame address as a debugger expression; omit to use the current Windows thread's saved KTHREAD.TrapFrame"
+    )]
+    address: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -433,7 +435,42 @@ struct SetBreakpointArgs {
     )]
     address: String,
     #[schemars(
-        description = "Optional break condition, re-evaluated each hit; the breakpoint only surfaces when it holds (e.g. \"$rcx == 0x4\" or a bare expression treated as non-zero). Comparison ops: == != < <= > >="
+        description = "Optional break condition, parsed when installed and re-evaluated each hit; the breakpoint only surfaces when it holds. Uses the normal expression grammar, including comparisons (== != < <= > >=), bitwise operators (~ & ^ | << >>), and short-circuiting !, &&, ||."
+    )]
+    condition: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum WatchpointAccessArg {
+    Write,
+    ReadWrite,
+}
+
+impl From<WatchpointAccessArg> for WatchpointAccess {
+    fn from(access: WatchpointAccessArg) -> Self {
+        match access {
+            WatchpointAccessArg::Write => Self::Write,
+            WatchpointAccessArg::ReadWrite => Self::ReadWrite,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SetWatchpointArgs {
+    #[schemars(description = "Data address to watch as a debugger expression")]
+    address: String,
+    #[schemars(
+        description = "Access to watch: write, or read_write (x86 cannot trap reads without also trapping writes)"
+    )]
+    access: WatchpointAccessArg,
+    #[schemars(
+        range(min = 1, max = 8),
+        description = "Watched width in bytes: 1, 2, 4, or 8; address must be naturally aligned"
+    )]
+    length: u8,
+    #[schemars(
+        description = "Optional condition, parsed when installed and re-evaluated after the watch fires. Uses the normal expression grammar, including comparisons, bitwise operators, and short-circuiting !, &&, ||."
     )]
     condition: Option<String>,
 }
@@ -516,7 +553,9 @@ struct OpenDumpArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct OpenArgs {
-    #[schemars(description = "Backend to use: \"kd\" (KD over Unix socket), \"gdb\" (GDB remote stub), or \"memory\" (physical memory only, no debug transport)")]
+    #[schemars(
+        description = "Backend to use: \"kd\" (KD over Unix socket), \"gdb\" (GDB remote stub), or \"memory\" (physical memory only, no debug transport)"
+    )]
     backend: String,
     #[schemars(
         description = "Connection target: Unix socket path for kd (default /tmp/ntoseye-kd.sock), host:port for gdb (default 127.0.0.1:1234). Ignored for memory backend."
@@ -534,9 +573,7 @@ struct EvalArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ReadPointerArgs {
-    #[schemars(
-        description = "Address expression to read a pointer-sized (8-byte) value from"
-    )]
+    #[schemars(description = "Address expression to read a pointer-sized (8-byte) value from")]
     address: String,
 }
 
@@ -726,15 +763,23 @@ fn continue_outcome_json(ctx: &Session, outcome: ContinueOutcome) -> Value {
             symbol,
             temporary,
             rip,
-        } => serde_json::json!({
-            "stop": "breakpoint",
-            "id": id,
-            "address": hex(address),
-            "symbol": symbol.or_else(|| symbol_at(rip)),
-            "temporary": temporary,
-            "rip": hex(rip),
-            "process": process,
-        }),
+            condition_error,
+        } => {
+            let bp = ctx.breakpoint(id);
+            let watch_access = bp.and_then(|bp| bp.watch_access_name());
+            serde_json::json!({
+                "stop": if watch_access.is_some() { "watchpoint" } else { "breakpoint" },
+                "id": id,
+                "address": hex(address),
+                "symbol": symbol.or_else(|| symbol_at(rip)),
+                "temporary": temporary,
+                "rip": hex(rip),
+                "process": process,
+                "watch_access": watch_access,
+                "watch_length": bp.and_then(|bp| bp.watch_length()),
+                "condition_error": condition_error,
+            })
+        }
         ContinueOutcome::Bugcheck { rip, info } => {
             let analysis = info
                 .map(|i| analyze_bugcheck(&ctx.target, &i))
@@ -1549,7 +1594,9 @@ impl NtoseyeMcp {
                     .symbols
                     .find_type_across_modules(dtb, &type_name)
                     .ok_or_else(|| {
-                        ToolError::Request(ctx.target.symbols.unresolved_type_message(dtb, &type_name))
+                        ToolError::Request(
+                            ctx.target.symbols.unresolved_type_message(dtb, &type_name),
+                        )
                     })?;
                 let fields: Vec<Value> = {
                     let mut fields: Vec<_> = info.fields.iter().collect();
@@ -1706,7 +1753,9 @@ impl NtoseyeMcp {
                     .symbols
                     .find_type_across_modules(dtb, &type_name)
                     .ok_or_else(|| {
-                        ToolError::Request(ctx.target.symbols.unresolved_type_message(dtb, &type_name))
+                        ToolError::Request(
+                            ctx.target.symbols.unresolved_type_message(dtb, &type_name),
+                        )
                     })?;
                 let mut buf = vec![0u8; info.size];
                 read_virt_bytes(ctx, addr, &mut buf)?;
@@ -1796,7 +1845,7 @@ impl NtoseyeMcp {
     }
 
     #[tool(
-        description = "Analyze the current bugcheck (BSOD): {code, code_hex, name, description, driver, args:[{index, value, description}], fault:{ip, symbol, driver}, source}, or null if the guest is not bugchecking"
+        description = "Analyze the current bugcheck (BSOD): {code, code_hex, name, description, driver, args:[{index, value, description}], fault:{ip, symbol, driver}, trap_frames:[{address, rip_symbol, frame:{rax..r11, rip, rsp, cs, ss, eflags, error_code, previous_mode, previous_irql}|null, error:string|null}], source}, or null if the guest is not bugchecking"
     )]
     async fn bugcheck(&self) -> Result<CallToolResult, McpError> {
         let v = self
@@ -1805,6 +1854,30 @@ impl NtoseyeMcp {
                     Some(analysis) => view::to_json(&view::bugcheck(&analysis)),
                     None => Value::Null,
                 })
+            })
+            .await?;
+        json_result(v)
+    }
+
+    #[tool(
+        description = "Decode an x64 _KTRAP_FRAME at an address, or the current Windows thread's saved trap frame when address is omitted. Returns {address, rip_symbol, frame:{rax..r11, rip, rsp, cs, ss, eflags, error_code, previous_mode, previous_irql}}."
+    )]
+    async fn inspect_trap_frame(
+        &self,
+        Parameters(TrapFrameArgs { address }): Parameters<TrapFrameArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let v = self
+            .run(move |ctx| {
+                let address = address
+                    .as_deref()
+                    .map(|address| eval_addr(ctx, address).map(VirtAddr))
+                    .transpose()?;
+                let frame = read_ktrap_frame_at_or_current(&ctx.target, address)
+                    .map_err(ToolError::from)?;
+                let rip_symbol = ctx
+                    .target
+                    .closest_symbol_current_context(VirtAddr(frame.rip));
+                Ok(view::to_json(&view::trap_frame(&frame, rip_symbol)))
             })
             .await?;
         json_result(v)
@@ -2084,7 +2157,46 @@ impl NtoseyeMcp {
     }
 
     #[tool(
-        description = "Remove a breakpoint by id. Requires the VM halted (call interrupt first, or be stopped at a breakpoint)."
+        description = "Watch a data address globally across guest address spaces for write or read/write access. length is 1, 2, 4, or 8 bytes and the address must be naturally aligned. Requires the VM halted and a backend with data-watch support (currently KD). Returns {id, address, access, length, condition}."
+    )]
+    async fn set_watchpoint(
+        &self,
+        Parameters(SetWatchpointArgs {
+            address,
+            access,
+            length,
+            condition,
+        }): Parameters<SetWatchpointArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let v = self
+            .run(move |ctx| {
+                require_halted(ctx, "set_watchpoint")?;
+                let addr = eval_addr(ctx, &address)?;
+                let access = WatchpointAccess::from(access);
+                let symbol = ctx.target.closest_symbol_current_context(VirtAddr(addr));
+                let id = ctx
+                    .add_watchpoint_with_symbol_condition(
+                        VirtAddr(addr),
+                        access,
+                        length,
+                        symbol,
+                        condition.clone(),
+                    )
+                    .map_err(ToolError::from)?;
+                Ok(serde_json::json!({
+                    "id": id,
+                    "address": hex(addr),
+                    "access": access.name(),
+                    "length": length,
+                    "condition": condition,
+                }))
+            })
+            .await?;
+        json_result(v)
+    }
+
+    #[tool(
+        description = "Remove a breakpoint or watchpoint by id. Requires the VM halted (call interrupt first, or be stopped at a breakpoint/watchpoint)."
     )]
     async fn clear_breakpoint(
         &self,
@@ -2101,7 +2213,7 @@ impl NtoseyeMcp {
     }
 
     #[tool(
-        description = "Re-arm a disabled breakpoint by id (re-patch its int3). Requires the VM halted (call interrupt first, or be stopped at a breakpoint)."
+        description = "Re-arm a disabled breakpoint or watchpoint by id. Requires the VM halted (call interrupt first, or be stopped at one)."
     )]
     async fn enable_breakpoint(
         &self,
@@ -2118,7 +2230,7 @@ impl NtoseyeMcp {
     }
 
     #[tool(
-        description = "Disable a breakpoint by id (restore the original byte) without forgetting it, so it can be re-enabled later. Requires the VM halted (call interrupt first, or be stopped at a breakpoint)."
+        description = "Disable a breakpoint or watchpoint by id without forgetting it, so it can be re-enabled later. Requires the VM halted."
     )]
     async fn disable_breakpoint(
         &self,
@@ -2135,7 +2247,7 @@ impl NtoseyeMcp {
     }
 
     #[tool(
-        description = "List breakpoints as {id, address, enabled, symbol, scope, condition, temporary} objects (scope is \"global\" for kernel-wide or \"name (pid)\" for a process-scoped breakpoint)"
+        description = "List code breakpoints and data watchpoints as {id, address, enabled, symbol, scope, condition, temporary, watch_access, watch_length} objects. watch_access/watch_length are null for code breakpoints."
     )]
     async fn list_breakpoints(&self) -> Result<CallToolResult, McpError> {
         let v = self
@@ -2143,17 +2255,7 @@ impl NtoseyeMcp {
                 let arr: Vec<Value> = ctx
                     .list_breakpoints()
                     .iter()
-                    .map(|b| {
-                        serde_json::json!({
-                            "id": b.id,
-                            "address": hex(b.address.0),
-                            "enabled": b.enabled,
-                            "symbol": b.symbol,
-                            "scope": b.scope.label(),
-                            "condition": b.condition,
-                            "temporary": b.temporary,
-                        })
-                    })
+                    .map(|b| view::to_json(&view::breakpoint(b)))
                     .collect();
                 Ok(serde_json::json!({ "breakpoints": arr }))
             })
@@ -2184,7 +2286,7 @@ impl NtoseyeMcp {
     }
 
     #[tool(
-        description = "Wait up to timeout_ms for the next stop WITHOUT resuming (default 10000, max 20000; 0 = default). Returns {stop:\"breakpoint\"|\"exception\"|\"bugcheck\"|\"target_reloaded\"} with context, {stop:\"running\"} if the wait elapsed (call again to keep waiting; no stops lost between calls), or {stop:\"halted\"} immediately if the VM is already parked with nothing pending. Does not resume; call resume to advance. Use short timeouts and poll; there is no indefinite wait."
+        description = "Wait up to timeout_ms for the next stop WITHOUT resuming (default 10000, max 20000; 0 = default). Returns {stop:\"breakpoint\"|\"watchpoint\"|\"exception\"|\"bugcheck\"|\"target_reloaded\"} with context, {stop:\"running\"} if the wait elapsed (call again to keep waiting; no stops lost between calls), or {stop:\"halted\"} immediately if the VM is already parked with nothing pending. Breakpoint/watchpoint stops include condition_error when condition evaluation failed; the stop is surfaced rather than skipped. Does not resume; call resume to advance. Use short timeouts and poll; there is no indefinite wait."
     )]
     async fn wait_for_stop(
         &self,
@@ -2389,8 +2491,7 @@ impl NtoseyeMcp {
             .run(move |ctx| {
                 require_halted(ctx, "set_register")?;
                 let value = eval_addr(ctx, &value)?;
-                ctx.write_register(&name, value)
-                    .map_err(ToolError::from)?;
+                ctx.write_register(&name, value).map_err(ToolError::from)?;
                 Ok(serde_json::json!({ "name": name, "value": hex(value) }))
             })
             .await?;
@@ -2458,14 +2559,13 @@ impl NtoseyeMcp {
 
         let backend_name = backend.clone();
         let connect_str = connect.clone();
-        let (tx, service_pending) = tokio::task::spawn_blocking(move || {
-            spawn_session(backend_name, connect_str, None)
-        })
-        .await
-        .map_err(|e| McpError::internal_error(format!("spawn_blocking failed: {e}"), None))?
-        .map_err(|e| {
-            McpError::internal_error(format!("failed to connect ({backend}): {e}"), None)
-        })?;
+        let (tx, service_pending) =
+            tokio::task::spawn_blocking(move || spawn_session(backend_name, connect_str, None))
+                .await
+                .map_err(|e| McpError::internal_error(format!("spawn_blocking failed: {e}"), None))?
+                .map_err(|e| {
+                    McpError::internal_error(format!("failed to connect ({backend}): {e}"), None)
+                })?;
 
         let tx_for_ticker = tx.clone();
         opening.promote(tx)?;
@@ -2497,26 +2597,19 @@ impl NtoseyeMcp {
                 let running = s.running;
                 let status = run_status_json(s);
 
-                let bc = current_bugcheck(&ctx.target)
-                    .map(|a| view::to_json(&view::bugcheck(&a)));
+                let bc = current_bugcheck(&ctx.target).map(|a| view::to_json(&view::bugcheck(&a)));
 
                 let bt = if !running {
                     ctx.backtrace(BACKTRACE_DEFAULT_LIMIT)
                         .ok()
-                        .map(|trace| {
-                            Value::Array(trace.frames.iter().map(frame_json).collect())
-                        })
+                        .map(|trace| Value::Array(trace.frames.iter().map(frame_json).collect()))
                 } else {
                     None
                 };
 
                 let all_mods = ctx.target.guest.kernel_modules().unwrap_or_default();
                 let modules_total = all_mods.len();
-                let mods: Vec<Value> = all_mods
-                    .iter()
-                    .take(200)
-                    .map(module_json)
-                    .collect();
+                let mods: Vec<Value> = all_mods.iter().take(200).map(module_json).collect();
 
                 Ok(serde_json::json!({
                     "status": status,
@@ -2642,9 +2735,10 @@ impl rmcp::ServerHandler for NtoseyeMcp {
                 "ntoseye: introspect and control a live Windows kernel running under \
                  KVM/QEMU. Read-only tools for process/thread/module/driver \
                  enumeration, memory and struct reads, disassembly, backtraces, \
-                 page-table walks, and symbol/type lookup. State-changing tools: \
-                 attach_process/detach (scope the context to a process), \
-                 set_breakpoint/clear_breakpoint/list_breakpoints, run-control \
+                 trap-frame decoding, page-table walks, and symbol/type lookup. \
+                 State-changing tools: attach_process/detach (scope the context \
+                 to a process), set_breakpoint/set_watchpoint and shared \
+                 clear/enable/disable/list breakpoint lifecycle, run-control \
                  (resume, wait_for_stop, interrupt, step, step_over, step_out, \
                  set_current_thread), and guest writes \
                  (write_memory, set_register). Run-control is split: resume goes \
@@ -2655,9 +2749,10 @@ impl rmcp::ServerHandler for NtoseyeMcp {
                  (poll until stop:\"breakpoint\"). \
                  The guest runs freely by default (memory/process/struct reads work \
                  live). registers/backtrace need the CPU halted: call interrupt \
-                 first (or be stopped at a breakpoint), inspect, then resume to let \
-                 the guest run again. Breakpoint mutation, step, and set_register \
-                 require the VM halted; write_memory works live. After a reboot, \
+                 first (or be stopped at a breakpoint/watchpoint), inspect, then \
+                 resume to let the guest run again. Stop-point mutation, step, \
+                 and set_register require the VM halted; write_memory works live. \
+                 After a reboot, \
                  status reports coherent:false until rediscovery finishes; \
                  wait_for_stop for it rather than enumerating stale state. \
                  Tools that take an address accept a debugger expression (symbol, \
@@ -2788,9 +2883,7 @@ pub fn run(
         let serve = async {
             match http {
                 Some(addr) => {
-                    eprintln!(
-                        "ntoseye-mcp: serving Streamable HTTP at http://{addr}/mcp"
-                    );
+                    eprintln!("ntoseye-mcp: serving Streamable HTTP at http://{addr}/mcp");
                     serve_http(session, addr, unsafe_http, interrupt).await
                 }
                 None => {
@@ -2841,10 +2934,7 @@ pub fn run(
 /// `service_pending` keeps at most one `Service` queued even if the actor is
 /// busy in a long wait; the thread exits once the actor's channel closes
 /// (send fails).
-fn spawn_service_ticker(
-    tx: mpsc::UnboundedSender<Command>,
-    service_pending: Arc<AtomicBool>,
-) {
+fn spawn_service_ticker(tx: mpsc::UnboundedSender<Command>, service_pending: Arc<AtomicBool>) {
     std::thread::spawn(move || {
         loop {
             std::thread::sleep(SERVICE_TICK);
@@ -2885,9 +2975,7 @@ async fn serve_http(
     let allow_origin = if unsafe_http {
         AllowOrigin::any()
     } else {
-        AllowOrigin::predicate(|origin, _parts| {
-            origin.to_str().is_ok_and(is_loopback_origin)
-        })
+        AllowOrigin::predicate(|origin, _parts| origin.to_str().is_ok_and(is_loopback_origin))
     };
     let cors = CorsLayer::new()
         .allow_origin(allow_origin)
@@ -2920,6 +3008,17 @@ mod tests {
             Arc::new(std::sync::Mutex::new(SessionSlot::Active(tx))),
             Arc::new(AtomicBool::new(false)),
         )
+    }
+
+    #[test]
+    fn structured_trap_frame_and_watchpoint_tools_are_registered() {
+        let mcp = empty_mcp();
+        for name in ["inspect_trap_frame", "set_watchpoint", "list_breakpoints"] {
+            assert!(
+                mcp.tool_router.get(name).is_some(),
+                "missing MCP tool {name}"
+            );
+        }
     }
 
     #[test]

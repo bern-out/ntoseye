@@ -33,8 +33,8 @@ use crate::{
     backend::MemoryOps,
     gdb::RegisterMap,
     guest::{ModuleInfo, PeImage, ProcessInfo, read_pe_image, read_pe_image_from_file},
-    phys::PhysMem,
     memory::AddressSpace,
+    phys::PhysMem,
     symbols::SymbolStore,
     target::Target,
     types::{Dtb, VirtAddr},
@@ -211,7 +211,11 @@ pub fn resolve_thread_trace_context(debugger: &Target, cr3: u64) -> ThreadTraceC
     }
 }
 
-pub fn format_symbol(debugger: &Target, trace: &ThreadTraceContext, addr: u64) -> String {
+pub fn try_format_symbol(
+    debugger: &Target,
+    trace: &ThreadTraceContext,
+    addr: u64,
+) -> Option<String> {
     let try_format = |dtb| {
         debugger
             .symbols
@@ -219,24 +223,24 @@ pub fn format_symbol(debugger: &Target, trace: &ThreadTraceContext, addr: u64) -
     };
 
     if let Some(module) = trace.module_for_address(addr) {
-        return try_format(module.dtb).unwrap_or_else(|| {
+        return Some(try_format(module.dtb).unwrap_or_else(|| {
             // TODO lazily load module symbols on stop so user return addresses resolve past module+offset.
             let offset = addr.saturating_sub(module.info.base_address.0);
             format!("{}+{:#x}", module.info.short_name, offset)
-        });
+        }));
     }
 
     if let Some(process_dtb) = trace.process_dtb
         && let Some(symbol) = try_format(process_dtb)
     {
-        return symbol;
+        return Some(symbol);
     }
 
-    if let Some(symbol) = try_format(trace.kernel_dtb) {
-        return symbol;
-    }
+    try_format(trace.kernel_dtb)
+}
 
-    format!("{:#x}", addr)
+pub fn format_symbol(debugger: &Target, trace: &ThreadTraceContext, addr: u64) -> String {
+    try_format_symbol(debugger, trace, addr).unwrap_or_else(|| format!("{addr:#x}"))
 }
 
 pub fn preferred_code_dtb(trace: &ThreadTraceContext, addr: u64) -> Dtb {
@@ -344,10 +348,12 @@ fn ensure_frame_module_symbols(
     }
 
     for (dtb, modules) in by_dtb {
-        let _ =
-            debugger
-                .guest
-                .load_symbols_for_modules(&debugger.phys, &debugger.symbols, modules, dtb);
+        let _ = debugger.guest.load_symbols_for_modules(
+            &debugger.phys,
+            &debugger.symbols,
+            modules,
+            dtb,
+        );
     }
 }
 
