@@ -219,6 +219,22 @@ impl DmpContext {
             let off = context::OFFSET_XMM0 + i * 16;
             data[off..off + 16].copy_from_slice(&val.to_le_bytes());
         }
+        // Keep the buffer symmetric with from_bytes: PRCB-sourced raw CONTEXT
+        // copies carry these, so the header-context buffer must too.
+        put_u64!(context::OFFSET_DEBUG_CONTROL, self.debug_control);
+        put_u64!(context::OFFSET_LAST_BRANCH_TO_RIP, self.last_branch_to_rip);
+        put_u64!(
+            context::OFFSET_LAST_BRANCH_FROM_RIP,
+            self.last_branch_from_rip
+        );
+        put_u64!(
+            context::OFFSET_LAST_EXCEPTION_TO_RIP,
+            self.last_exception_to_rip
+        );
+        put_u64!(
+            context::OFFSET_LAST_EXCEPTION_FROM_RIP,
+            self.last_exception_from_rip
+        );
 
         data
     }
