@@ -353,6 +353,9 @@ fn buffer_u64(buf: &[u8], offset: usize) -> u64 {
 }
 
 impl DebugBackend for DmpBackend {
+    fn name(&self) -> &'static str {
+        "dmp"
+    }
     fn initialize_from_target(&mut self, target: &Target) {
         let Some(offset) = self.prcb_context_offset else {
             return;

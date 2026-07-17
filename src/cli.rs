@@ -206,7 +206,6 @@ fn run() -> Result<()> {
         println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
-
     if args.gdbstub_instructions {
         println!("{}", GDBSTUB_INSTRUCTIONS);
         return Ok(());

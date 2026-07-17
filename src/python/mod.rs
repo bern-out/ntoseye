@@ -1533,7 +1533,10 @@ impl Debugger {
         let rows = self.inner.disassemble(VirtAddr(addr), count).map_err(err)?;
         Ok(rows
             .into_iter()
-            .map(|r| (r.ip, r.hex, r.asm, r.comment))
+            .map(|r| {
+                let asm = r.asm();
+                (r.ip, r.hex, asm, r.comment)
+            })
             .collect())
     }
 

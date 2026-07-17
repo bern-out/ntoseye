@@ -243,6 +243,7 @@ impl ReplState<'_> {
                         &self.caches,
                     );
                     if is_bugcheck {
+                        print_stop_separator();
                         print_bugcheck_summary(&self.ctx.target, event.bugcheck.as_ref());
                         println!();
                     }
@@ -253,10 +254,6 @@ impl ReplState<'_> {
                         && stop_exception_code.zip(stop_pc).is_some_and(|(_, pc)| {
                             self.ctx.breakpoints.breakpoint_id_at_address(pc).is_none()
                         });
-                    if early_non_breakpoint_stop {
-                        print_stop_notice_parts(stop_exception_code, stop_pc);
-                        println!();
-                    }
 
                     refresh_stop_caches_post(
                         &self.ctx.target,
@@ -317,7 +314,6 @@ impl ReplState<'_> {
                     match hit_result {
                         BreakpointStopAction::Hit {
                             id,
-                            symbol,
                             temporary,
                             condition_error,
                             ..
@@ -325,24 +321,19 @@ impl ReplState<'_> {
                             if let Some(error) = condition_error {
                                 error!("breakpoint condition failed: {error}");
                             }
-                            println!();
-                            if !temporary {
-                                println!(
-                                    "{} {} {}",
-                                    ui::label("breakpoint:"),
-                                    ui::bp_id(id),
-                                    symbol
-                                        .as_ref()
-                                        .map(|s| format!("({})", ui::symbol(s)))
-                                        .unwrap_or_default()
-                                );
-                            }
-                            print_break_context(
+                            print_stop_separator();
+                            // Banner names the hit symbol already; temporary
+                            // (run-to) breakpoints stay silent.
+                            let cause = (!temporary)
+                                .then(|| format!("{} {}", ui::muted("breakpoint"), ui::bp_id(id)));
+                            print_break_context_at(
                                 &mut *self.ctx.backend,
                                 &self.ctx.register_map,
                                 &mut self.ctx.target,
                                 &self.ctx.breakpoints,
                                 &self.ctx.current_thread,
+                                None,
+                                cause,
                             );
 
                             break;
@@ -351,9 +342,8 @@ impl ReplState<'_> {
                         // waiting if one ever reaches here.
                         BreakpointStopAction::Resumed => continue,
                         BreakpointStopAction::NotBreakpoint => {
-                            if !target_reloaded && !early_non_breakpoint_stop && !is_bugcheck {
-                                print_stop_notice_parts(stop_exception_code, stop_pc);
-                                println!();
+                            if !is_bugcheck {
+                                print_stop_separator();
                             }
                             if reload_load_symbols_stop {
                                 print_target_reload_notification_context(
@@ -372,12 +362,17 @@ impl ReplState<'_> {
                                     event.bugcheck.as_ref(),
                                 );
                             } else {
-                                print_break_context(
+                                let cause = (!target_reloaded)
+                                    .then(|| stop_exception_cause(stop_exception_code, stop_pc))
+                                    .flatten();
+                                print_break_context_at(
                                     &mut *self.ctx.backend,
                                     &self.ctx.register_map,
                                     &mut self.ctx.target,
                                     &self.ctx.breakpoints,
                                     &self.ctx.current_thread,
+                                    None,
+                                    cause,
                                 );
                             }
                             break;
@@ -399,30 +394,32 @@ impl ReplState<'_> {
 
     /// Print a hardware (DR) breakpoint hit, mirroring the software-breakpoint
     /// `Hit` rendering. The address the breakpoint watches is unrelated to
-    /// `rip` for data watches, so the banner names the breakpoint while the
-    /// break context shows where execution actually stopped.
+    /// `rip` for data watches, so the cause child keeps the watched symbol
+    /// while the BREAK banner shows where execution actually stopped.
     fn surface_hardware_breakpoint_hit(&mut self, bp: &Breakpoint) {
-        println!();
+        print_stop_separator();
         let access = bp
             .hardware
             .map(|hw| format!(" {}{}", hw.access.letter(), hw.len))
             .unwrap_or_default();
-        println!(
-            "{} {}{} {}",
-            ui::label("hardware breakpoint:"),
+        let cause = format!(
+            "{} {}{}{}",
+            ui::muted("hardware breakpoint"),
             ui::bp_id(bp.id),
             access.bright_black(),
             bp.symbol
                 .as_ref()
-                .map(|s| format!("({})", ui::symbol(s)))
+                .map(|s| format!("  {}", ui::symbol(s)))
                 .unwrap_or_default()
         );
-        print_break_context(
+        print_break_context_at(
             &mut *self.ctx.backend,
             &self.ctx.register_map,
             &mut self.ctx.target,
             &self.ctx.breakpoints,
             &self.ctx.current_thread,
+            None,
+            Some(cause),
         );
     }
 
@@ -435,7 +432,7 @@ impl ReplState<'_> {
             return Ok(());
         }
 
-        println!();
+        print_stop_separator();
         print_break_context(
             &mut *self.ctx.backend,
             &self.ctx.register_map,

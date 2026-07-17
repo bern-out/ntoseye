@@ -1302,7 +1302,7 @@ impl NtoseyeMcp {
                         serde_json::json!({
                             "ip": hex(r.ip),
                             "hex": r.hex,
-                            "asm": r.asm,
+                            "asm": r.asm(),
                             "comment": r.comment,
                         })
                     })

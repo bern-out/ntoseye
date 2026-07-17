@@ -27,6 +27,9 @@ impl DebugBackend for MemoryBackend {
     fn register_map(&self) -> &RegisterMap {
         &self.register_map
     }
+    fn name(&self) -> &'static str {
+        "mem"
+    }
 
     fn capabilities(&self) -> Vec<BackendCapability> {
         vec![

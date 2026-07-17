@@ -186,7 +186,6 @@ pub fn apply_target_reload_if_needed(
                     dropped_breakpoints
                 );
             }
-            println!();
             TargetReloadStatus::Reloaded {
                 loaded_module_list_available,
             }
@@ -216,7 +215,6 @@ pub fn apply_target_reload_if_needed(
                     dropped_breakpoints
                 );
             }
-            println!();
             TargetReloadStatus::PendingRediscovery { kernel_base_hint }
         }
     }
@@ -245,45 +243,44 @@ pub fn refresh_windows_thread_context_for_backend_thread(
     thread
 }
 
+/// One-line summary: `thread Idle  state Running  ethread <addr>  pid 0  tid 0`.
+/// The leading `thread` label distinguishes it from the break line above,
+/// which names the process context (via CR3), not the thread's owner.
 fn format_windows_thread(thread: &ThreadInfo) -> String {
     let process = thread.process_name.as_deref().unwrap_or("unknown");
-    let pid = thread
-        .pid
-        .map(|pid| format!(" pid={pid}"))
-        .unwrap_or_default();
-    let tid = thread
-        .tid
-        .map(|tid| format!(" tid={tid}"))
-        .unwrap_or_default();
-    let state = thread
-        .state
-        .map(|state| format!(" state={}", kthread_state_name(state)))
-        .unwrap_or_default();
-    format!(
-        "{} ethread={}{}{}{}",
-        process,
-        ui::addr(thread.ethread.0),
-        pid,
-        tid,
-        state
-    )
-}
-
-pub fn print_stop_notice_parts(exception_code: Option<u32>, program_counter: Option<u64>) {
-    match (exception_code, program_counter) {
-        (Some(code), Some(pc)) => println!(
-            "{} KD exception {:#x} at {}",
-            "stop:".bold(),
-            code,
-            ui::addr(pc)
-        ),
-        (Some(code), None) => println!("{} KD exception {:#x}", "stop:".bold(), code),
-        _ => {}
+    let mut line = format!("{} {}", ui::muted("thread"), process);
+    if let Some(state) = thread.state {
+        line.push_str(&format!(
+            "  {} {}",
+            ui::muted("state"),
+            kthread_state_name(state)
+        ));
     }
+    line.push_str(&format!(
+        "  {} {}",
+        ui::muted("ethread"),
+        ui::addr(thread.ethread.0)
+    ));
+    if let Some(pid) = thread.pid {
+        line.push_str(&format!("  {} {pid}", ui::muted("pid")));
+    }
+    if let Some(tid) = thread.tid {
+        line.push_str(&format!("  {} {tid}", ui::muted("tid")));
+    }
+    line
 }
 
-pub fn print_stop_notice(event: &StopEvent) {
-    print_stop_notice_parts(event.exception_code, event.program_counter);
+/// The exception cause child for a BREAK banner, e.g. `exception 0x80000003
+/// at fffff807c0c5a0d0`. `None` when the stop carried no exception code.
+pub fn stop_exception_cause(
+    exception_code: Option<u32>,
+    program_counter: Option<u64>,
+) -> Option<String> {
+    let code = exception_code?;
+    Some(match program_counter {
+        Some(pc) => format!("{} {:#x} at {}", ui::muted("exception"), code, ui::addr(pc)),
+        None => format!("{} {:#x}", ui::muted("exception"), code),
+    })
 }
 
 // In core (the reload state machine owns them); re-exported for the REPL.
@@ -349,6 +346,7 @@ pub fn print_async_stop_context(
     current_thread: &mut String,
     outcome: StopOutcome,
 ) {
+    print_stop_separator();
     let StopOutcome {
         event,
         reload_status,
@@ -357,13 +355,13 @@ pub fn print_async_stop_context(
     let reload_load_symbols_stop = is_target_reload_load_symbols_stop(&event, reload_status);
     set_current_thread_from_stop(client, &event, current_thread);
     let modules_changed = refresh_stop_caches_pre(client, debugger, caches);
+    // The trailing blank pairs with the seam the bugcheck pane owns; other
+    // stops carry their exception as a cause child on the BREAK banner.
     if event.is_bugcheck && !target_reloaded {
         print_bugcheck_summary(debugger, event.bugcheck.as_ref());
-    } else if !target_reloaded {
-        print_stop_notice(&event);
+        println!();
     }
     refresh_stop_caches_post(debugger, caches, target_reloaded, modules_changed);
-    println!();
     if reload_load_symbols_stop {
         print_target_reload_notification_context(debugger, current_thread, &event, reload_status);
         return;
@@ -378,7 +376,20 @@ pub fn print_async_stop_context(
             event.bugcheck.as_ref(),
         );
     } else {
-        print_break_context(client, register_map, debugger, breakpoints, current_thread);
+        let cause = if target_reloaded {
+            None
+        } else {
+            stop_exception_cause(event.exception_code, event.program_counter)
+        };
+        print_break_context_at(
+            client,
+            register_map,
+            debugger,
+            breakpoints,
+            current_thread,
+            None,
+            cause,
+        );
     }
 }
 
@@ -401,17 +412,20 @@ pub fn print_target_reload_notification_context(
         kernel_base_hint: event.target_kernel_base_hint,
     };
     println!(
-        "{} {} early boot at {}",
-        "break:".bold(),
-        current_thread,
-        pending_reload_location(debugger, event, pending_status, None)
+        "{}{}",
+        ui::badge("BREAK"),
+        ui::plate(&format!(
+            " {} early boot at {} ",
+            ui::thread_id(current_thread),
+            pending_reload_location(debugger, event, pending_status, None)
+        ))
     );
     let message = if reload_status.loaded_module_list_available() {
-        "target: kernel reloaded; context is limited, continue to resume boot"
+        "kernel reloaded; context is limited, continue to resume boot"
     } else {
-        "target: kernel reloaded; module list is not available yet, continue to retry full reload"
+        "kernel reloaded; module list is not available yet, continue to retry full reload"
     };
-    println!("{}", message.bright_black());
+    print_event_children(" ", &[ui::muted(message)]);
     println!();
 }
 
@@ -474,6 +488,7 @@ pub fn print_pending_rediscovery_stop_context(
     event: &StopEvent,
     reload_status: TargetReloadStatus,
 ) {
+    print_stop_separator();
     set_current_thread_from_stop(client, event, current_thread);
     let regs = client.read_registers();
     let register_kernel_base_hint = match (&regs, event.program_counter) {
@@ -481,15 +496,19 @@ pub fn print_pending_rediscovery_stop_context(
         _ => None,
     };
     println!(
-        "{} {} early boot at {}",
-        "break:".bold(),
-        current_thread,
-        pending_reload_location(debugger, event, reload_status, register_kernel_base_hint)
+        "{}{}",
+        ui::badge("BREAK"),
+        ui::plate(&format!(
+            " {} early boot at {} ",
+            ui::thread_id(current_thread),
+            pending_reload_location(debugger, event, reload_status, register_kernel_base_hint)
+        ))
     );
-    println!(
-        "{}",
-        "target: kernel is not discoverable yet; context is limited, continue to retry"
-            .bright_black()
+    print_event_children(
+        " ",
+        &[ui::muted(
+            "kernel is not discoverable yet; context is limited, continue to retry",
+        )],
     );
     println!();
 
@@ -631,7 +650,15 @@ pub fn print_break_context(
     breakpoints: &BreakpointManager,
     thread_id: &str,
 ) {
-    print_break_context_at(client, register_map, debugger, breakpoints, thread_id, None);
+    print_break_context_at(
+        client,
+        register_map,
+        debugger,
+        breakpoints,
+        thread_id,
+        None,
+        None,
+    );
 }
 
 pub fn print_break_context_for_bugcheck(
@@ -649,9 +676,12 @@ pub fn print_break_context_for_bugcheck(
         breakpoints,
         thread_id,
         info.and_then(bugcheck_fault_ip),
+        None,
     );
 }
 
+/// `cause` is an optional pre-styled tree child naming why execution stopped
+/// (e.g. `breakpoint #3`), rendered first.
 pub fn print_break_context_at(
     client: &mut dyn DebugBackend,
     register_map: &RegisterMap,
@@ -659,6 +689,7 @@ pub fn print_break_context_at(
     breakpoints: &BreakpointManager,
     thread_id: &str,
     display_rip: Option<u64>,
+    cause: Option<String>,
 ) {
     let _ = client.set_current_thread(thread_id);
 
@@ -667,15 +698,17 @@ pub fn print_break_context_at(
         Err(e) => {
             debugger.registers = None;
             println!(
-                "{} {} (read_registers failed: {})\n",
-                "break:".bold(),
-                thread_id,
-                e
+                "{}{}\n",
+                ui::badge("BREAK"),
+                ui::plate(&format!(
+                    " {} (read_registers failed: {}) ",
+                    ui::thread_id(thread_id),
+                    e
+                ))
             );
             return;
         }
     };
-
     debugger.registers = Some(register_map.to_hashmap(&regs));
 
     let cr3 = register_map.read_u64("cr3", &regs).unwrap_or(0);
@@ -685,28 +718,35 @@ pub fn print_break_context_at(
     let context_rip = display_rip.unwrap_or(rip);
     let symbol = format_symbol(debugger, &trace, context_rip);
 
+    println!(
+        "{}{}",
+        ui::badge("BREAK"),
+        ui::plate(&format!(
+            " {} {} at {} ",
+            ui::thread_id(thread_id),
+            trace.description,
+            ui::symbol(&symbol)
+        ))
+    );
+
+    let mut children: Vec<String> = Vec::new();
+    if let Some(cause) = cause {
+        children.push(cause);
+    }
+    // Bugcheck stops park at the break inside KeBugCheck, not at the fault
+    // site the banner names.
     if display_rip.is_some_and(|display_rip| display_rip != rip) {
         let stop_symbol = format_symbol(debugger, &trace, rip);
-        println!(
-            "{} {} {} at {}",
-            "break:".bold(),
-            thread_id,
-            trace.description,
-            ui::symbol(&symbol)
-        );
-        println!("{} bugcheck, {}", "stop:".bold(), ui::symbol(&stop_symbol));
-    } else {
-        println!(
-            "{} {} {} at {}",
-            "break:".bold(),
-            thread_id,
-            trace.description,
-            ui::symbol(&symbol)
-        );
+        children.push(format!(
+            "{} {}",
+            ui::muted("stopped at"),
+            ui::symbol(&stop_symbol)
+        ));
     }
     if let Some(thread) = windows_thread {
-        println!("  {}", format_windows_thread(&thread));
+        children.push(format_windows_thread(&thread));
     }
+    print_event_children(" ", &children);
 
     print_registers(register_map, &regs, true);
     print_disasm_context(debugger, breakpoints, &trace, context_rip);

@@ -160,9 +160,8 @@ impl ReplState<'_> {
                     len,
                     ui::addr(address.0),
                     symbol
-                        .map(|s| format!(" ({s})"))
-                        .unwrap_or_default()
-                        .green(),
+                        .map(|s| format!(" ({})", ui::symbol(&s)))
+                        .unwrap_or_default(),
                     condition_label.bright_black(),
                 );
             }
@@ -213,9 +212,8 @@ impl ReplState<'_> {
                     ui::bp_id(id),
                     ui::addr(address.0),
                     symbol
-                        .map(|s| format!(" ({})", s))
-                        .unwrap_or_default()
-                        .green(),
+                        .map(|s| format!(" ({})", ui::symbol(&s)))
+                        .unwrap_or_default(),
                     condition_label.bright_black(),
                     format!(
                         " ({})",

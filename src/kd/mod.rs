@@ -917,6 +917,9 @@ impl DebugBackend for KdBackend {
     fn register_map(&self) -> &RegisterMap {
         &self.register_map
     }
+    fn name(&self) -> &'static str {
+        "kd"
+    }
 
     fn read_registers(&mut self) -> Result<Vec<u8>> {
         kd_trace!(

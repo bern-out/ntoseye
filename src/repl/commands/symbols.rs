@@ -224,7 +224,7 @@ impl ReplState<'_> {
         let mut names: Vec<&String> = self.ctx.target.user_vars.keys().collect();
         names.sort();
         if !names.is_empty() {
-            println!("{}", ui::label("user:"));
+            println!("{}", ui::label("user"));
             for name in names {
                 let var = &self.ctx.target.user_vars[name];
                 println!(
@@ -256,7 +256,7 @@ impl ReplState<'_> {
             if !self.ctx.target.user_vars.is_empty() || !self.ctx.target.results.is_empty() {
                 println!();
             }
-            println!("{}", ui::label("builtins:"));
+            println!("{}", ui::label("builtins"));
             for var in builtins {
                 println!(
                     "  ${:<16} {}   {}",

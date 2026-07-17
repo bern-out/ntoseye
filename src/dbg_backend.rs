@@ -337,6 +337,11 @@ impl BackendCapability {
 /// Debug transport abstraction; memory access stays on `/dev/kvm`
 pub trait DebugBackend {
     fn register_map(&self) -> &RegisterMap;
+    /// Short lowercase transport name for status surfaces (e.g. the REPL
+    /// prompt): "kd", "gdb", "dmp".
+    fn name(&self) -> &'static str {
+        "dbg"
+    }
 
     fn read_registers(&mut self) -> Result<Vec<u8>>;
     fn write_registers(&mut self, data: &[u8]) -> Result<()>;

@@ -674,6 +674,9 @@ impl DebugBackend for GdbClient {
     fn register_map(&self) -> &RegisterMap {
         &self.register_map
     }
+    fn name(&self) -> &'static str {
+        "gdb"
+    }
 
     fn read_registers(&mut self) -> Result<Vec<u8>> {
         GdbClient::read_registers(self)

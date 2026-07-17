@@ -54,20 +54,20 @@ pub struct LoadReport {
     pub failed: Vec<(PathBuf, String)>,
 }
 
-/// Print a one-line load summary (and any failures). Quiet on startup when no
-/// scripts are installed.
-pub fn print_script_load_report(report: &LoadReport, startup_hint: bool) {
-    if report.loaded.is_empty() && report.failed.is_empty() {
-        if !startup_hint {
-            println!("python: 0 loaded");
-        }
-        return;
-    }
+/// Print a one-line load summary and any failures (used by `.reload`;
+/// startup calls [`print_script_load_failures`] directly).
+pub fn print_script_load_report(report: &LoadReport) {
     let mut summary = format!("python: {} loaded", report.loaded.len());
     if !report.failed.is_empty() {
         summary.push_str(&format!(", {} failed", report.failed.len()));
     }
     println!("{summary}");
+    print_script_load_failures(report);
+}
+
+/// Print per-file load failures, shared by the reload report and the startup
+/// summary line.
+pub fn print_script_load_failures(report: &LoadReport) {
     for (path, err) in &report.failed {
         diagnostics::print_error(format!("{}: {}", path.display(), err));
     }

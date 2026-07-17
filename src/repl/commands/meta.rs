@@ -23,11 +23,11 @@ impl ReplState<'_> {
         #[cfg(feature = "python")]
         {
             let py_report = embed::load_commands_dir();
-            embed::print_script_load_report(&py_report, false);
+            embed::print_script_load_report(&py_report);
             *self.caches.user_commands.write().unwrap() = initial_user_commands();
         }
         let alias_report = self.reload_aliases();
-        print_alias_load_report(&alias_report, false);
+        print_alias_load_report(&alias_report);
         Ok(())
     }
 

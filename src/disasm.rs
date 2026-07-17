@@ -1,5 +1,6 @@
 use iced_x86::{
-    Code, Decoder, DecoderOptions, Formatter, Instruction, MemorySizeOptions, NasmFormatter,
+    Code, Decoder, DecoderOptions, Formatter, FormatterOutput, FormatterTextKind, Instruction,
+    MemorySizeOptions, NasmFormatter,
 };
 
 /// NASM formatter configured for ntoseye's disassembly, so every call site
@@ -17,14 +18,68 @@ pub fn disasm_formatter() -> NasmFormatter {
     formatter
 }
 
+/// A semantic classification for one disassembly token, assigned by the
+/// decoder and turned into color by the presentation layer. Color-agnostic on
+/// purpose: core decodes, `ui` owns the palette.
+#[derive(Clone, Copy)]
+pub enum AsmKind {
+    Mnemonic,
+    Register,
+    Number,
+    Punctuation,
+    Keyword,
+    Text,
+}
+
+/// One formatted token of an instruction: its text and semantic kind.
+pub struct AsmToken {
+    pub text: String,
+    pub kind: AsmKind,
+}
+
+/// Collects iced's formatter output into semantic [`AsmToken`]s, mapping the
+/// formatter's fine-grained kinds onto our small render palette.
+struct TokenSink<'a>(&'a mut Vec<AsmToken>);
+
+impl FormatterOutput for TokenSink<'_> {
+    fn write(&mut self, text: &str, kind: FormatterTextKind) {
+        let kind = match kind {
+            FormatterTextKind::Mnemonic | FormatterTextKind::Prefix => AsmKind::Mnemonic,
+            FormatterTextKind::Register => AsmKind::Register,
+            FormatterTextKind::Number
+            | FormatterTextKind::LabelAddress
+            | FormatterTextKind::FunctionAddress
+            | FormatterTextKind::SelectorValue => AsmKind::Number,
+            FormatterTextKind::Punctuation | FormatterTextKind::Operator => AsmKind::Punctuation,
+            FormatterTextKind::Keyword
+            | FormatterTextKind::Directive
+            | FormatterTextKind::Decorator => AsmKind::Keyword,
+            _ => AsmKind::Text,
+        };
+        self.0.push(AsmToken {
+            text: text.to_string(),
+            kind,
+        });
+    }
+}
+
 /// One decoded instruction, ready to render: address, space-joined hex bytes,
-/// NASM asm text, and an optional symbol comment for a branch / rip-relative
-/// target.
+/// the asm as semantic [`AsmToken`]s, and an optional symbol comment for a
+/// branch / rip-relative target.
 pub struct DisasmRow {
     pub ip: u64,
     pub hex: String,
-    pub asm: String,
+    pub tokens: Vec<AsmToken>,
     pub comment: Option<String>,
+}
+
+impl DisasmRow {
+    /// The instruction as plain, unstyled text — the form MCP, the Python
+    /// binding, and JSON output consume. Colored rendering goes through
+    /// `ui::disasm_asm` instead.
+    pub fn asm(&self) -> String {
+        self.tokens.iter().map(|t| t.text.as_str()).collect()
+    }
 }
 
 /// Decode `bytes` (loaded at `start_addr`) into rows, stopping after `limit`
@@ -40,7 +95,6 @@ pub fn decode_rows(
 ) -> Vec<DisasmRow> {
     let mut decoder = Decoder::with_ip(64, bytes, start_addr, DecoderOptions::NONE);
     let mut instruction = Instruction::default();
-    let mut output = String::new();
     let mut rows = Vec::new();
 
     while decoder.can_decode() && limit.is_none_or(|n| rows.len() < n) {
@@ -48,8 +102,8 @@ pub fn decode_rows(
         if instruction.code() == Code::INVALID {
             continue;
         }
-        output.clear();
-        formatter.format(&instruction, &mut output);
+        let mut tokens = Vec::new();
+        formatter.format(&instruction, &mut TokenSink(&mut tokens));
 
         let ip = instruction.ip();
         let start_index = (ip - start_addr) as usize;
@@ -74,7 +128,7 @@ pub fn decode_rows(
         rows.push(DisasmRow {
             ip,
             hex,
-            asm: output.clone(),
+            tokens,
             comment,
         });
     }

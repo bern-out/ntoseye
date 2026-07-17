@@ -17,33 +17,47 @@ pub use crate::bugchecks::{
 };
 pub use crate::trapframe::KtrapFrame;
 
-use super::disasm::format_rflags;
+use super::disasm::{format_rflags, print_event_children, wrap_prose};
 
 fn print_unresolved_bugcheck_data(failure: &CurrentBugcheckFailure) {
-    fn print_slots(label: &str, data: &[u64; BUGCHECK_DATA_SLOTS]) {
-        println!(
-            "{} {label} = [{:#x}, {:#x}, {:#x}, {:#x}, {:#x}]",
-            "bugcheck:".bold(),
+    fn slots_line(label: &str, data: &[u64; BUGCHECK_DATA_SLOTS]) -> String {
+        format!(
+            "{} [{:#x}, {:#x}, {:#x}, {:#x}, {:#x}]",
+            ui::muted(label),
             data[0],
             data[1],
             data[2],
             data[3],
             data[4]
-        );
+        )
     }
 
     println!(
         "{} unable to resolve nt!KiBugCheckData at {:#x}: {}",
-        "bugcheck:".bold(),
+        ui::badge("BUGCHECK"),
         failure.address,
         failure.reason
     );
+    let mut children: Vec<String> = Vec::new();
     if let Some(data) = &failure.slots {
-        print_slots("raw slots", data);
+        children.push(slots_line("raw slots", data));
     }
     if let Some(data) = &failure.dereferenced_slots {
-        print_slots("dereferenced slots", data);
+        children.push(slots_line("dereferenced slots", data));
     }
+    print_event_children(" ", &children);
+}
+
+/// Tree child with a dim wrapped prose tail. `hang` is the child-relative
+/// indent of continuation lines; `col` the absolute column where the prose
+/// starts on screen, from which the wrap width is derived.
+fn wrapped_dim_tail(prefix: String, hang: usize, prose: &str, col: usize) -> String {
+    let lines = wrap_prose(prose, col);
+    let mut out = format!("{prefix}{}", ui::muted(&lines[0]));
+    for line in &lines[1..] {
+        out.push_str(&format!("\n{}{}", " ".repeat(hang), ui::muted(line)));
+    }
+    out
 }
 
 pub fn format_arg_value(value: u64) -> String {
@@ -66,43 +80,65 @@ fn format_bugcheck_fault(fault: &BugcheckFault) -> String {
     }
 }
 
-/// Render an already-decoded [`BugcheckAnalysis`]: banner, responsible module,
-/// fault site, args (with their documented meanings), data provenance, and any
-/// trap frames the parameters point at.
+/// Render a [`BugcheckAnalysis`]: ` BUGCHECK ` badge banner with the details
+/// as tree children and the args nested one level deeper; trap frames follow
+/// as ordinary panes. No bold on the plate: its `\x1b[0m` reset would cut
+/// the background. Callers own surrounding blank lines.
 pub fn print_bugcheck_analysis(analysis: &BugcheckAnalysis) {
-    println!();
     println!(
-        "{}",
-        format!("{} ({:#010x})", analysis.name, analysis.code)
-            .red()
-            .bold()
+        "{}{}",
+        ui::badge("BUGCHECK"),
+        ui::plate(&format!(" {} ({:#010x}) ", analysis.name, analysis.code))
     );
+
+    let mut children: Vec<String> = Vec::new();
     if let Some(driver) = &analysis.driver {
-        println!("  module: {}", driver.green());
+        children.push(format!("{} {}", ui::muted("module"), driver.bright_blue()));
     }
     if let Some(fault) = &analysis.fault {
-        println!("  fault: {}", format_bugcheck_fault(fault));
+        children.push(format!(
+            "{} {}",
+            ui::muted("fault "),
+            format_bugcheck_fault(fault)
+        ));
     }
     if let Some(description) = &analysis.description {
-        println!("  reason: {description}");
-    }
-    println!();
-    println!("{}", "args".bold());
-    for (idx, arg) in analysis.args.iter().enumerate() {
-        if arg.description.is_empty() {
-            println!("  arg{} {}", idx + 1, format_arg_value(arg.value));
-        } else {
-            println!(
-                "  arg{} {}  {}",
-                idx + 1,
-                format_arg_value(arg.value),
-                arg.description
-            );
-        }
+        // prose starts at column 11: tree indent (1) + gutter (3) + "reason " (7)
+        children.push(wrapped_dim_tail(
+            format!("{} ", ui::muted("reason")),
+            7,
+            description,
+            11,
+        ));
     }
     if let Some(source) = &analysis.source {
-        println!("  source: {}", source.bright_black());
+        children.push(format!("{} {}", ui::muted("source"), ui::muted(source)));
     }
+    children.push(ui::muted("args"));
+    print_event_children(" ", &children);
+    let args: Vec<String> = analysis
+        .args
+        .iter()
+        .enumerate()
+        .map(|(idx, arg)| {
+            // `#N` matches the stack-frame index style; the parent node
+            // already says `args`.
+            let prefix = format!(
+                "{} {}",
+                ui::muted(&format!("#{}", idx + 1)),
+                format_arg_value(arg.value)
+            );
+            if arg.description.is_empty() {
+                prefix
+            } else {
+                // prose at column 28: indent (4) + gutter (3) + "#N " (3)
+                // + value (16) + separator (2)
+                wrapped_dim_tail(format!("{prefix}  "), 21, &arg.description, 28)
+            }
+        })
+        .collect();
+    print_event_children("    ", &args);
+
     for trap_frame in &analysis.trap_frames {
         println!();
         print_bugcheck_trap_frame(trap_frame);
@@ -159,9 +195,9 @@ pub fn print_ktrap_frame(frame: &KtrapFrame, rip_symbol: Option<&str>) {
         format_rflags(frame.eflags as u64)
     );
     println!(
-        "  cs  {}  ss  {}  error code {:#x}  irql {}  previous mode {}",
-        format!("{:04x}", frame.cs).bright_white().bold(),
-        format!("{:04x}", frame.ss).bright_white().bold(),
+        "  cs  {:04x}  ss  {:04x}  error code {:#x}  irql {}  previous mode {}",
+        frame.cs,
+        frame.ss,
         frame.error_code,
         frame.previous_irql,
         if frame.previous_mode == 0 {
@@ -194,7 +230,7 @@ pub fn print_bugcheck_summary_from_memory(debugger: &Target) {
         CurrentBugcheckResolution::Resolved(analysis) => print_bugcheck_analysis(&analysis),
         CurrentBugcheckResolution::SymbolUnavailable => println!(
             "{} guest is bugchecking (symbol nt!KiBugCheckData unavailable)",
-            "bugcheck:".bold()
+            ui::badge("BUGCHECK")
         ),
         CurrentBugcheckResolution::Unresolved(failure) => {
             print_unresolved_bugcheck_data(&failure);

@@ -346,7 +346,7 @@ impl ReplState<'_> {
             self.ctx
                 .register_map
                 .read_u64(name, &regs)
-                .map(|v| format!("{:04x}", v).bright_white().bold().to_string())
+                .map(|v| format!("{:04x}", v))
                 .unwrap_or_else(|_| "N/A".to_string())
         };
 
@@ -422,6 +422,7 @@ impl ReplState<'_> {
                 error!("failed to select execution context: {:?}", e);
                 return Ok(());
             }
+            print_stop_separator();
             print_break_context(
                 &mut *self.ctx.backend,
                 &self.ctx.register_map,

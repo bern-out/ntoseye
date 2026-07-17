@@ -11,15 +11,37 @@ use owo_colors::OwoColorize;
 use std::borrow::Cow;
 
 use crate::expr::Expr;
+use crate::ui;
 
 use crate::repl::*;
 
+/// The REPL prompt, e.g. `kd:p1.1>`: transport muted, thread in the cyan
+/// identity accent. Rebuilt each read_line so it tracks thread switches.
 #[derive(Clone)]
-pub struct CustomPrompt;
+pub struct CustomPrompt {
+    pub left: String,
+}
 const DEFAULT_MULTILINE_INDICATOR: &str = "     ::: ";
+
+impl CustomPrompt {
+    pub fn new(backend: &str, thread: &str) -> Self {
+        let left = if thread.is_empty() {
+            "ntoseye>".bright_black().to_string()
+        } else {
+            format!(
+                "{}{}{}",
+                format!("{backend}:").bright_black(),
+                ui::thread_id(thread),
+                ">".bright_black()
+            )
+        };
+        CustomPrompt { left }
+    }
+}
+
 impl Prompt for CustomPrompt {
     fn render_prompt_left(&self) -> Cow<'_, str> {
-        Cow::Owned("ntoseye>".bright_black().to_string())
+        Cow::Borrowed(&self.left)
     }
 
     fn render_prompt_right(&self) -> Cow<'_, str> {

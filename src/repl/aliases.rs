@@ -132,20 +132,20 @@ impl UserAliases {
     }
 }
 
-pub fn print_alias_load_report(report: &AliasLoadReport, startup_hint: bool) {
-    if report.loaded == 0 && report.failed.is_empty() {
-        if !startup_hint {
-            println!("aliases: 0 loaded");
-        }
-        return;
-    }
-
+/// Print a one-line load summary and any failures (used by `.reload`;
+/// startup calls [`print_alias_load_failures`] directly).
+pub fn print_alias_load_report(report: &AliasLoadReport) {
     let mut summary = format!("aliases: {} loaded", report.loaded);
     if !report.failed.is_empty() {
         summary.push_str(&format!(", {} failed", report.failed.len()));
     }
     println!("{summary}");
+    print_alias_load_failures(report);
+}
 
+/// Print per-definition load failures, shared by the reload report and the
+/// startup summary line.
+pub fn print_alias_load_failures(report: &AliasLoadReport) {
     for failure in &report.failed {
         let location = match failure.line {
             Some(line) => format!("{}:{}", failure.path.display(), line),

@@ -35,7 +35,7 @@ use crate::target::Target;
 use crate::ui;
 
 pub static INTERRUPT_REQUESTED: AtomicBool = AtomicBool::new(false);
-pub const BREAK_STACKTRACE_DISPLAY_LIMIT: usize = 8;
+pub const BREAK_STACKTRACE_DISPLAY_LIMIT: usize = 6;
 pub const BREAK_STACKTRACE_PROBE_LIMIT: usize = 64;
 #[cfg(feature = "cli")]
 const REPL_HISTORY_SIZE: usize = 5000;
@@ -86,7 +86,7 @@ pub use pool::*;
 pub use stop::*;
 
 pub fn print_module_symbol_report(report: &ModuleSymbolLoadReport) {
-    let mut summary = format!("symbols: loaded {}/{}", report.loaded, report.total);
+    let mut summary = format!("loaded {}/{}", report.loaded, report.total);
     if report.failed_count() > 0 {
         summary.push_str(&format!(", {} failed", report.failed_count()));
     }
@@ -96,7 +96,7 @@ pub fn print_module_symbol_report(report: &ModuleSymbolLoadReport) {
     if report.skipped > 0 {
         summary.push_str(&format!(", {} skipped", report.skipped));
     }
-    println!("{summary}");
+    println!("{} {summary}", ui::muted("symbols:"));
 }
 
 pub fn print_backend_capabilities(capabilities: &[BackendCapability]) {
@@ -237,12 +237,54 @@ pub fn start_repl(ctx: &mut Session) -> Result<()> {
     })?;
 
     let message_data = debugger.startup_message_data()?;
+    let backend_label = client.name();
 
-    println!("{}", "target".bold());
-    println!("  kernel: Windows {}", message_data.build_number.0);
-    println!("  base:   {}", ui::addr(message_data.base_address.0));
+    // Loaded up front so the summary prints with the transport banner and
+    // the completion caches below see them.
+    #[cfg(feature = "python")]
+    let py_report = embed::load_commands_dir();
+    let (aliases, alias_report) = UserAliases::load_with_report();
+    let mut loaded_parts: Vec<String> = Vec::new();
+    #[cfg(feature = "python")]
+    if !py_report.loaded.is_empty() || !py_report.failed.is_empty() {
+        let mut part = format!("{} python", py_report.loaded.len());
+        if !py_report.failed.is_empty() {
+            part.push_str(&format!(" ({} failed)", py_report.failed.len()));
+        }
+        loaded_parts.push(part);
+    }
+    if alias_report.loaded > 0 || !alias_report.failed.is_empty() {
+        let n = alias_report.loaded;
+        let mut part = format!("{n} alias{}", if n == 1 { "" } else { "es" });
+        if !alias_report.failed.is_empty() {
+            part.push_str(&format!(" ({} failed)", alias_report.failed.len()));
+        }
+        loaded_parts.push(part);
+    }
+    if !loaded_parts.is_empty() {
+        println!(
+            "{}",
+            ui::muted(&format!("loaded: {}", loaded_parts.join(", ")))
+        );
+    }
+    #[cfg(feature = "python")]
+    embed::print_script_load_failures(&py_report);
+    print_alias_load_failures(&alias_report);
+
+    println!("\n{}", ui::label("target"));
     println!(
-        "  psmods: {}",
+        "  {} Windows {}",
+        ui::muted("kernel"),
+        message_data.build_number.0
+    );
+    println!(
+        "  {} {}",
+        ui::muted("base  "),
+        ui::addr(message_data.base_address.0)
+    );
+    println!(
+        "  {} {}",
+        ui::muted("psmods"),
         ui::addr_opt(message_data.loaded_module_list)
     );
     println!();
@@ -341,16 +383,6 @@ pub fn start_repl(ctx: &mut Session) -> Result<()> {
     };
     let initial_drivers = debugger.enumerate_driver_objects().unwrap_or_default();
 
-    // In-REPL Python commands (the embedded-interpreter build). Loaded here so
-    // they're in the completion set below.
-    #[cfg(feature = "python")]
-    {
-        let py_report = embed::load_commands_dir();
-        embed::print_script_load_report(&py_report, true);
-    }
-
-    let (aliases, alias_report) = UserAliases::load_with_report();
-    print_alias_load_report(&alias_report, true);
     let caches = ReplCaches {
         symbols: Arc::new(RwLock::new(debugger.current_symbol_index())),
         types: Arc::new(RwLock::new(debugger.current_types_index())),
@@ -396,7 +428,6 @@ pub fn start_repl(ctx: &mut Session) -> Result<()> {
             )),
         }
     }
-    let prompt = CustomPrompt {};
 
     let mut state = ReplState {
         ctx,
@@ -410,6 +441,7 @@ pub fn start_repl(ctx: &mut Session) -> Result<()> {
     state.ctx.reload_module_list_pending = reload_module_list_pending;
 
     loop {
+        let prompt = CustomPrompt::new(backend_label, &state.ctx.current_thread);
         let sig = line_editor.read_line(&prompt)?;
         match sig {
             Signal::Success(buffer) => {
