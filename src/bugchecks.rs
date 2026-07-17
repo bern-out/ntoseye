@@ -73,13 +73,13 @@ pub struct BugcheckAnalysis {
 /// Detailed result of resolving the frozen guest's `nt!KiBugCheckData`.
 /// Public hosts use [`current_bugcheck`]'s compact `Option`; the REPL also
 /// consumes failures so a bugcheck stop can explain missing or malformed data.
-pub(crate) enum CurrentBugcheckResolution {
+pub enum CurrentBugcheckResolution {
     Resolved(BugcheckAnalysis),
     SymbolUnavailable,
     Unresolved(CurrentBugcheckFailure),
 }
 
-pub(crate) struct CurrentBugcheckFailure {
+pub struct CurrentBugcheckFailure {
     pub address: VirtAddr,
     pub slots: Option<[u64; BUGCHECK_DATA_SLOTS]>,
     pub dereferenced_slots: Option<[u64; BUGCHECK_DATA_SLOTS]>,
@@ -428,7 +428,7 @@ pub fn analyze_bugcheck(debugger: &Target, info: &BugcheckInfo) -> BugcheckAnaly
 /// level of pointer indirection (some builds store the data behind a pointer in
 /// the first slot). Unlike [`current_bugcheck`], this preserves diagnostics for
 /// the REPL's bugcheck-stop banner.
-pub(crate) fn resolve_current_bugcheck(debugger: &Target) -> CurrentBugcheckResolution {
+pub fn resolve_current_bugcheck(debugger: &Target) -> CurrentBugcheckResolution {
     let Some(guest) = debugger.guest.as_ref() else {
         return CurrentBugcheckResolution::SymbolUnavailable;
     };

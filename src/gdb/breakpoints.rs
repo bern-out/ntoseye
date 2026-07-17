@@ -17,10 +17,10 @@ use crate::types::{Dtb, VirtAddr};
 /// A hardware (debug-register) breakpoint's parameters: the access it traps on,
 /// the watch width in bytes, and which DR slot (0-3) it occupies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct HardwareBreakpoint {
-    pub(crate) access: HwBreakpointAccess,
-    pub(crate) len: u8,
-    pub(crate) slot: u8,
+pub struct HardwareBreakpoint {
+    pub access: HwBreakpointAccess,
+    pub len: u8,
+    pub slot: u8,
 }
 
 #[derive(Debug, Clone)]
@@ -31,11 +31,11 @@ pub struct Breakpoint {
     pub symbol: Option<String>,
     pub scope: BreakpointScope,
     pub condition: Option<String>,
-    pub(crate) condition_expr: Option<Arc<Expr>>,
+    pub condition_expr: Option<Arc<Expr>>,
     pub temporary: bool,
     /// Transport-specific breakpoint state; hosts use [`Self::watchpoint`] for
     /// the semantic data-watch metadata.
-    pub(crate) hardware: Option<HardwareBreakpoint>,
+    pub hardware: Option<HardwareBreakpoint>,
     backend: BreakpointBackend,
 }
 
@@ -66,7 +66,7 @@ impl Breakpoint {
 
     /// Evaluate the condition compiled when this breakpoint was installed.
     /// Unconditional breakpoints always hold.
-    pub(crate) fn evaluate_condition(&self, target: &Target) -> Result<bool> {
+    pub fn evaluate_condition(&self, target: &Target) -> Result<bool> {
         match &self.condition_expr {
             Some(expr) => Ok(expr.resolve(target)?.0 != 0),
             None => Ok(true),
@@ -264,7 +264,7 @@ impl BreakpointManager {
     /// breakpoints these are always global (DR matches a linear address in any
     /// process) and modify no guest memory, so validation is alignment/width
     /// only, not page executability.
-    pub(crate) fn add_hardware(
+    pub fn add_hardware(
         &mut self,
         client: &mut dyn DebugBackend,
         address: VirtAddr,
@@ -441,7 +441,7 @@ impl BreakpointManager {
 
     /// Whether any enabled hardware (DR) breakpoint exists — the cheap gate the
     /// stop path checks before reading DR6 on a single-step.
-    pub(crate) fn has_enabled_hardware_breakpoints(&self) -> bool {
+    pub fn has_enabled_hardware_breakpoints(&self) -> bool {
         self.breakpoints
             .values()
             .any(|bp| bp.enabled && bp.hardware.is_some())
@@ -449,7 +449,7 @@ impl BreakpointManager {
 
     /// The enabled hardware breakpoint occupying DR slot `slot`, if any — used
     /// to map a DR6 status bit back to the breakpoint that fired.
-    pub(crate) fn hardware_breakpoint_for_slot(&self, slot: u8) -> Option<Breakpoint> {
+    pub fn hardware_breakpoint_for_slot(&self, slot: u8) -> Option<Breakpoint> {
         self.breakpoints
             .values()
             .find(|bp| bp.enabled && bp.hardware.is_some_and(|hw| hw.slot == slot))
@@ -462,7 +462,7 @@ impl BreakpointManager {
     /// debug registers are reset anyway, but a reload without a machine reset
     /// (kernel rediscovery) would otherwise leave orphaned watches raising
     /// `#DB`s no manager entry can claim.
-    pub(crate) fn clear_hardware_slots(&self, client: &mut dyn DebugBackend) {
+    pub fn clear_hardware_slots(&self, client: &mut dyn DebugBackend) {
         for bp in self.breakpoints.values() {
             if let Some(hw) = bp.hardware {
                 let _ = client.clear_hardware_breakpoint(hw.slot);

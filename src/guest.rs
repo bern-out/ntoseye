@@ -1178,7 +1178,7 @@ impl Guest {
         prefix == 0xFFFF8 || prefix == 0xFFFF9 || prefix == 0xFFFFA
     }
 
-    pub(crate) fn load_module_symbols(
+    pub fn load_module_symbols(
         phys: &PhysMem,
         symbols: &SymbolStore,
         modules: Vec<ModuleInfo>,

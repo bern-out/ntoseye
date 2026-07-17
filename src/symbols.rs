@@ -852,7 +852,7 @@ impl SymbolStore {
         Ok(job.path)
     }
 
-    pub(crate) fn build_image_download_job(
+    pub fn build_image_download_job(
         image_file_name: &str,
         time_date_stamp: u32,
         size_of_image: u32,

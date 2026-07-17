@@ -243,7 +243,7 @@ impl DmpContext {
 /// Clamp the untrusted header's processor count so a malformed dump can't
 /// drive an unbounded per-CPU register-buffer allocation (Windows tops out
 /// at 2048 logical processors).
-pub(crate) fn clamp_processors(n: u32) -> u32 {
+pub fn clamp_processors(n: u32) -> u32 {
     n.clamp(1, 2048)
 }
 
