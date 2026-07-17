@@ -750,12 +750,7 @@ impl ReplState<'_> {
 
         let dtb = match &self.ctx.target.current_process_info {
             Some(process_info) => process_info.dtb,
-            None => self
-                .ctx
-                .target
-                .guest()
-                .map(|g| g.ntoskrnl.dtb())
-                .unwrap_or(self.ctx.target.current_dtb()),
+            None => self.ctx.target.kernel_dtb(),
         };
 
         match self.ctx.target.modules() {

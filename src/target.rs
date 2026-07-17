@@ -603,7 +603,16 @@ impl Target {
 
     pub fn kernel_modules(&self) -> Result<Vec<ModuleInfo>> {
         match self.guest() {
-            Ok(g) => g.kernel_modules().or_else(|_| self.triage_modules()),
+            // The triage snapshot only substitutes when one exists; live
+            // enumeration failures propagate instead of being remapped to
+            // NtoskrnlNotFound.
+            Ok(g) => g.kernel_modules().or_else(|e| {
+                if self.triage_modules_cache.is_some() {
+                    self.triage_modules()
+                } else {
+                    Err(e)
+                }
+            }),
             Err(_) => self.triage_modules(),
         }
     }
@@ -2513,18 +2522,29 @@ impl Target {
     }
 
     pub fn startup_message_data(&mut self) -> Result<StartupMessage> {
+        // Dumps may not capture these symbols' memory, so they degrade to
+        // zeroed fields; live sessions propagate the underlying error.
+        let degraded = self.phys.dmp_info().is_some();
         let guest = self.guest()?;
-        let build_number: u16 = guest
+        let build_number: u16 = match guest
             .ntoskrnl
             .symbol("NtBuildNumber")
             .and_then(|s| s.read())
-            .unwrap_or(0u16);
+        {
+            Ok(v) => v,
+            Err(_) if degraded => 0,
+            Err(e) => return Err(e),
+        };
         let base_address = guest.ntoskrnl.base_address;
-        let loaded_module_list = guest
+        let loaded_module_list = match guest
             .ntoskrnl
             .symbol("PsLoadedModuleList")
             .and_then(|s| s.read())
-            .unwrap_or(VirtAddr(0));
+        {
+            Ok(v) => v,
+            Err(_) if degraded => VirtAddr(0),
+            Err(e) => return Err(e),
+        };
 
         Ok(StartupMessage {
             build_number: Value(build_number),
