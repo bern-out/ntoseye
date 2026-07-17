@@ -51,10 +51,11 @@ impl MemoryOps<PhysAddr> for PhysMem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dmp::{DmpContext, DmpInfo, DmpMem};
 
     #[test]
     fn dmp_info_exposed_for_dmp_variant() {
-        let info = crate::dmp::DmpInfo {
+        let info = DmpInfo {
             directory_table_base: 0x1ad000,
             bug_check_code: 0x7e,
             bug_check_parameters: [1, 2, 3, 4],
@@ -73,7 +74,7 @@ mod tests {
             broken_driver: None,
             triage_overflowed: false,
             kern_base: None,
-            context: crate::dmp::DmpContext {
+            context: DmpContext {
                 rax: 0,
                 rbx: 0,
                 rcx: 0,
@@ -114,7 +115,7 @@ mod tests {
             },
         };
 
-        let phys = PhysMem::Dmp(Box::new(crate::dmp::DmpMem::new_for_test(vec![], info)));
+        let phys = PhysMem::Dmp(Box::new(DmpMem::new_for_test(vec![], info)));
         let retrieved = phys.dmp_info().unwrap();
         assert_eq!(retrieved.bug_check_code, 0x7e);
         assert_eq!(retrieved.directory_table_base, 0x1ad000);

@@ -1,7 +1,7 @@
 use crate::{
     backend::MemoryOps,
     error::{Error, Result},
-    memory::{self, AddressSpace, PAGE_SIZE},
+    memory::{self, AddressSpace, DTB_IDENTITY, PAGE_SIZE},
     phys::PhysMem,
     symbols::{
         DownloadJob, FieldInfo, ModuleSymbolDiscovery, ModuleSymbolLoad, ModuleSymbolSource,
@@ -807,7 +807,7 @@ fn find_ntoskrnl_va(kernel_dtb: Dtb, phys: &PhysMem) -> Result<Option<VirtAddr>>
 /// marker, the same heuristic `is_ntoskrnl_pte` uses but at the virtual
 /// layer.
 fn find_ntoskrnl_va_triage(kernel_dtb: Dtb, phys: &PhysMem) -> Result<Option<VirtAddr>> {
-    let space = crate::memory::AddressSpace::new(phys, kernel_dtb);
+    let space = AddressSpace::new(phys, kernel_dtb);
 
     // Triage dumps include ntoskrnl's base in PsLoadedModuleList. We can
     // read the PsLoadedModuleList VA from the header; the list entry itself
@@ -917,7 +917,7 @@ impl Guest {
         symbols: Arc<SymbolStore>,
         kernel_dtb: Dtb,
     ) -> Result<Self> {
-        let is_triage = kernel_dtb == crate::memory::DTB_IDENTITY;
+        let is_triage = kernel_dtb == DTB_IDENTITY;
 
         let ntoskrnl_va = if is_triage {
             find_ntoskrnl_va_triage(kernel_dtb, &phys)?

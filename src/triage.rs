@@ -3,8 +3,10 @@ use crate::dmp::{
     DmpContext, DmpException, DmpInfo, DmpSystemInfo, UnloadedDriver, clamp_processors,
 };
 use crate::error::{Error, Result};
+use crate::guest::ModuleInfo;
 use crate::kd::context;
 use crate::kd::wire::{read_u16, read_u32, read_u64};
+use crate::types::VirtAddr;
 use kdmp_parser::structs::KdDebuggerData64;
 
 const DUMP_HEADER64_SIZE: usize = 0x2000;
@@ -105,13 +107,9 @@ pub struct TriageDriver {
 }
 
 impl TriageDriver {
-    pub fn to_module_info(&self) -> crate::guest::ModuleInfo {
-        crate::guest::ModuleInfo::new(
-            self.name.clone(),
-            crate::types::VirtAddr(self.base),
-            self.size,
-        )
-        .with_time_date_stamp(self.time_date_stamp)
+    pub fn to_module_info(&self) -> ModuleInfo {
+        ModuleInfo::new(self.name.clone(), VirtAddr(self.base), self.size)
+            .with_time_date_stamp(self.time_date_stamp)
     }
 }
 

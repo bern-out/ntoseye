@@ -22,7 +22,7 @@ use owo_colors::OwoColorize;
 use crate::dbg_backend::DebugBackend;
 use crate::dbg_backend::{BackendCapability, DebugCapability};
 use crate::diagnostics;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::guest::ModuleSymbolLoadReport;
 #[cfg(feature = "python")]
 use crate::python::embed;
@@ -293,8 +293,7 @@ pub fn start_repl(ctx: &mut Session) -> Result<()> {
             println!();
             message_data.loaded_module_list.is_zero()
         }
-        Err(crate::error::Error::NtoskrnlNotFound)
-        | Err(crate::error::Error::AddressNotInDump(_)) => {
+        Err(Error::NtoskrnlNotFound) | Err(Error::AddressNotInDump(_)) => {
             println!("\n{}", ui::label("target"));
             if let Some(base) = debugger.kernel_base() {
                 println!("  {} {}", ui::muted("base  "), ui::addr(base.0));

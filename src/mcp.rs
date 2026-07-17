@@ -19,10 +19,11 @@ use std::time::Duration;
 use crate::backend::MemoryOps;
 use crate::bugchecks::{analyze_bugcheck, bugcheck_from_dump_info, current_bugcheck};
 use crate::dbg_backend::{DebugBackend, WatchpointAccess};
-use crate::dmp::DmpBackend;
+use crate::dmp::{DmpBackend, DmpException, DmpSystemInfo, TriageCrashInfo, UnloadedDriver};
 use crate::error::Error;
 use crate::expr::Expr;
 use crate::gdb::GdbClient;
+use crate::guest::ModuleInfo;
 use crate::kd::KdBackend;
 use crate::memory_backend::MemoryBackend;
 use crate::phys::PhysMem;
@@ -30,8 +31,11 @@ use crate::session::{ContinueOutcome, RunStatus, Session};
 use crate::symbols::{FieldValue, TypeInfo};
 use crate::target::{kthread_state_name, wait_reason_name};
 use crate::trapframe::read_ktrap_frame_at_or_current;
+use crate::triage::TriagePrcbInfo;
 use crate::types::VirtAddr;
+use crate::unwind::StackFrame;
 use crate::view;
+use crate::{DEFAULT_KD_SOCKET, resolve_target};
 
 // MCP handlers are async/Send, but `Session` is not. A dedicated actor thread
 // owns the session; handlers send closures and await one reply.
@@ -101,15 +105,11 @@ fn spawn_session(
                     .dmp_info()
                     .expect("dmp_info must be Some for DMP backend")
                     .clone();
-                Session::connect(
-                    phys,
-                    None,
-                    || -> crate::error::Result<Box<dyn DebugBackend>> {
-                        Ok(Box::new(DmpBackend::new(&info)))
-                    },
-                )
+                Session::connect(phys, None, || -> Result<Box<dyn DebugBackend>, Error> {
+                    Ok(Box::new(DmpBackend::new(&info)))
+                })
             } else {
-                let target = crate::resolve_target(backend.as_str(), connect.as_deref());
+                let target = resolve_target(backend.as_str(), connect.as_deref());
                 let phys = Arc::new(PhysMem::kvm()?);
                 Session::connect(phys, target.as_deref(), || {
                     let backend: Box<dyn DebugBackend> = match backend.as_str() {
@@ -962,7 +962,7 @@ fn status_json(ctx: &mut Session) -> Value {
     run_status_json(ctx.run_status())
 }
 
-fn frame_json(f: &crate::unwind::StackFrame) -> Value {
+fn frame_json(f: &StackFrame) -> Value {
     serde_json::json!({
         "ip": hex(f.ip),
         "sp": hex(f.sp),
@@ -971,7 +971,7 @@ fn frame_json(f: &crate::unwind::StackFrame) -> Value {
     })
 }
 
-fn module_json(m: &crate::guest::ModuleInfo) -> Value {
+fn module_json(m: &ModuleInfo) -> Value {
     serde_json::json!({
         "name": m.name,
         "short_name": m.short_name,
@@ -981,7 +981,7 @@ fn module_json(m: &crate::guest::ModuleInfo) -> Value {
     })
 }
 
-fn exception_json(exc: &crate::dmp::DmpException) -> Value {
+fn exception_json(exc: &DmpException) -> Value {
     serde_json::json!({
         "code": exc.code,
         "code_hex": hex(exc.code as u64),
@@ -1014,7 +1014,7 @@ fn exception_code_name(code: u32) -> &'static str {
     }
 }
 
-fn system_info_json(info: &crate::dmp::DmpSystemInfo) -> Value {
+fn system_info_json(info: &DmpSystemInfo) -> Value {
     let product = match info.product_type {
         1 => "Workstation",
         2 => "DomainController",
@@ -1051,7 +1051,7 @@ fn system_info_json(info: &crate::dmp::DmpSystemInfo) -> Value {
 
 /// Crash context extracted from the triage EPROCESS/ETHREAD snapshots,
 /// shared by `open_dump` and `triage`.
-fn crash_context_json(ci: &crate::dmp::TriageCrashInfo) -> Value {
+fn crash_context_json(ci: &TriageCrashInfo) -> Value {
     let mut v = serde_json::json!({
         "process_name": ci.process_name,
         "process_id": ci.process_id,
@@ -1074,7 +1074,7 @@ fn crash_context_json(ci: &crate::dmp::TriageCrashInfo) -> Value {
 }
 
 /// Crashing processor's PRCB summary, shared by `open_dump` and `triage`.
-fn prcb_json(p: &crate::triage::TriagePrcbInfo) -> Value {
+fn prcb_json(p: &TriagePrcbInfo) -> Value {
     serde_json::json!({
         "current_thread": hex(p.current_thread),
         "processor_number": p.processor_number,
@@ -1118,7 +1118,7 @@ fn days_to_ymd(mut days: i64) -> (i64, i64, i64) {
     (y, m, d)
 }
 
-fn unloaded_driver_json(d: &crate::dmp::UnloadedDriver) -> Value {
+fn unloaded_driver_json(d: &UnloadedDriver) -> Value {
     serde_json::json!({
         "name": d.name,
         "start_address": hex(d.start_address),
@@ -3042,7 +3042,7 @@ pub fn run(
             eprintln!(
                 "ntoseye-mcp: note: pass --connect {default_kd} to auto-attach at startup, \
                  or use the 'open' tool after launch",
-                default_kd = crate::DEFAULT_KD_SOCKET,
+                default_kd = DEFAULT_KD_SOCKET,
             );
         } else {
             eprintln!(

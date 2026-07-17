@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 #[cfg(feature = "mcp")]
 use crate::mcp;
+use crate::resolve_target;
 use crate::{
     dbg_backend::DebugBackend,
     diagnostics,
@@ -275,7 +276,7 @@ fn run() -> Result<()> {
         BackendKind::Kd => "kd",
         BackendKind::Memory => "memory",
     };
-    let target = crate::resolve_target(backend_str, args.connect.as_deref());
+    let target = resolve_target(backend_str, args.connect.as_deref());
     let phys = Arc::new(PhysMem::kvm()?);
     let mut ctx = session::Session::connect(
         phys,

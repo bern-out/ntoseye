@@ -8,7 +8,7 @@ use kdmp_parser::structs::KdDebuggerData64;
 use kdmp_parser::virt;
 use memmap2::Mmap;
 
-use crate::kd::wire::read_u64 as buffer_u64;
+use crate::kd::wire::{read_u16, read_u32, read_u64, read_u64 as buffer_u64};
 
 use crate::backend::MemoryOps;
 use crate::dbg_backend::{BackendCapability, DebugBackend, DebugCapability, StopEvent};
@@ -18,7 +18,11 @@ use crate::gdb::RegisterMap;
 use crate::kd::context;
 use crate::memory::PAGE_SIZE;
 use crate::session::processor_index_from_backend_thread_id;
+use crate::symbols::TypeInfo;
 use crate::target::Target;
+use crate::triage::{
+    TriageBlock, TriageDriver, TriagePrcbInfo, is_triage_dump, parse_drivers, parse_triage,
+};
 use crate::types::{PhysAddr, VirtAddr};
 
 #[derive(Debug, Clone)]
@@ -91,8 +95,6 @@ pub struct UnloadedDriver {
 
 impl DmpContext {
     pub fn from_bytes(buf: &[u8]) -> Self {
-        use crate::kd::wire::{read_u16, read_u32, read_u64};
-
         let mut xmm = [0u128; 16];
         if buf.len() >= context::OFFSET_XMM0 + 16 * 16 {
             for (i, slot) in xmm.iter_mut().enumerate() {
@@ -258,13 +260,13 @@ pub struct DmpInfo {
     pub is_triage: bool,
     pub ps_loaded_module_list: u64,
     pub ps_active_process_head: u64,
-    pub triage_drivers: Vec<crate::triage::TriageDriver>,
+    pub triage_drivers: Vec<TriageDriver>,
     pub exception: Option<DmpException>,
     pub system_info: Option<DmpSystemInfo>,
     pub unloaded_drivers: Vec<UnloadedDriver>,
     pub triage_process_snapshot: Option<Vec<u8>>,
     pub triage_thread_snapshot: Option<Vec<u8>>,
-    pub triage_prcb_info: Option<crate::triage::TriagePrcbInfo>,
+    pub triage_prcb_info: Option<TriagePrcbInfo>,
     pub broken_driver: Option<String>,
     pub triage_overflowed: bool,
     pub kern_base: Option<u64>,
@@ -291,7 +293,7 @@ enum DmpStorage {
     /// Full/BMP/kernel dump: sorted by page-aligned GPA
     Pages(Vec<(u64, u64)>),
     /// Triage dump: sorted by VA, variable-size regions
-    Blocks(Vec<crate::triage::TriageBlock>),
+    Blocks(Vec<TriageBlock>),
 }
 
 impl DmpMem {
@@ -299,7 +301,7 @@ impl DmpMem {
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
 
-        if crate::triage::is_triage_dump(&mmap) {
+        if is_triage_dump(&mmap) {
             return Self::open_triage(mmap);
         }
 
@@ -413,8 +415,8 @@ impl DmpMem {
     }
 
     fn open_triage(mmap: Mmap) -> Result<Self> {
-        let (mut info, blocks) = crate::triage::parse_triage(&mmap)?;
-        info.triage_drivers = crate::triage::parse_drivers(&mmap);
+        let (mut info, blocks) = parse_triage(&mmap)?;
+        info.triage_drivers = parse_drivers(&mmap);
         Ok(Self {
             mmap,
             storage: DmpStorage::Blocks(blocks),
@@ -446,11 +448,7 @@ impl DmpMem {
     }
 
     #[cfg(test)]
-    pub fn new_triage_for_test(
-        data: Vec<u8>,
-        blocks: Vec<crate::triage::TriageBlock>,
-        info: DmpInfo,
-    ) -> Self {
+    pub fn new_triage_for_test(data: Vec<u8>, blocks: Vec<TriageBlock>, info: DmpInfo) -> Self {
         use memmap2::MmapMut;
         let mut mmap_mut = MmapMut::map_anon(data.len()).unwrap();
         mmap_mut.copy_from_slice(&data);
@@ -637,7 +635,7 @@ impl DmpBackend {
         }
     }
 
-    fn read_u64_field(snap: &[u8], layout: &crate::symbols::TypeInfo, field: &str) -> Option<u64> {
+    fn read_u64_field(snap: &[u8], layout: &TypeInfo, field: &str) -> Option<u64> {
         let off = layout.field_offset(field).ok()? as usize;
         if off + 8 <= snap.len() {
             Some(u64::from_le_bytes(snap[off..off + 8].try_into().ok()?))
@@ -646,7 +644,7 @@ impl DmpBackend {
         }
     }
 
-    fn read_i32_field(snap: &[u8], layout: &crate::symbols::TypeInfo, field: &str) -> Option<i32> {
+    fn read_i32_field(snap: &[u8], layout: &TypeInfo, field: &str) -> Option<i32> {
         let off = layout.field_offset(field).ok()? as usize;
         if off + 4 <= snap.len() {
             Some(i32::from_le_bytes(snap[off..off + 4].try_into().ok()?))
@@ -1097,8 +1095,6 @@ mod tests {
 
     #[test]
     fn triage_mem_read_within_block() {
-        use crate::triage::TriageBlock;
-
         let mut data = vec![0u8; 0x4000];
         // Block at VA 0xfffff80000001000, file offset 0x3000, size 0x100
         // Fill the file region with recognizable data
@@ -1129,8 +1125,6 @@ mod tests {
 
     #[test]
     fn triage_overlapping_blocks_fallback() {
-        use crate::triage::TriageBlock;
-
         let mut data = vec![0u8; 0x8000];
         // Large block A: VA 0x1000, size 0x3000, at file offset 0x2000
         for i in 0..0x3000usize {

@@ -23,6 +23,7 @@ use crate::kd::KdBackend;
 use crate::memory_backend::MemoryBackend;
 use crate::phys::PhysMem;
 use crate::repl::ReplState;
+use crate::resolve_target;
 use crate::session::{ContinueOutcome, Session};
 use crate::symbols::{FieldValue, ParsedType, TypeInfo, le_uint};
 use crate::target::{
@@ -2814,7 +2815,7 @@ fn attach(backend: &str, connect: Option<&str>) -> PyResult<Debugger> {
         })
         .map_err(err)?
     } else {
-        let target = crate::resolve_target(backend, connect);
+        let target = resolve_target(backend, connect);
         let phys = Arc::new(PhysMem::kvm().map_err(err)?);
         Session::connect(phys, target.as_deref(), || {
             let be: Box<dyn DebugBackend> = match backend {

@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::dmp::TriageCrashInfo;
 use crate::error::{Error, Result};
 use crate::gdb::RegisterMap;
 use crate::target::Target;
@@ -420,7 +421,7 @@ pub trait DebugBackend {
     fn initialize_from_target(&mut self, _target: &Target) {}
 
     /// Crash context extracted from triage dump EPROCESS/ETHREAD snapshots.
-    fn triage_crash_info(&self) -> Option<&crate::dmp::TriageCrashInfo> {
+    fn triage_crash_info(&self) -> Option<&TriageCrashInfo> {
         None
     }
 

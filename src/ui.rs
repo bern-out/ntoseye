@@ -6,6 +6,7 @@
 use owo_colors::OwoColorize;
 use std::fmt::Display;
 
+use crate::disasm::{AsmKind, AsmToken};
 use crate::types::VirtAddr;
 
 /// Absolute address: bare 16-digit, default foreground. Never format a
@@ -60,8 +61,7 @@ pub fn label(text: &str) -> String {
 /// (punctuation, size directives) recedes to muted. Kept minimal so it doesn't
 /// fight the yellow cursor, muted bytes, or blue symbol comment that share the
 /// line.
-pub fn disasm_asm(tokens: &[crate::disasm::AsmToken]) -> String {
-    use crate::disasm::AsmKind;
+pub fn disasm_asm(tokens: &[AsmToken]) -> String {
     let mut out = String::new();
     for token in tokens {
         match token.kind {

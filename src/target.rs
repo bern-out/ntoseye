@@ -5,12 +5,13 @@ use std::sync::Arc;
 use crate::{
     backend::MemoryOps,
     bugchecks::looks_like_kernel_pointer,
+    diagnostics,
     error::{Error, Result},
     guest::{
         Guest, ModuleInfo, ModuleSymbolLoadReport, ProcessInfo, StructRef, WinObject,
         section_name_at,
     },
-    memory::{AddressSpace, PAGE_SIZE},
+    memory::{AddressSpace, DTB_IDENTITY, PAGE_SIZE},
     phys::PhysMem,
     symbols::{ParsedType, SymbolIndex, SymbolStore, TypeInfo},
     types::{Dtb, PageTableEntry, Value, VirtAddr},
@@ -509,7 +510,7 @@ impl Target {
         self.guest
             .as_ref()
             .map(|g| g.ntoskrnl.dtb())
-            .unwrap_or(crate::memory::DTB_IDENTITY)
+            .unwrap_or(DTB_IDENTITY)
     }
 
     pub fn new() -> Result<Self> {
@@ -520,7 +521,7 @@ impl Target {
         let symbols = Arc::new(SymbolStore::new());
         let guest = if let Some(info) = phys.dmp_info() {
             let dtb = if info.is_triage {
-                crate::memory::DTB_IDENTITY
+                DTB_IDENTITY
             } else {
                 info.directory_table_base
             };
@@ -531,7 +532,7 @@ impl Target {
                 // (e.g. a symbol download error while offline), not just a
                 // missing kernel; identity-mapped access still works.
                 Err(e) if info.is_triage => {
-                    crate::diagnostics::eprint_warning(format!(
+                    diagnostics::eprint_warning(format!(
                         "kernel discovery failed ({e}); continuing without kernel context"
                     ));
                     None
@@ -557,7 +558,7 @@ impl Target {
         if let Some(ref guest) = guest {
             let _ = guest.load_all_kernel_module_symbols(&phys, &symbols);
         } else if let Some(ref modules) = triage_modules {
-            let dtb = crate::memory::DTB_IDENTITY;
+            let dtb = DTB_IDENTITY;
             let _ = Guest::load_module_symbols(&phys, &symbols, modules.clone(), dtb, false);
         }
 
@@ -565,7 +566,7 @@ impl Target {
             Some(WinObject::new(
                 phys.clone(),
                 symbols.clone(),
-                crate::memory::DTB_IDENTITY,
+                DTB_IDENTITY,
                 VirtAddr(0),
             ))
         } else {

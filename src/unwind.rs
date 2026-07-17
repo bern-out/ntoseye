@@ -33,7 +33,7 @@ use crate::{
     backend::MemoryOps,
     gdb::RegisterMap,
     guest::{Guest, ModuleInfo, PeImage, ProcessInfo, read_pe_image, read_pe_image_from_file},
-    memory::AddressSpace,
+    memory::{AddressSpace, DTB_IDENTITY},
     phys::PhysMem,
     symbols::SymbolStore,
     target::Target,
@@ -177,7 +177,7 @@ pub fn resolve_thread_trace_context(debugger: &Target, cr3: u64) -> ThreadTraceC
 
     // Triage dumps use DTB_IDENTITY — page-table walks are impossible,
     // so force the kernel context regardless of the thread's real CR3.
-    if kernel_dtb == crate::memory::DTB_IDENTITY || cr3_masked == kernel_dtb_masked {
+    if kernel_dtb == DTB_IDENTITY || cr3_masked == kernel_dtb_masked {
         return ThreadTraceContext {
             description: "kernel".to_string(),
             active_dtb: kernel_dtb,

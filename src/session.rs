@@ -18,7 +18,7 @@ use crate::error::{Error, Result};
 use crate::gdb::breakpoints::Breakpoint;
 use crate::gdb::{BreakpointHitResult, BreakpointManager, RegisterMap};
 use crate::kd::trace_enabled;
-use crate::memory::AddressSpace;
+use crate::memory::{AddressSpace, DTB_IDENTITY};
 use crate::phys::PhysMem;
 use crate::target::{ReloadReport, Target, ThreadInfo};
 use crate::types::VirtAddr;
@@ -212,11 +212,7 @@ fn update_target_context_from_registers(
         // record is meaningless.  Setting it here would cause a DTB
         // mismatch that makes symbol lookup, type resolution, and eval
         // fail.
-        Ok(cr3)
-            if cr3 != 0
-                && target.guest.is_some()
-                && target.kernel_dtb() != crate::memory::DTB_IDENTITY =>
-        {
+        Ok(cr3) if cr3 != 0 && target.guest.is_some() && target.kernel_dtb() != DTB_IDENTITY => {
             target.set_context_dtb_override(cr3)
         }
         _ => target.clear_context_dtb_override(),
