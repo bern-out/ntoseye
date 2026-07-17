@@ -4,6 +4,7 @@ use tabled::settings::{Alignment, Modify, Panel};
 
 use owo_colors::OwoColorize;
 
+use crate::bugchecks::bugcheck_from_dump_info;
 use crate::error::{Error, Result};
 use crate::expr::Expr;
 use crate::target::{irp_major_function_name, kthread_state_name, wait_reason_name};
@@ -226,7 +227,11 @@ impl ReplState<'_> {
     fn cmd_analyze(&mut self) -> Result<()> {
         // Same decode path the stop banner and the SDK/MCP use; on demand so an
         // already-frozen guest (or a scrolled-away banner) can be re-analyzed.
-        match current_bugcheck(&self.ctx.target) {
+        // Dumps whose KiBugCheckData memory is not captured fall back to the
+        // dump header fields, mirroring the MCP/Python surfaces.
+        match current_bugcheck(&self.ctx.target)
+            .or_else(|| bugcheck_from_dump_info(&self.ctx.target))
+        {
             Some(analysis) => {
                 print_bugcheck_analysis(&analysis);
                 println!();
