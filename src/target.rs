@@ -527,6 +527,15 @@ impl Target {
             match Guest::new_with_dtb(phys.clone(), symbols.clone(), dtb) {
                 Ok(g) => Some(g),
                 Err(Error::NtoskrnlNotFound) if info.is_triage => None,
+                // Triage degradation must survive any discovery failure
+                // (e.g. a symbol download error while offline), not just a
+                // missing kernel; identity-mapped access still works.
+                Err(e) if info.is_triage => {
+                    crate::diagnostics::eprint_warning(format!(
+                        "kernel discovery failed ({e}); continuing without kernel context"
+                    ));
+                    None
+                }
                 Err(e) => return Err(e),
             }
         } else {
