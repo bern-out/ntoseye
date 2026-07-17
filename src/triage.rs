@@ -1,5 +1,7 @@
 use crate::diagnostics;
-use crate::dmp::{DmpContext, DmpException, DmpInfo, DmpSystemInfo, UnloadedDriver};
+use crate::dmp::{
+    DmpContext, DmpException, DmpInfo, DmpSystemInfo, UnloadedDriver, clamp_processors,
+};
 use crate::error::{Error, Result};
 use crate::kd::context;
 use crate::kd::wire::{read_u16, read_u32, read_u64};
@@ -299,7 +301,7 @@ pub fn parse_triage(mmap: &[u8]) -> Result<(DmpInfo, Vec<TriageBlock>)> {
         bug_check_code,
         bug_check_parameters,
         offset_prcb_context: debugger_data.as_ref().and_then(|d| d.offset_prcb_context),
-        number_processors: number_processors.max(1),
+        number_processors: clamp_processors(number_processors),
         is_triage: true,
         ps_loaded_module_list: read_u64(mmap, OFF_PS_LOADED_MODULE_LIST),
         ps_active_process_head: read_u64(mmap, OFF_PS_ACTIVE_PROCESS_HEAD),

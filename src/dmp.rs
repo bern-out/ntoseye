@@ -224,6 +224,13 @@ impl DmpContext {
     }
 }
 
+/// Clamp the untrusted header's processor count so a malformed dump can't
+/// drive an unbounded per-CPU register-buffer allocation (Windows tops out
+/// at 2048 logical processors).
+pub(crate) fn clamp_processors(n: u32) -> u32 {
+    n.clamp(1, 2048)
+}
+
 #[derive(Debug, Clone)]
 pub struct DmpInfo {
     pub directory_table_base: u64,
@@ -327,7 +334,7 @@ impl DmpMem {
             bug_check_code: hdr.bug_check_code,
             bug_check_parameters: hdr.bug_check_code_parameters,
             offset_prcb_context,
-            number_processors: hdr.number_processors.max(1),
+            number_processors: clamp_processors(hdr.number_processors),
             is_triage: false,
             ps_loaded_module_list: hdr.ps_loaded_module_list,
             ps_active_process_head: hdr.ps_active_process_head,
