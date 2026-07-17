@@ -726,8 +726,8 @@ impl Target {
                     .find_type_across_modules(dtb, "_UNICODE_STRING")
                     .ok_or(Error::ExpectedSymbols)?;
                 let mem = proc.memory();
-                let len_off = ti.field_offset("Length")? as u64;
-                let buf_off = ti.field_offset("Buffer")? as u64;
+                let len_off = ti.field_offset("Length")?;
+                let buf_off = ti.field_offset("Buffer")?;
                 let length: u16 = mem.read(addr + len_off)?;
                 let buffer: VirtAddr = mem.read(addr + buf_off)?;
                 if length == 0 || buffer.is_zero() {

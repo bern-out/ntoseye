@@ -44,8 +44,6 @@ const TRIAGE_SIZE_OF_DUMP: usize = 0x04;
 const TRIAGE_VALID_OFFSET: usize = 0x08;
 const TRIAGE_CONTEXT_OFFSET: usize = 0x0C;
 const TRIAGE_EXCEPTION_OFFSET: usize = 0x10;
-#[cfg(test)]
-const TRIAGE_MM_OFFSET: usize = 0x14;
 const TRIAGE_UNLOADED_DRIVERS_OFFSET: usize = 0x18;
 const TRIAGE_PRCB_OFFSET: usize = 0x1C;
 const TRIAGE_PROCESS_OFFSET: usize = 0x20;
@@ -202,14 +200,16 @@ pub fn parse_triage(mmap: &[u8]) -> Result<(DmpInfo, Vec<TriageBlock>)> {
     // Add the call stack as a memory region (with the same bounds check
     // that data blocks receive below).  call_stack_offset is an absolute
     // file offset.
-    if size_of_call_stack > 0 && call_stack_offset > 0 && top_of_stack > size_of_call_stack as u64 {
-        if call_stack_offset + size_of_call_stack as u64 <= mmap.len() as u64 {
-            blocks.push(TriageBlock {
-                address: top_of_stack - size_of_call_stack as u64,
-                offset: call_stack_offset,
-                size: size_of_call_stack,
-            });
-        }
+    if size_of_call_stack > 0
+        && call_stack_offset > 0
+        && top_of_stack > size_of_call_stack as u64
+        && call_stack_offset + size_of_call_stack as u64 <= mmap.len() as u64
+    {
+        blocks.push(TriageBlock {
+            address: top_of_stack - size_of_call_stack as u64,
+            offset: call_stack_offset,
+            size: size_of_call_stack,
+        });
     }
 
     // Parse TRIAGE_DATA_BLOCK entries (data_blocks_offset is an absolute

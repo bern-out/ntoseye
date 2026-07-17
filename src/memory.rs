@@ -250,8 +250,8 @@ mod tests {
     fn identity_dtb_cross_boundary_read() {
         let mut data = vec![0u8; 0x3000];
         // Span across a 4K boundary: fill 0xFFF..0x1001
-        for i in 0xFF0..0x1010 {
-            data[i] = (i & 0xFF) as u8;
+        for (i, byte) in data[0xFF0..0x1010].iter_mut().enumerate() {
+            *byte = ((0xFF0 + i) & 0xFF) as u8;
         }
         let mem = FakePhysMem { data };
         let space = AddressSpace::new(&mem, DTB_IDENTITY);
