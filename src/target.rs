@@ -1278,7 +1278,10 @@ impl Target {
         Ok(vec![ProcessInfo {
             pid,
             name,
-            dtb: info.directory_table_base,
+            // The header CR3 is unusable in a triage dump (no page tables
+            // captured); reads go through the identity mapping, so report
+            // the DTB that actually resolves.
+            dtb: self.kernel_dtb(),
             eprocess_va: VirtAddr(0),
         }])
     }
