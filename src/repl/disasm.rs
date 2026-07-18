@@ -213,6 +213,24 @@ pub fn render_rows(rows: &[DisasmRow], marker_for: impl Fn(u64) -> Option<bool>)
     }
 }
 
+const DISASM_CONTEXT_BYTES: usize = 64;
+const DISASM_CONTEXT_INSTRUCTIONS: usize = 7;
+
+fn decode_disasm_context(
+    bytes_at_rip: &[u8],
+    rip: u64,
+    resolve: impl Fn(u64) -> String,
+) -> Vec<DisasmRow> {
+    let mut formatter = disasm_formatter();
+    decode_rows(
+        bytes_at_rip,
+        rip,
+        Some(DISASM_CONTEXT_INSTRUCTIONS),
+        &mut formatter,
+        resolve,
+    )
+}
+
 pub fn print_disasm_context(
     debugger: &Target,
     breakpoints: &BreakpointManager,
@@ -221,58 +239,24 @@ pub fn print_disasm_context(
 ) {
     print_section("disasm");
 
-    let pre_bytes: u64 = 64;
-    let post_bytes: u64 = 64;
-    let start_addr = rip.saturating_sub(pre_bytes);
-    let total_len = (pre_bytes + post_bytes) as usize;
     let active_memory = AddressSpace::new(&debugger.phys, trace.active_dtb);
     let code_dtb = preferred_code_dtb(trace, rip);
     let code_memory = AddressSpace::new(&debugger.phys, code_dtb);
+    let mut bytes = [0u8; DISASM_CONTEXT_BYTES];
 
-    let mut bytes = vec![0u8; total_len];
-    if active_memory
-        .read_bytes(VirtAddr(start_addr), &mut bytes)
-        .is_err()
+    if active_memory.read_bytes(VirtAddr(rip), &mut bytes).is_err()
         && (code_dtb == trace.active_dtb
-            || code_memory
-                .read_bytes(VirtAddr(start_addr), &mut bytes)
-                .is_err())
+            || code_memory.read_bytes(VirtAddr(rip), &mut bytes).is_err())
     {
         println!("{}", "  (could not read memory at RIP)".bright_black());
         return;
     }
-    breakpoints.mask_breakpoint_bytes(VirtAddr(start_addr), &mut bytes, trace.active_dtb);
+
+    breakpoints.mask_breakpoint_bytes(VirtAddr(rip), &mut bytes, trace.active_dtb);
 
     let resolve = |target: u64| format_symbol(debugger, trace, target);
-    let mut formatter = disasm_formatter();
-    let instructions = decode_rows(&bytes, start_addr, None, &mut formatter, resolve);
-
-    // find which instruction corresponds to RIP
-    let rip_idx = instructions.iter().position(|row| row.ip == rip);
-
-    if let Some(idx) = rip_idx {
-        let context_before = 3;
-        let context_after = 3;
-        let start = idx.saturating_sub(context_before);
-        let end = (idx + context_after + 1).min(instructions.len());
-        render_rows(&instructions[start..end], |ip| Some(ip == rip));
-    } else {
-        let mut forward_buf = vec![0u8; post_bytes as usize];
-        if active_memory
-            .read_bytes(VirtAddr(rip), &mut forward_buf)
-            .is_ok()
-            || (code_dtb != trace.active_dtb
-                && code_memory
-                    .read_bytes(VirtAddr(rip), &mut forward_buf)
-                    .is_ok())
-        {
-            breakpoints.mask_breakpoint_bytes(VirtAddr(rip), &mut forward_buf, trace.active_dtb);
-            let rows = decode_rows(&forward_buf, rip, Some(7), &mut formatter, resolve);
-            render_rows(&rows, |ip| Some(ip == rip));
-        } else {
-            println!("{}", "  (could not read memory at RIP)".bright_black());
-        }
-    }
+    let rows = decode_disasm_context(&bytes, rip, resolve);
+    render_rows(&rows, |ip| Some(ip == rip));
 }
 
 /// Print the stack frames. `embedded` is true inside the break/status dump:
@@ -330,5 +314,19 @@ pub fn print_stacktrace(
             "{indent}{}",
             format!("... {} more frames", hidden).bright_black()
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stop_disassembly_starts_at_rip_and_only_looks_forward() {
+        let rip = 0xffff_f807_c0e1_3ae0;
+        let rows = decode_disasm_context(&[0x90; 8], rip, |_| String::new());
+        let ips = rows.iter().map(|row| row.ip).collect::<Vec<_>>();
+
+        assert_eq!(ips, (rip..rip + 7).collect::<Vec<_>>());
     }
 }
