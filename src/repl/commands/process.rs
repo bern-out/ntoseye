@@ -584,7 +584,7 @@ impl ReplState<'_> {
             return Ok(());
         }
 
-        let modules = match self.ctx.target.kernel_modules() {
+        let modules = match self.ctx.target.kernel_modules_with_versions() {
             Ok(modules) => modules,
             Err(e) => {
                 error!("failed to enumerate kernel modules: {}", e);
@@ -753,13 +753,14 @@ impl ReplState<'_> {
             None => self.ctx.target.kernel_dtb(),
         };
 
-        match self.ctx.target.modules() {
+        match self.ctx.target.modules_with_versions() {
             Ok(modules) => {
                 let mut builder = Builder::default();
                 builder.push_record(vec![
                     "Start".to_string(),
                     "End".to_string(),
                     "Module".to_string(),
+                    "Version".to_string(),
                     "Symbols".to_string(),
                     "Source".to_string(),
                     "Image".to_string(),
@@ -778,6 +779,7 @@ impl ReplState<'_> {
                         format!("{}  ", ui::addr(module.base_address.0)),
                         format!("{}  ", ui::addr(module.end_address().0)),
                         format!("{}  ", module.short_name),
+                        format!("{}  ", module.file_version.as_deref().unwrap_or("-")),
                         format!(
                             "{}  ",
                             self.ctx

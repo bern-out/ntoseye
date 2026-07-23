@@ -874,7 +874,7 @@ fn hex_of(slice: &[u8]) -> String {
 /// Rejects odd length and non-hex digits as invalid params.
 fn bytes_of_hex(s: &str) -> Result<Vec<u8>, ToolError> {
     let s = s.strip_prefix("0x").unwrap_or(s);
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err(invalid_request("hex must have an even number of digits"));
     }
     (0..s.len())
@@ -972,13 +972,26 @@ fn frame_json(f: &StackFrame) -> Value {
 }
 
 fn module_json(m: &ModuleInfo) -> Value {
-    serde_json::json!({
+    let mut v = serde_json::json!({
         "name": m.name,
         "short_name": m.short_name,
         "base": hex(m.base_address.0),
         "end": hex(m.end_address().0),
         "size": m.size,
-    })
+    });
+    if let Some(tds) = m.time_date_stamp {
+        v["time_date_stamp"] = hex(tds as u64).into();
+    }
+    if let Some(cs) = m.checksum {
+        v["checksum"] = hex(cs as u64).into();
+    }
+    if let Some(ref fv) = m.file_version {
+        v["file_version"] = fv.clone().into();
+    }
+    if let Some(ref pv) = m.product_version {
+        v["product_version"] = pv.clone().into();
+    }
+    v
 }
 
 fn exception_json(exc: &DmpException) -> Value {
@@ -1089,7 +1102,7 @@ fn filetime_to_iso(ft: u64) -> Option<String> {
     // Unix epoch is 11644473600 seconds after that.
     const EPOCH_DIFF: i64 = 11_644_473_600;
     let secs = (ft / 10_000_000) as i64 - EPOCH_DIFF;
-    if secs < 0 || secs > 253_402_300_799 {
+    if !(0..=253_402_300_799).contains(&secs) {
         return None;
     }
     let s = secs % 60;
@@ -1223,7 +1236,7 @@ impl NtoseyeMcp {
     }
 
     #[tool(
-        description = "List loaded kernel modules (optional name filter; paged via offset/limit) as {total, offset, returned, has_more, next_offset?, modules:[{name, short_name, base, end, size}]}"
+        description = "List loaded kernel modules (optional name filter; paged via offset/limit) as {total, offset, returned, has_more, next_offset?, modules:[{name, short_name, base, end, size, time_date_stamp?, checksum?, file_version?, product_version?}]}"
     )]
     async fn kernel_modules(
         &self,
@@ -1239,7 +1252,7 @@ impl NtoseyeMcp {
             .run(move |ctx| {
                 let mods = ctx
                     .target
-                    .kernel_modules()
+                    .kernel_modules_with_versions()
                     .map_err(|e| enumeration_error(ctx, e))?;
                 let f = filter.as_deref().map(str::to_ascii_lowercase);
                 let matched: Vec<_> = mods
@@ -2089,7 +2102,7 @@ impl NtoseyeMcp {
     }
 
     #[tool(
-        description = "List loaded modules for the current inspection scope: the attached process's user-mode modules when attached (attach_process), otherwise the kernel module list. Optional name filter; paged via offset/limit. Returns {total, offset, returned, has_more, next_offset?, modules:[{name, short_name, base, end, size}]}. Use kernel_modules to list kernel modules regardless of attach state."
+        description = "List loaded modules for the current inspection scope: the attached process's user-mode modules when attached (attach_process), otherwise the kernel module list. Optional name filter; paged via offset/limit. Returns {total, offset, returned, has_more, next_offset?, modules:[{name, short_name, base, end, size, time_date_stamp?, checksum?, file_version?, product_version?}]}. Use kernel_modules to list kernel modules regardless of attach state."
     )]
     async fn modules(
         &self,
@@ -2105,7 +2118,7 @@ impl NtoseyeMcp {
             .run(move |ctx| {
                 let mods = ctx
                     .target
-                    .modules()
+                    .modules_with_versions()
                     .map_err(|e| enumeration_error(ctx, e))?;
                 let f = filter.as_deref().map(str::to_ascii_lowercase);
                 let matched: Vec<_> = mods
@@ -2769,7 +2782,7 @@ impl NtoseyeMcp {
                     None
                 };
 
-                let all_mods = ctx.target.kernel_modules().unwrap_or_default();
+                let all_mods = ctx.target.kernel_modules_with_versions().unwrap_or_default();
                 let modules_total = all_mods.len();
                 let mods: Vec<Value> = all_mods.iter().take(200).map(module_json).collect();
 
