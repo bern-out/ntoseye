@@ -9,9 +9,10 @@ use std::time::{Duration, Instant};
 use owo_colors::OwoColorize;
 
 use crate::dbg_backend::{
-    BackendCapability, BugcheckInfo, DebugBackend, DebugCapability, DebugLog, DebugOutputPage,
-    HW_BREAKPOINT_SLOTS, HwBreakpointAccess, StopEvent,
+    BackendCapability, BugcheckInfo, ContinueDisposition, DebugBackend, DebugCapability, DebugLog,
+    DebugOutputPage, HW_BREAKPOINT_SLOTS, HwBreakpointAccess, StopEvent,
 };
+use crate::debugger_data::{DebuggerDataCandidate, MetadataSource};
 use crate::error::{Error, Result};
 use crate::gdb::RegisterMap;
 use crate::kd::framing::{BREAKIN_BYTE, KdFraming};
@@ -61,6 +62,8 @@ pub struct StateChange {
     number_processors: u16,
     new_state: u32,
     exception_code: u32,
+    exception_first_chance: Option<bool>,
+    exception_address: Option<u64>,
     program_counter: u64,
     kernel_base_hint: Option<VirtAddr>,
     is_bugcheck: bool,
@@ -89,6 +92,21 @@ const DBG_KD_LOAD_SYMBOLS_STATE_CHANGE: u32 = 0x0000_3031;
 const DBG_KD_COMMAND_STRING_STATE_CHANGE: u32 = 0x0000_3032;
 
 const AMD64_DEBUG_CONTROL_SPACE_KSPECIAL: u64 = 2;
+const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
+
+fn require_amd64_machine(machine_type: u16) -> Result<()> {
+    if machine_type == IMAGE_FILE_MACHINE_AMD64 {
+        return Ok(());
+    }
+    let name = match machine_type {
+        0x014c => "I386",
+        0xaa64 => "ARM64",
+        _ => "unknown",
+    };
+    Err(Error::UnsupportedArchitecture(format!(
+        "{name} KD target (machine {machine_type:#06x})"
+    )))
+}
 const KSPECIAL_REGISTERS_CR0_OFFSET: usize = 0x00;
 const KSPECIAL_REGISTERS_CR2_OFFSET: usize = 0x08;
 const KSPECIAL_REGISTERS_CR3_OFFSET: usize = 0x10;
@@ -245,6 +263,8 @@ fn stop_event(stop: StateChange) -> StopEvent {
         thread_id: Some(thread_id_for(stop.processor)),
         exception_code: (stop.new_state == DBG_KD_EXCEPTION_STATE_CHANGE)
             .then_some(stop.exception_code),
+        first_chance: stop.exception_first_chance,
+        exception_address: stop.exception_address,
         program_counter: Some(stop.program_counter),
         is_bugcheck: stop.is_bugcheck,
         bugcheck: stop.bugcheck,
@@ -279,6 +299,9 @@ pub struct KdBackend {
     pending_write_breakpoint: Option<PendingWriteBreakpoint>,
     special_register_cache: HashMap<u16, Vec<u8>>,
     is_running: bool,
+    /// Set after an explicit frontend cleanup. Prevents `Drop` from overriding
+    /// a deliberate halted exit after breakpoint restoration failed.
+    exit_prepared: bool,
     /// Captured guest debug output (DbgPrint). Shared with the background pump,
     /// which is the sole socket reader (and so the primary capture point) while
     /// the VM runs.
@@ -309,15 +332,19 @@ impl KdBackend {
 
         // A waiting kernel retransmits state-change; otherwise break in
         let mut initial_stop = poll_for_initial_break(&mut framing, initial_timeout)?;
-        if let Err(err) = probe_initial_request(&mut framing, initial_stop.processor) {
-            if !is_initial_resync_error(&err) {
-                return Err(err);
+        let version = match probe_initial_request(&mut framing, initial_stop.processor) {
+            Ok(version) => version,
+            Err(err) => {
+                if !is_initial_resync_error(&err) {
+                    return Err(err);
+                }
+                kd_trace!("kd: initial request probe failed ({err}); resetting KD packet stream");
+                framing.send_reset()?;
+                initial_stop = poll_for_initial_break(&mut framing, initial_timeout)?;
+                probe_initial_request(&mut framing, initial_stop.processor)?
             }
-            kd_trace!("kd: initial request probe failed ({err}); resetting KD packet stream");
-            framing.send_reset()?;
-            initial_stop = poll_for_initial_break(&mut framing, initial_timeout)?;
-            probe_initial_request(&mut framing, initial_stop.processor)?;
-        }
+        };
+        require_amd64_machine(version.machine_type)?;
         // The first state-change often arrives with KD's SYNC bit set. That is
         // the baseline connection, not a target reload for the REPL to surface.
         framing.take_peer_reset_seen();
@@ -359,6 +386,7 @@ impl KdBackend {
             reconnect_assist_after_continue: None,
             special_register_cache: HashMap::new(),
             is_running: false,
+            exit_prepared: false,
             debug_log: DebugLog::new(DEBUG_LOG_CAPACITY),
         })
     }
@@ -841,7 +869,7 @@ impl KdBackend {
         append_control_registers_from_special(ctx, special)
     }
 
-    fn continue_preserving_dr7(&mut self, processor: u16, trace: bool) -> Result<()> {
+    fn continue_preserving_dr7(&mut self, processor: u16, status: u32, trace: bool) -> Result<()> {
         if !self.special_register_cache.contains_key(&processor) {
             let special = self.read_special_registers_uncached(processor)?;
             self.special_register_cache.insert(processor, special);
@@ -852,7 +880,7 @@ impl KdBackend {
             .expect("cache holds processor; we just inserted it on miss");
         let dr7 = wire::read_u64(special, KSPECIAL_REGISTERS_DR7_OFFSET);
         with_framing_read_timeout(self.framing()?, KD_REQUEST_TIMEOUT, |framing| {
-            api::continue_api2(framing, processor, api::DBG_CONTINUE, trace, dr7)
+            api::continue_api2(framing, processor, status, trace, dr7)
         })
     }
 
@@ -864,7 +892,7 @@ impl KdBackend {
         ) {
             self.advance_rip_past_int3(processor)?;
         }
-        self.continue_preserving_dr7(processor, false)?;
+        self.continue_preserving_dr7(processor, api::DBG_CONTINUE, false)?;
         self.record_running();
         // The resume consumed the current stop. Any stashed pending_stop from
         // an earlier break-in is stale now; keeping it can make exit issue
@@ -910,6 +938,10 @@ impl KdBackend {
         Err(Error::Kd(format!(
             "target kept stopping during debugger exit after {KD_EXIT_MAX_CONTINUES} continues"
         )))
+    }
+
+    fn needs_drop_cleanup(&self) -> bool {
+        !self.exit_prepared && (self.pump.is_some() || !self.is_running)
     }
 }
 
@@ -1068,7 +1100,27 @@ impl DebugBackend for KdBackend {
         })
     }
 
+    fn target_debugger_data_hint(&mut self) -> Result<Option<DebuggerDataCandidate>> {
+        let processor = self.current_processor;
+        with_framing_read_timeout(self.framing()?, KD_REQUEST_TIMEOUT, |framing| {
+            api::get_version(framing, processor).map(|version| {
+                (version.flags & api::DBGKD_VERS_FLAG_DATA != 0 && version.debugger_data_list != 0)
+                    .then_some(DebuggerDataCandidate {
+                        address: VirtAddr(version.debugger_data_list),
+                        source: MetadataSource::KdVersion,
+                    })
+            })
+        })
+    }
+
     fn continue_execution(&mut self) -> Result<()> {
+        self.continue_execution_with_disposition(ContinueDisposition::Handled)
+    }
+
+    fn continue_execution_with_disposition(
+        &mut self,
+        disposition: ContinueDisposition,
+    ) -> Result<()> {
         // Drain stale break-in bytes consumed by KdPollBreakIn after resume
         const MAX_DRAIN_ITERATIONS: u32 = 64;
         const DRAIN_POLL: Duration = Duration::from_millis(1000);
@@ -1106,7 +1158,16 @@ impl DebugBackend for KdBackend {
                 "kd: continue: sending ContinueApi2 on p{}",
                 resume_processor + 1
             );
-            self.continue_preserving_dr7(resume_processor, false)?;
+            // The requested disposition acknowledges the user's actual stop.
+            // Any immediate raw int3 / assisted break-in drained on a later
+            // iteration is debugger noise and must always be acknowledged as
+            // handled rather than passed into Windows exception dispatch.
+            let continue_status = if drained == 0 {
+                api::status_for_disposition(disposition)
+            } else {
+                api::DBG_CONTINUE
+            };
+            self.continue_preserving_dr7(resume_processor, continue_status, false)?;
             kd_trace!("kd: continue: ContinueApi2 ACKed, VM should resume");
             self.record_running();
 
@@ -1177,7 +1238,7 @@ impl DebugBackend for KdBackend {
         // single step stops almost immediately, so the caller's wait_for_stop
         // reads it synchronously; no pump needed
         let processor = self.current_processor;
-        self.continue_preserving_dr7(processor, true)?;
+        self.continue_preserving_dr7(processor, api::DBG_CONTINUE, true)?;
         self.record_running();
         Ok(())
     }
@@ -1334,7 +1395,11 @@ impl DebugBackend for KdBackend {
     }
 
     fn prepare_for_exit(&mut self, leave_running: bool) -> Result<()> {
-        self.finish_for_exit(leave_running)
+        let result = self.finish_for_exit(leave_running);
+        if result.is_ok() {
+            self.exit_prepared = true;
+        }
+        result
     }
 
     fn take_modules_changed(&mut self) -> bool {
@@ -1349,7 +1414,7 @@ impl DebugBackend for KdBackend {
 /// Best-effort resume during normal teardown
 impl Drop for KdBackend {
     fn drop(&mut self) {
-        if self.pump.is_some() || !self.is_running {
+        if self.needs_drop_cleanup() {
             let _ = self.finish_for_exit(true);
         }
     }
@@ -1364,6 +1429,14 @@ mod tests {
     };
     use std::io::{Cursor, Read, Write};
     use std::time::Instant;
+
+    #[test]
+    fn kd_rejects_non_amd64_targets_before_context_access() {
+        assert!(require_amd64_machine(IMAGE_FILE_MACHINE_AMD64).is_ok());
+        let error = require_amd64_machine(0xaa64).unwrap_err();
+        assert!(error.to_string().contains("ARM64 KD target"));
+        assert!(error.to_string().contains("supports AMD64 targets only"));
+    }
 
     struct Loopback {
         inbound: Cursor<Vec<u8>>,
@@ -1429,6 +1502,23 @@ mod tests {
     }
 
     #[test]
+    fn parse_state_change_extracts_exception_record_metadata() {
+        let mut payload = vec![0u8; 188];
+        payload[0..4].copy_from_slice(&DBG_KD_EXCEPTION_STATE_CHANGE.to_le_bytes());
+        payload[32..36].copy_from_slice(&0xc000_0005u32.to_le_bytes());
+        payload[48..56].copy_from_slice(&0xfffff800_12345678u64.to_le_bytes());
+        payload[184..188].copy_from_slice(&1u32.to_le_bytes());
+
+        let first = parse_state_change(&payload).unwrap();
+        assert_eq!(first.exception_address, Some(0xfffff800_12345678));
+        assert_eq!(first.exception_first_chance, Some(true));
+
+        payload[184..188].copy_from_slice(&0u32.to_le_bytes());
+        let second = parse_state_change(&payload).unwrap();
+        assert_eq!(second.exception_first_chance, Some(false));
+    }
+
+    #[test]
     fn parse_load_symbols_state_change_extracts_base_hint() {
         let mut payload = vec![0u8; 64];
         payload[0..4].copy_from_slice(&DBG_KD_LOAD_SYMBOLS_STATE_CHANGE.to_le_bytes());
@@ -1449,6 +1539,8 @@ mod tests {
             number_processors: 2,
             new_state: DBG_KD_EXCEPTION_STATE_CHANGE,
             exception_code: STATUS_BREAKPOINT,
+            exception_first_chance: Some(true),
+            exception_address: Some(0xfffff800deadbeef),
             program_counter: 0xfffff800deadbeef,
             kernel_base_hint: None,
             is_bugcheck: false,
@@ -1460,6 +1552,8 @@ mod tests {
         let event = stop_event(stop);
         assert_eq!(event.thread_id.as_deref(), Some("p1.2"));
         assert_eq!(event.exception_code, Some(STATUS_BREAKPOINT));
+        assert_eq!(event.first_chance, Some(true));
+        assert_eq!(event.exception_address, Some(0xfffff800deadbeef));
         assert_eq!(event.program_counter, Some(0xfffff800deadbeef));
         assert_eq!(event.target_kernel_base_hint, None);
         assert!(!event.is_bugcheck);
@@ -1475,6 +1569,8 @@ mod tests {
             number_processors: 1,
             new_state: DBG_KD_EXCEPTION_STATE_CHANGE,
             exception_code: STATUS_BREAKPOINT,
+            exception_first_chance: Some(true),
+            exception_address: Some(0xfffff800deadbeef),
             program_counter: 0xfffff800deadbeef,
             kernel_base_hint: None,
             is_bugcheck: false,
@@ -1495,6 +1591,8 @@ mod tests {
             number_processors: 1,
             new_state: DBG_KD_EXCEPTION_STATE_CHANGE,
             exception_code: STATUS_BREAKPOINT,
+            exception_first_chance: Some(true),
+            exception_address: Some(0xfffff800deadbeef),
             program_counter: 0xfffff800deadbeef,
             kernel_base_hint: None,
             is_bugcheck: false,
@@ -1514,6 +1612,8 @@ mod tests {
             number_processors: 1,
             new_state: DBG_KD_LOAD_SYMBOLS_STATE_CHANGE,
             exception_code: 0,
+            exception_first_chance: None,
+            exception_address: None,
             program_counter: 0xfffff8007faf9325,
             kernel_base_hint: Some(VirtAddr(0xfffff8007f600000)),
             is_bugcheck: true,
@@ -1540,6 +1640,8 @@ mod tests {
             number_processors: 1,
             new_state: DBG_KD_LOAD_SYMBOLS_STATE_CHANGE,
             exception_code: 0,
+            exception_first_chance: None,
+            exception_address: None,
             program_counter: 0xfffff8007faf9325,
             kernel_base_hint: None,
             is_bugcheck: false,
@@ -1993,6 +2095,7 @@ mod tests {
             pending_write_breakpoint: None,
             special_register_cache: HashMap::new(),
             is_running: true,
+            exit_prepared: false,
             debug_log: DebugLog::new(DEBUG_LOG_CAPACITY),
         }
     }
@@ -2018,6 +2121,7 @@ mod tests {
             pending_write_breakpoint: None,
             special_register_cache: HashMap::new(),
             is_running: true,
+            exit_prepared: false,
             debug_log: DebugLog::new(DEBUG_LOG_CAPACITY),
         }
     }
@@ -2070,6 +2174,8 @@ mod tests {
             number_processors: 1,
             new_state: DBG_KD_EXCEPTION_STATE_CHANGE,
             exception_code: STATUS_BREAKPOINT,
+            exception_first_chance: Some(true),
+            exception_address: Some(pc),
             program_counter: pc,
             kernel_base_hint: None,
             is_bugcheck: false,
@@ -2100,6 +2206,8 @@ mod tests {
             number_processors: 1,
             new_state: DBG_KD_EXCEPTION_STATE_CHANGE,
             exception_code: code,
+            exception_first_chance: Some(true),
+            exception_address: Some(pc),
             program_counter: pc,
             kernel_base_hint: None,
             is_bugcheck: false,
@@ -2361,6 +2469,7 @@ mod tests {
 
         assert!(backend.is_running);
         assert!(backend.pump.is_none());
+        assert!(backend.exit_prepared);
         assert!(backend.framing.is_some());
         assert_eq!(
             u32::from_le_bytes(continue_packet[0..4].try_into().unwrap()),
@@ -2382,12 +2491,30 @@ mod tests {
     }
 
     #[test]
+    fn explicit_halted_exit_suppresses_drop_resume() {
+        let (host, _kernel) = UnixStream::pair().unwrap();
+        let mut backend = kd_backend_with_framing(host);
+        backend.is_running = false;
+
+        backend.prepare_for_exit(false).unwrap();
+        let needs_drop_cleanup = backend.needs_drop_cleanup();
+        // Keep unwinding safe if the assertion ever regresses: a running
+        // framing-only fixture never enters Drop's resume path.
+        backend.is_running = true;
+
+        assert!(backend.exit_prepared);
+        assert!(!needs_drop_cleanup);
+    }
+
+    #[test]
     fn exit_classifies_stray_single_step_but_spares_real_stops() {
         let pc = 0xfffff800_deadbeef;
         let mut managed = HashSet::new();
         let stop_at = |code: Option<u32>, pc: Option<u64>, is_bugcheck: bool| StopEvent {
             thread_id: None,
             exception_code: code,
+            first_chance: code.map(|_| true),
+            exception_address: pc,
             program_counter: pc,
             is_bugcheck,
             bugcheck: None,
@@ -2446,6 +2573,8 @@ mod tests {
             number_processors: 1,
             new_state: 0x3030,
             exception_code: STATUS_BREAKPOINT,
+            exception_first_chance: Some(true),
+            exception_address: Some(0xfffff800_002f90d0),
             program_counter: 0xfffff800_002f90d0,
             kernel_base_hint: None,
             is_bugcheck: false,

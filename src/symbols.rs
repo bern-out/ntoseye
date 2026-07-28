@@ -20,7 +20,7 @@ use pelite::{
     pe64::{Pe, PeFile, PeView, debug::CodeView},
 };
 use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
-use spin::Mutex;
+use spin::{Mutex, RwLock};
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
@@ -65,16 +65,49 @@ pub struct SymbolIndex {
     names: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymbolVisibility {
+    Public,
+    Private,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IndexedSymbol {
+    rva: u32,
+    visibility: SymbolVisibility,
+    compiland: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolCandidate {
+    pub module: String,
+    pub address: VirtAddr,
+    pub visibility: SymbolVisibility,
+    pub compiland: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolIndexDiagnostic {
+    pub phase: &'static str,
+    pub compiland: Option<String>,
+    pub message: String,
+}
+
 pub struct SymbolStore {
     pdbs: DashMap<u128, Mutex<pdb2::PDB<'static, Cursor<&'static [u8]>>>>,
 
     mmaps: DashMap<u128, Arc<Mmap>>,
+    pdb_ages: DashMap<u128, u32>,
+    index_build_results: DashMap<u128, Arc<OnceLock<std::result::Result<(), String>>>>,
     index: DashMap<u128, SymbolIndex>,
     index_types: DashMap<u128, SymbolIndex>,
     index_enums: DashMap<u128, SymbolIndex>,
-    /// guid -> (public symbol name -> RVA). Built alongside `index` so symbol
-    /// address resolution is an O(1) lookup instead of a per-call PDB scan
-    symbol_rvas: DashMap<u128, HashMap<String, u32>>,
+    /// GUID -> symbol name -> every address-bearing PDB record. Private/static
+    /// duplicates retain their compiland identity; resolution prefers public
+    /// records when present but never collapses distinct candidate addresses.
+    symbol_rvas: DashMap<u128, HashMap<String, Vec<IndexedSymbol>>>,
+    source_lines: DashMap<u128, Vec<SourceLineEntry>>,
+    index_diagnostics: DashMap<u128, Vec<SymbolIndexDiagnostic>>,
 
     /// (guid, struct name) -> parsed layout. `dump_struct_with_types`
     /// otherwise rescans the entire PDB type stream on every call; keying on
@@ -85,6 +118,8 @@ pub struct SymbolStore {
     modules: DashMap<(Dtb, u64), LoadedModule>,
     module_status: DashMap<(Dtb, u64), ModuleSymbolStatus>,
     module_source: DashMap<(Dtb, u64), ModuleSymbolSource>,
+    sources: RwLock<Vec<SymbolSource>>,
+    source_paths: RwLock<Vec<SourcePathMapping>>,
 
     /// GUID of the kernel (`ntoskrnl`) module. Type/enum *layout* lookups are
     /// address-space independent, so they must always prefer the kernel's
@@ -102,6 +137,118 @@ fn guid_to_u128(guid: GUID) -> u128 {
     bytes[6..8].copy_from_slice(&guid.Data3.to_be_bytes());
     bytes[8..16].copy_from_slice(&guid.Data4);
     u128::from_be_bytes(bytes)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SymbolSource {
+    /// ntoseye's managed on-disk symbol cache.
+    Cache,
+    /// A directory containing either bare PDBs or a conventional symbol store.
+    LocalDirectory(PathBuf),
+    /// An HTTP(S) symbol server root.
+    Http(String),
+}
+
+fn symbol_sources_from_servers(servers: &[String]) -> Vec<SymbolSource> {
+    let mut sources = Vec::with_capacity(servers.len() + 1);
+    sources.push(SymbolSource::Cache);
+    sources.extend(servers.iter().cloned().map(SymbolSource::Http));
+    sources
+}
+
+impl fmt::Display for SymbolSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Cache => match symbols_directory() {
+                Some(path) => write!(f, "cache*{}", path.display()),
+                None => f.write_str("cache*<unavailable>"),
+            },
+            Self::LocalDirectory(path) => write!(f, "{}", path.display()),
+            Self::Http(url) => f.write_str(url),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourcePathMapping {
+    pub recorded_prefix: Option<String>,
+    pub local_root: PathBuf,
+}
+
+impl fmt::Display for SourcePathMapping {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.recorded_prefix {
+            Some(prefix) => write!(f, "{}={}", prefix, self.local_root.display()),
+            None => write!(f, "{}", self.local_root.display()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PdbIdentity {
+    pub guid: u128,
+    pub age: u32,
+}
+
+impl PdbIdentity {
+    fn matches(self, candidate: Self) -> std::result::Result<(), String> {
+        if candidate.guid != self.guid {
+            return Err(format!(
+                "GUID mismatch (expected {:032X}, found {:032X})",
+                self.guid, candidate.guid
+            ));
+        }
+        if candidate.age < self.age {
+            return Err(format!(
+                "age mismatch (image {}, PDB {}; PDB age must be at least the image age)",
+                self.age, candidate.age
+            ));
+        }
+        Ok(())
+    }
+
+    fn symbol_store_key(self) -> String {
+        format!("{:032X}{:X}", self.guid, self.age)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceLocation {
+    /// Path recorded in the PDB.
+    pub file: String,
+    pub line: u32,
+    pub column: Option<u32>,
+    /// First configured remapping candidate (or first existing candidate).
+    pub local_path: Option<PathBuf>,
+    pub local_exists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcedureLocal {
+    pub name: String,
+    pub type_name: String,
+    pub byte_size: Option<u64>,
+    pub is_parameter: bool,
+    pub location: LocalVariableLocation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalVariableLocation {
+    /// The variable's value is held directly in a register.
+    Register { register: String },
+    /// The variable is stored in memory at register + signed offset.
+    RegisterRelative { register: String, offset: i32 },
+    /// PDB frame-pointer-relative location without a safely decoded base register.
+    FrameRelative { offset: i32 },
+    /// The PDB explicitly says the value is absent or uses an unsupported recipe.
+    Unavailable { reason: String },
+}
+
+#[derive(Debug, Clone)]
+struct SourceLineEntry {
+    rva: u32,
+    length: Option<u32>,
+    location: SourceLocation,
 }
 
 pub fn format_symbol_with_offset(module: &str, name: &str, offset: u32) -> String {
@@ -206,14 +353,468 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(root);
     }
+
+    #[test]
+    fn symbol_sources_preserve_order_and_reset_defaults() {
+        let store = SymbolStore::new();
+        let private = SymbolSource::LocalDirectory(PathBuf::from("/private"));
+        let server = SymbolSource::Http("https://symbols.example.test".to_string());
+
+        store.set_symbol_sources(vec![private.clone()]);
+        store.append_symbol_source(server.clone());
+        assert_eq!(store.symbol_sources(), vec![private, server]);
+
+        store.reset_symbol_sources();
+        assert_eq!(
+            store.symbol_sources(),
+            symbol_sources_from_servers(pdb_servers())
+        );
+    }
+
+    #[test]
+    fn configured_pdb_servers_feed_default_symbol_sources_in_order() {
+        let servers = vec![
+            "https://private.example.test/symbols".to_string(),
+            "https://backup.example.test/symbols".to_string(),
+        ];
+
+        assert_eq!(
+            symbol_sources_from_servers(&servers),
+            vec![
+                SymbolSource::Cache,
+                SymbolSource::Http(servers[0].clone()),
+                SymbolSource::Http(servers[1].clone()),
+            ]
+        );
+    }
+
+    #[test]
+    fn local_source_paths_cover_direct_and_symbol_store_layouts() {
+        let identity = PdbIdentity {
+            guid: 0x00112233445566778899AABBCCDDEEFF,
+            age: 2,
+        };
+        let root = Path::new("/symbols");
+
+        assert_eq!(
+            local_source_candidates(root, "private.pdb", identity),
+            vec![
+                root.join("private.pdb"),
+                root.join("private.pdb")
+                    .join("00112233445566778899AABBCCDDEEFF2")
+                    .join("private.pdb")
+            ]
+        );
+    }
+
+    #[test]
+    fn pdb_identity_requires_guid_and_non_stale_age() {
+        let expected = PdbIdentity {
+            guid: 0x1234,
+            age: 3,
+        };
+        assert!(expected.matches(expected).is_ok());
+        assert!(
+            expected
+                .matches(PdbIdentity {
+                    guid: expected.guid,
+                    age: 4
+                })
+                .is_ok()
+        );
+        assert!(
+            expected
+                .matches(PdbIdentity {
+                    guid: 0x5678,
+                    age: 3
+                })
+                .unwrap_err()
+                .contains("GUID mismatch")
+        );
+        assert!(
+            expected
+                .matches(PdbIdentity {
+                    guid: expected.guid,
+                    age: 2
+                })
+                .unwrap_err()
+                .contains("age mismatch")
+        );
+    }
+
+    #[test]
+    fn duplicate_private_symbols_remain_candidates_while_public_symbols_take_precedence() {
+        let mut symbols = HashMap::new();
+        insert_symbol_rva(
+            &mut symbols,
+            "duplicate".to_string(),
+            0x100,
+            SymbolVisibility::Private,
+            Some("first.obj".to_string()),
+        );
+        insert_symbol_rva(
+            &mut symbols,
+            "duplicate".to_string(),
+            0x200,
+            SymbolVisibility::Private,
+            Some("second.obj".to_string()),
+        );
+        assert_eq!(preferred_symbol_records(&symbols["duplicate"]).len(), 2);
+
+        insert_symbol_rva(
+            &mut symbols,
+            "duplicate".to_string(),
+            0x300,
+            SymbolVisibility::Public,
+            None,
+        );
+        let preferred = preferred_symbol_records(&symbols["duplicate"]);
+        assert_eq!(preferred.len(), 1);
+        assert_eq!(preferred[0].rva, 0x300);
+        assert_eq!(symbols["duplicate"].len(), 3);
+    }
+
+    #[test]
+    fn symbol_resolution_reports_distinct_private_candidates() {
+        let store = SymbolStore::new();
+        let dtb = 0x1000_u64;
+        let base = VirtAddr(0x0000_0001_8000_0000);
+        store.modules.insert(
+            SymbolStore::module_key(dtb, base),
+            LoadedModule {
+                name: "driver.sys".to_string(),
+                guid: 1,
+                base_address: base,
+                size: 0x1000,
+                dtb,
+            },
+        );
+        store.symbol_rvas.insert(
+            1,
+            HashMap::from([(
+                "worker".to_string(),
+                vec![
+                    IndexedSymbol {
+                        rva: 0x100,
+                        visibility: SymbolVisibility::Private,
+                        compiland: Some("first.obj".to_string()),
+                    },
+                    IndexedSymbol {
+                        rva: 0x200,
+                        visibility: SymbolVisibility::Private,
+                        compiland: Some("second.obj".to_string()),
+                    },
+                ],
+            )]),
+        );
+
+        let candidates = store.find_symbol_candidates(dtb, "driver!worker");
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].compiland.as_deref(), Some("first.obj"));
+        assert_eq!(candidates[1].address, base + 0x200_u64);
+        let error = store
+            .find_symbol_with_module(dtb, "driver!worker")
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("driver!worker"));
+        assert!(message.contains("first.obj"));
+        assert!(message.contains("second.obj"));
+    }
+
+    #[test]
+    fn public_symbol_is_the_unique_resolution_for_a_duplicate_name() {
+        let store = SymbolStore::new();
+        let dtb = 0x1000_u64;
+        let base = VirtAddr(0x0000_0001_8000_0000);
+        store.modules.insert(
+            SymbolStore::module_key(dtb, base),
+            LoadedModule {
+                name: "driver.sys".to_string(),
+                guid: 1,
+                base_address: base,
+                size: 0x1000,
+                dtb,
+            },
+        );
+        store.symbol_rvas.insert(
+            1,
+            HashMap::from([(
+                "worker".to_string(),
+                vec![
+                    IndexedSymbol {
+                        rva: 0x100,
+                        visibility: SymbolVisibility::Private,
+                        compiland: Some("first.obj".to_string()),
+                    },
+                    IndexedSymbol {
+                        rva: 0x300,
+                        visibility: SymbolVisibility::Public,
+                        compiland: None,
+                    },
+                ],
+            )]),
+        );
+
+        assert_eq!(
+            store.find_symbol_with_module(dtb, "driver!worker").unwrap(),
+            Some((base + 0x300_u64, "driver".to_string()))
+        );
+    }
+
+    #[test]
+    fn source_line_lookup_obeys_line_ranges() {
+        let lines = vec![
+            SourceLineEntry {
+                rva: 0x100,
+                length: Some(4),
+                location: SourceLocation {
+                    file: "private.c".to_string(),
+                    line: 10,
+                    column: Some(2),
+                    local_path: None,
+                    local_exists: false,
+                },
+            },
+            SourceLineEntry {
+                rva: 0x110,
+                length: None,
+                location: SourceLocation {
+                    file: "private.c".to_string(),
+                    line: 11,
+                    column: None,
+                    local_path: None,
+                    local_exists: false,
+                },
+            },
+            SourceLineEntry {
+                rva: 0x120,
+                length: Some(2),
+                location: SourceLocation {
+                    file: "private.c".to_string(),
+                    line: 12,
+                    column: None,
+                    local_path: None,
+                    local_exists: false,
+                },
+            },
+        ];
+
+        assert_eq!(lookup_source_line(&lines, 0x102).unwrap().line, 10);
+        assert!(lookup_source_line(&lines, 0x104).is_none());
+        assert_eq!(lookup_source_line(&lines, 0x11f).unwrap().line, 11);
+        assert!(lookup_source_line(&lines, 0x122).is_none());
+    }
+
+    #[test]
+    fn definition_range_excludes_gaps() {
+        let gaps = [(4, 2)];
+        assert!(live_range_contains(0x100, 10, &gaps, 0x103));
+        assert!(!live_range_contains(0x100, 10, &gaps, 0x104));
+        assert!(!live_range_contains(0x100, 10, &gaps, 0x105));
+        assert!(live_range_contains(0x100, 10, &gaps, 0x106));
+        assert!(!live_range_contains(0x100, 10, &gaps, 0x10a));
+    }
+
+    #[test]
+    fn source_file_matching_supports_windows_paths_and_basenames() {
+        assert!(source_file_matches(
+            r"C:\agent\src\private.c",
+            r"c:\AGENT\src\PRIVATE.c"
+        ));
+        assert!(source_file_matches(r"C:\agent\src\private.c", "PRIVATE.c"));
+        assert!(!source_file_matches(r"C:\agent\src\private.c", "other.c"));
+    }
+
+    #[test]
+    fn source_path_remapping_prefers_existing_ordered_candidate() {
+        let root = temp_root("source-remap");
+        let first = root.join("missing");
+        let second = root.join("checkout");
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(second.join("private.c"), "int private;\n").unwrap();
+        let mappings = vec![
+            SourcePathMapping {
+                recorded_prefix: Some(r"C:\agent\src".to_string()),
+                local_root: first,
+            },
+            SourcePathMapping {
+                recorded_prefix: Some(r"C:\agent\src".to_string()),
+                local_root: second.clone(),
+            },
+        ];
+
+        let (candidate, exists) = remap_source_file(r"C:\agent\src\private.c", &mappings);
+        assert!(exists);
+        assert_eq!(candidate, Some(second.join("private.c")));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn source_path_remapping_rejects_traversal_and_symlink_escape() {
+        let root = temp_root("source-containment");
+        let checkout = root.join("checkout");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&checkout).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.c"), "secret\n").unwrap();
+        std::os::unix::fs::symlink(&outside, checkout.join("link")).unwrap();
+        let mappings = [SourcePathMapping {
+            recorded_prefix: Some(r"C:\agent\src".to_string()),
+            local_root: checkout.clone(),
+        }];
+
+        assert_eq!(
+            remap_source_file(r"C:\agent\src\..\outside\secret.c", &mappings),
+            (None, false)
+        );
+        let (candidate, exists) = remap_source_file(r"C:\agent\src\link\secret.c", &mappings);
+        assert_eq!(candidate, Some(checkout.join("link/secret.c")));
+        assert!(!exists);
+        assert_eq!(remap_source_file("/etc/passwd", &[]), (None, false));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn source_addresses_resolve_cached_file_and_line() {
+        let store = SymbolStore::new();
+        let guid = 0x55;
+        let dtb = 0x1000;
+        store.modules.insert(
+            (dtb, 0x140000000),
+            LoadedModule {
+                name: "private.exe".to_string(),
+                guid,
+                base_address: VirtAddr(0x140000000),
+                size: 0x1000,
+                dtb,
+            },
+        );
+        store.source_lines.insert(
+            guid,
+            vec![
+                SourceLineEntry {
+                    rva: 0x120,
+                    length: Some(4),
+                    location: SourceLocation {
+                        file: r"C:\agent\src\private.c".to_string(),
+                        line: 42,
+                        column: None,
+                        local_path: None,
+                        local_exists: false,
+                    },
+                },
+                SourceLineEntry {
+                    rva: 0x180,
+                    length: Some(4),
+                    location: SourceLocation {
+                        file: r"C:\agent\src\private.c".to_string(),
+                        line: 42,
+                        column: None,
+                        local_path: None,
+                        local_exists: false,
+                    },
+                },
+            ],
+        );
+        store.set_source_paths(vec![SourcePathMapping {
+            recorded_prefix: Some(r"C:\agent\src".to_string()),
+            local_root: "/checkout".into(),
+        }]);
+
+        assert_eq!(
+            store.source_addresses(dtb, "private.c", 42),
+            vec![VirtAddr(0x140000120), VirtAddr(0x140000180)]
+        );
+        assert_eq!(
+            store.source_addresses(dtb, "/checkout/private.c", 42),
+            vec![VirtAddr(0x140000120), VirtAddr(0x140000180)]
+        );
+    }
+
+    #[test]
+    fn invalidating_module_clears_registration_and_status() {
+        let store = SymbolStore::new();
+        let dtb = 0x1000;
+        let base = VirtAddr(0x180000000);
+        store.modules.insert(
+            (dtb, base.0),
+            LoadedModule {
+                name: "reload.dll".to_string(),
+                guid: 0x99,
+                base_address: base,
+                size: 0x1000,
+                dtb,
+            },
+        );
+        store.set_module_symbol_status(dtb, base, ModuleSymbolStatus::Loaded);
+
+        store.invalidate_modules(dtb, &[base]);
+
+        assert!(store.find_module_for_address(dtb, base).is_none());
+        assert!(store.module_symbol_status(dtb, base).is_none());
+    }
+
+    #[test]
+    fn private_index_skips_pdb2_function_list_records() {
+        assert!(is_private_address_symbol_kind(0x1110));
+        assert!(is_private_address_symbol_kind(0x110d));
+        assert!(!is_private_address_symbol_kind(PDB_S_CALLEES));
+        assert!(!is_private_address_symbol_kind(PDB_S_CALLERS));
+        assert!(is_pdb2_function_list_symbol(PDB_S_CALLEES));
+        assert!(is_pdb2_function_list_symbol(PDB_S_CALLERS));
+    }
+    #[test]
+    fn module_lookup_prefers_active_dtb_then_falls_back() {
+        let store = SymbolStore::new();
+        let active_dtb = 0x1000;
+        let fallback_dtb = 0x2000;
+        let base = VirtAddr(0x180000000);
+        let module = |name: &str, guid, dtb| LoadedModule {
+            name: name.to_string(),
+            guid,
+            base_address: base,
+            size: 0x1000,
+            dtb,
+        };
+        store.modules.insert(
+            (fallback_dtb, base.0),
+            module("kernel.sys", 0x22, fallback_dtb),
+        );
+
+        let resolved = store
+            .find_module_for_address_in_context(active_dtb, fallback_dtb, base)
+            .unwrap();
+        assert_eq!(resolved.dtb, fallback_dtb);
+        assert_eq!(resolved.name, "kernel.sys");
+
+        store
+            .modules
+            .insert((active_dtb, base.0), module("user.dll", 0x11, active_dtb));
+        let resolved = store
+            .find_module_for_address_in_context(active_dtb, fallback_dtb, base)
+            .unwrap();
+        assert_eq!(resolved.dtb, active_dtb);
+        assert_eq!(resolved.name, "user.dll");
+    }
 }
 
-/// Information needed to download a PDB file
+/// A file acquisition planned by symbol discovery. PDB jobs carry the RSDS
+/// identity and ordered source snapshot needed to validate every candidate.
 #[derive(Debug, Clone)]
 pub struct DownloadJob {
     pub urls: Vec<String>,
     pub path: PathBuf,
     pub filename: String,
+    pdb: Option<PdbRequest>,
+}
+
+#[derive(Debug, Clone)]
+struct PdbRequest {
+    identity: PdbIdentity,
+    server_name: String,
+    sources: Vec<SymbolSource>,
 }
 
 #[derive(Debug, Clone)]
@@ -301,7 +902,18 @@ impl ModuleSymbolLoad {
 
 impl DownloadJob {
     pub fn needs_download(&self) -> bool {
-        !self.path.exists() || *FORCE_DOWNLOADS.get_or_init(|| false)
+        self.pdb.is_some() || !self.path.exists() || *FORCE_DOWNLOADS.get_or_init(|| false)
+    }
+
+    fn matches_loaded_identity(&self, ages: &DashMap<u128, u32>) -> bool {
+        self.pdb.as_ref().is_some_and(|request| {
+            ages.get(&request.identity.guid)
+                .is_some_and(|age| *age >= request.identity.age)
+        })
+    }
+
+    fn expected_identity(&self) -> Option<PdbIdentity> {
+        self.pdb.as_ref().map(|request| request.identity)
     }
 }
 
@@ -324,34 +936,37 @@ fn task_progress_style() -> ProgressStyle {
 }
 
 fn download_job(job: &DownloadJob, pb: ProgressBar) -> Result<()> {
+    if let Some(request) = &job.pdb {
+        return resolve_pdb_job(job, request, pb);
+    }
     if !job.needs_download() {
         return Ok(());
     }
 
     let mut last_err = None;
     for url in &job.urls {
-        match reqwest::blocking::get(url).and_then(|r| r.error_for_status()) {
-            Ok(response) => {
-                return download_response(job, response, pb);
+        match download_url_to_path(url, &job.path, &job.filename, &pb) {
+            Ok(()) => {
+                pb.finish_and_clear();
+                return Ok(());
             }
-            Err(e) => last_err = Some(e),
+            Err(error) => last_err = Some(error),
         }
     }
-    Err(last_err.expect("DownloadJob.urls must not be empty").into())
+    pb.finish_and_clear();
+    Err(last_err.expect("DownloadJob.urls must not be empty"))
 }
 
-fn download_response(
-    job: &DownloadJob,
-    response: reqwest::blocking::Response,
-    pb: ProgressBar,
-) -> Result<()> {
+fn download_url_to_path(url: &str, path: &Path, filename: &str, pb: &ProgressBar) -> Result<()> {
+    let response = reqwest::blocking::get(url)?;
+    let response = response.error_for_status()?;
     let total_size = response.content_length().unwrap_or(0);
 
     pb.set_style(download_progress_style()?);
     pb.set_length(total_size);
-    pb.set_message(format_progress_name(&job.filename));
+    pb.set_message(format_progress_name(filename));
 
-    if let Some(parent) = job.path.parent() {
+    if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
@@ -360,13 +975,7 @@ fn download_response(
     // concurrent duplicate jobs and rips pages out from under any existing
     // mmap of it (--force-download-symbols re-downloads loaded PDBs); a rename
     // leaves prior mappings on the old inode intact.
-    static DOWNLOAD_SEQ: AtomicU64 = AtomicU64::new(0);
-    let tmp_path = job.path.with_extension(format!(
-        "tmp-{}-{}",
-        std::process::id(),
-        DOWNLOAD_SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-
+    let tmp_path = unique_temp_path(path);
     let mut file = File::create(&tmp_path)?;
     let mut downloaded = pb.wrap_read(response);
 
@@ -376,10 +985,155 @@ fn download_response(
         let _ = std::fs::remove_file(&tmp_path);
         return Err(e.into());
     }
-    std::fs::rename(&tmp_path, &job.path)?;
-    pb.finish_and_clear();
-
+    std::fs::rename(&tmp_path, path)?;
     Ok(())
+}
+
+fn unique_temp_path(path: &Path) -> PathBuf {
+    static DOWNLOAD_SEQ: AtomicU64 = AtomicU64::new(0);
+    path.with_extension(format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        DOWNLOAD_SEQ.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+fn pdb_identity(path: &Path) -> Result<PdbIdentity> {
+    let file = File::open(path)?;
+    let mut pdb = pdb2::PDB::open(file)?;
+    let info = pdb.pdb_information()?;
+    Ok(PdbIdentity {
+        guid: info.guid.as_u128(),
+        age: info.age,
+    })
+}
+
+fn validate_pdb_identity(path: &Path, expected: PdbIdentity) -> std::result::Result<(), String> {
+    let actual = pdb_identity(path).map_err(|err| format!("invalid PDB: {err}"))?;
+    expected.matches(actual)
+}
+
+fn local_source_candidates(root: &Path, server_name: &str, identity: PdbIdentity) -> Vec<PathBuf> {
+    vec![
+        root.join(server_name),
+        root.join(server_name)
+            .join(identity.symbol_store_key())
+            .join(server_name),
+    ]
+}
+
+fn install_local_pdb(source: &Path, destination: &Path) -> Result<()> {
+    if source == destination {
+        return Ok(());
+    }
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp_path = unique_temp_path(destination);
+    if let Err(err) = std::fs::copy(source, &tmp_path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err.into());
+    }
+    std::fs::rename(tmp_path, destination)?;
+    Ok(())
+}
+
+fn resolve_pdb_job(job: &DownloadJob, request: &PdbRequest, pb: ProgressBar) -> Result<()> {
+    let mut attempts = Vec::new();
+    let mut seen_paths = HashSet::new();
+    let force = *FORCE_DOWNLOADS.get_or_init(|| false);
+
+    for source in &request.sources {
+        match source {
+            SymbolSource::Cache => {
+                if force {
+                    attempts.push(format!("{}: skipped by force-download", source));
+                    continue;
+                }
+                let candidates = std::iter::once(job.path.clone()).chain(
+                    job.path.parent().into_iter().flat_map(|root| {
+                        local_source_candidates(root, &request.server_name, request.identity)
+                    }),
+                );
+                for candidate in candidates {
+                    if !seen_paths.insert(candidate.clone()) {
+                        continue;
+                    }
+                    if !candidate.is_file() {
+                        attempts.push(format!("{}: not found", candidate.display()));
+                        continue;
+                    }
+                    match validate_pdb_identity(&candidate, request.identity) {
+                        Ok(()) => {
+                            install_local_pdb(&candidate, &job.path)?;
+                            return Ok(());
+                        }
+                        Err(reason) => {
+                            attempts.push(format!("{}: {}", candidate.display(), reason))
+                        }
+                    }
+                }
+            }
+            SymbolSource::LocalDirectory(root) => {
+                for candidate in
+                    local_source_candidates(root, &request.server_name, request.identity)
+                {
+                    if !seen_paths.insert(candidate.clone()) {
+                        continue;
+                    }
+                    if !candidate.is_file() {
+                        attempts.push(format!("{}: not found", candidate.display()));
+                        continue;
+                    }
+                    match validate_pdb_identity(&candidate, request.identity) {
+                        Ok(()) => {
+                            install_local_pdb(&candidate, &job.path)?;
+                            return Ok(());
+                        }
+                        Err(reason) => {
+                            attempts.push(format!("{}: {}", candidate.display(), reason))
+                        }
+                    }
+                }
+            }
+            SymbolSource::Http(root) => {
+                let url = format!(
+                    "{}/{}/{}/{}",
+                    root.trim_end_matches('/'),
+                    request.server_name,
+                    request.identity.symbol_store_key(),
+                    request.server_name
+                );
+                let tmp_path = unique_temp_path(&job.path);
+                match download_url_to_path(&url, &tmp_path, &job.filename, &pb) {
+                    Ok(()) => match validate_pdb_identity(&tmp_path, request.identity) {
+                        Ok(()) => {
+                            if let Some(parent) = job.path.parent() {
+                                std::fs::create_dir_all(parent)?;
+                            }
+                            std::fs::rename(&tmp_path, &job.path)?;
+                            pb.finish_and_clear();
+                            return Ok(());
+                        }
+                        Err(reason) => {
+                            let _ = std::fs::remove_file(&tmp_path);
+                            attempts.push(format!("{}: {}", url, reason));
+                        }
+                    },
+                    Err(err) => {
+                        let _ = std::fs::remove_file(&tmp_path);
+                        attempts.push(format!("{}: {}", url, err));
+                    }
+                }
+            }
+        }
+    }
+
+    pb.finish_and_clear();
+    Err(Error::DebugInfo(format!(
+        "no matching PDB found; attempted {}",
+        attempts.join("; ")
+    )))
 }
 
 pub fn download_jobs_parallel(jobs: Vec<DownloadJob>) -> Vec<Result<PathBuf>> {
@@ -387,10 +1141,6 @@ pub fn download_jobs_parallel(jobs: Vec<DownloadJob>) -> Vec<Result<PathBuf>> {
 
     jobs.into_par_iter()
         .map(|job| {
-            if !job.needs_download() {
-                return Ok(job.path);
-            }
-
             let mp = Arc::clone(&mp);
             download_job(&job, mp.add(ProgressBar::new(0))).map(|_| job.path)
         })
@@ -593,6 +1343,214 @@ impl Default for SymbolStore {
     }
 }
 
+fn insert_symbol_rva(
+    rvas: &mut HashMap<String, Vec<IndexedSymbol>>,
+    name: String,
+    rva: u32,
+    visibility: SymbolVisibility,
+    compiland: Option<String>,
+) {
+    let records = rvas.entry(name).or_default();
+    if records.iter().any(|record| {
+        record.rva == rva && record.visibility == visibility && record.compiland == compiland
+    }) {
+        return;
+    }
+    records.push(IndexedSymbol {
+        rva,
+        visibility,
+        compiland,
+    });
+}
+
+fn preferred_symbol_records(records: &[IndexedSymbol]) -> Vec<&IndexedSymbol> {
+    let has_public = records
+        .iter()
+        .any(|record| record.visibility == SymbolVisibility::Public);
+    records
+        .iter()
+        .filter(|record| !has_public || record.visibility == SymbolVisibility::Public)
+        .collect()
+}
+
+fn record_index_diagnostic(
+    diagnostics: &mut Vec<SymbolIndexDiagnostic>,
+    phase: &'static str,
+    compiland: Option<&str>,
+    message: impl Into<String>,
+) {
+    const DIAGNOSTIC_LIMIT: usize = 64;
+    if diagnostics.len() < DIAGNOSTIC_LIMIT {
+        diagnostics.push(SymbolIndexDiagnostic {
+            phase,
+            compiland: compiland.map(str::to_string),
+            message: message.into(),
+        });
+    }
+}
+
+fn lookup_source_line(lines: &[SourceLineEntry], rva: u32) -> Option<SourceLocation> {
+    let index = lines
+        .partition_point(|line| line.rva <= rva)
+        .checked_sub(1)?;
+    let line = &lines[index];
+    let covered = match line.length {
+        Some(length) => rva < line.rva.saturating_add(length),
+        None => lines.get(index + 1).is_some_and(|next| rva < next.rva) || rva == line.rva,
+    };
+    covered.then(|| line.location.clone())
+}
+
+fn source_file_matches(recorded: &str, query: &str) -> bool {
+    let recorded = recorded.replace('\\', "/");
+    let query = query.replace('\\', "/");
+    if query.contains('/') {
+        recorded.eq_ignore_ascii_case(&query)
+    } else {
+        recorded
+            .rsplit('/')
+            .next()
+            .is_some_and(|name| name.eq_ignore_ascii_case(&query))
+    }
+}
+
+#[cfg(test)]
+fn live_range_contains(start_rva: u32, length: u16, gaps: &[(u16, u16)], target_rva: u32) -> bool {
+    let Some(relative) = target_rva.checked_sub(start_rva) else {
+        return false;
+    };
+    relative < u32::from(length)
+        && !gaps.iter().any(|(start, length)| {
+            relative >= u32::from(*start)
+                && relative < u32::from(*start).saturating_add(u32::from(*length))
+        })
+}
+
+fn pdb_register_name(register: pdb2::Register, cpu: Option<pdb2::CPUType>) -> String {
+    let Some(cpu) = cpu else {
+        return format!("cvreg{}", register.0);
+    };
+    let Ok(register) = pdb2::register::Register::new(register, cpu) else {
+        return format!("cvreg{}", register.0);
+    };
+    let display = register.to_string();
+    display
+        .split_once('(')
+        .and_then(|(_, rest)| rest.strip_suffix(')'))
+        .unwrap_or(&display)
+        .to_ascii_lowercase()
+}
+
+fn pdb_live_range_contains(
+    range: &pdb2::AddressRange,
+    gaps: &[pdb2::AddressGap],
+    address_map: &pdb2::AddressMap,
+    target_rva: u32,
+) -> bool {
+    let Some(start) = range.offset.to_rva(address_map) else {
+        return false;
+    };
+    let Some(relative) = target_rva.checked_sub(start.0) else {
+        return false;
+    };
+    relative < u32::from(range.cb_range)
+        && !gaps.iter().any(|gap| {
+            relative >= u32::from(gap.gap_start_offset)
+                && relative
+                    < u32::from(gap.gap_start_offset).saturating_add(u32::from(gap.cb_range))
+        })
+}
+
+fn safe_source_relative_path(relative: &str) -> Option<PathBuf> {
+    let mut path = PathBuf::new();
+    for component in relative
+        .split('/')
+        .filter(|component| !component.is_empty())
+    {
+        if matches!(component, "." | "..") || component.contains(':') {
+            return None;
+        }
+        path.push(component);
+    }
+    (!path.as_os_str().is_empty()).then_some(path)
+}
+
+fn source_candidate_is_contained_file(root: &Path, candidate: &Path) -> bool {
+    let Ok(root) = root.canonicalize() else {
+        return false;
+    };
+    let Ok(candidate) = candidate.canonicalize() else {
+        return false;
+    };
+    candidate.is_file() && candidate.starts_with(root)
+}
+
+fn remap_source_file(recorded: &str, mappings: &[SourcePathMapping]) -> (Option<PathBuf>, bool) {
+    let normalized = recorded.replace('\\', "/");
+    let lowered = normalized.to_ascii_lowercase();
+    let mut first_candidate = None;
+    for mapping in mappings {
+        let relative = match &mapping.recorded_prefix {
+            Some(prefix) => {
+                let prefix = prefix.replace('\\', "/");
+                let prefix_lower = prefix.to_ascii_lowercase();
+                if !lowered.starts_with(&prefix_lower)
+                    || (normalized.len() != prefix.len()
+                        && normalized.as_bytes().get(prefix.len()) != Some(&b'/'))
+                {
+                    continue;
+                }
+                normalized[prefix.len()..].trim_start_matches('/')
+            }
+            None => normalized.rsplit('/').next().unwrap_or(&normalized),
+        };
+        let Some(relative) = safe_source_relative_path(relative) else {
+            continue;
+        };
+        let candidate = mapping.local_root.join(relative);
+        if first_candidate.is_none() {
+            first_candidate = Some(candidate.clone());
+        }
+        if source_candidate_is_contained_file(&mapping.local_root, &candidate) {
+            return (Some(candidate), true);
+        }
+    }
+    (first_candidate, false)
+}
+
+// CodeView kinds consumed by the private address index. pdb2 keeps these
+// constants private, so keep the upstream S_* names beside their wire values.
+fn is_private_address_symbol_kind(kind: u16) -> bool {
+    matches!(
+        kind,
+        0x1007 // S_LDATA32_ST
+            | 0x1008 // S_GDATA32_ST
+            | 0x100a // S_LPROC32_ST
+            | 0x100b // S_GPROC32_ST
+            | 0x1020 // S_LMANDATA_ST
+            | 0x1021 // S_GMANDATA_ST
+            | 0x110c // S_LDATA32
+            | 0x110d // S_GDATA32
+            | 0x110f // S_LPROC32
+            | 0x1110 // S_GPROC32
+            | 0x111c // S_LMANDATA
+            | 0x111d // S_GMANDATA
+            | 0x1146 // S_LPROC32_ID
+            | 0x1147 // S_GPROC32_ID
+            | 0x1155 // S_LPROC32_DPC
+            | 0x1156 // S_LPROC32_DPC_ID
+    )
+}
+
+// pdb2 0.10.1 debug-asserts on valid Windows S_CALLEES/S_CALLERS records whose
+// optional invocation-count tail is longer than the function list. Neither
+// record contributes addresses or local-variable state, so never parse them.
+const PDB_S_CALLEES: u16 = 0x115a;
+const PDB_S_CALLERS: u16 = 0x115b;
+
+fn is_pdb2_function_list_symbol(kind: u16) -> bool {
+    matches!(kind, PDB_S_CALLEES | PDB_S_CALLERS)
+}
 impl SymbolStore {
     fn module_key(dtb: Dtb, base_address: VirtAddr) -> (Dtb, u64) {
         (dtb, base_address.0)
@@ -602,16 +1560,65 @@ impl SymbolStore {
         Self {
             pdbs: DashMap::new(),
             mmaps: DashMap::new(),
+            pdb_ages: DashMap::new(),
+            index_build_results: DashMap::new(),
             index: DashMap::new(),
             index_types: DashMap::new(),
             index_enums: DashMap::new(),
             symbol_rvas: DashMap::new(),
+            source_lines: DashMap::new(),
+            index_diagnostics: DashMap::new(),
             type_cache: DashMap::new(),
             modules: DashMap::new(),
             module_status: DashMap::new(),
             module_source: DashMap::new(),
+            sources: RwLock::new(Self::default_symbol_sources()),
+            source_paths: RwLock::new(Vec::new()),
             kernel_guid: Mutex::new(None),
         }
+    }
+
+    pub fn index_diagnostics(&self, guid: u128) -> Vec<SymbolIndexDiagnostic> {
+        self.index_diagnostics
+            .get(&guid)
+            .map(|diagnostics| diagnostics.clone())
+            .unwrap_or_default()
+    }
+
+    fn default_symbol_sources() -> Vec<SymbolSource> {
+        symbol_sources_from_servers(pdb_servers())
+    }
+
+    pub fn symbol_sources(&self) -> Vec<SymbolSource> {
+        self.sources.read().clone()
+    }
+
+    pub fn set_symbol_sources(&self, sources: Vec<SymbolSource>) {
+        *self.sources.write() = sources;
+    }
+
+    pub fn append_symbol_source(&self, source: SymbolSource) {
+        self.sources.write().push(source);
+    }
+
+    pub fn reset_symbol_sources(&self) {
+        *self.sources.write() = Self::default_symbol_sources();
+    }
+
+    pub fn source_paths(&self) -> Vec<SourcePathMapping> {
+        self.source_paths.read().clone()
+    }
+
+    pub fn set_source_paths(&self, paths: Vec<SourcePathMapping>) {
+        *self.source_paths.write() = paths;
+    }
+
+    pub fn append_source_path(&self, path: SourcePathMapping) {
+        self.source_paths.write().push(path);
+    }
+
+    pub fn reset_source_paths(&self) {
+        self.source_paths.write().clear();
     }
 
     /// Record the kernel module's guid so type/enum layout lookups can prefer it
@@ -653,7 +1660,45 @@ impl SymbolStore {
         }
     }
 
-    pub fn retain_modules_for_dtb(&self, dtb: Dtb, live_modules: &[ModuleInfo]) {
+    /// Forget selected module registrations and evict PDBs no longer used by
+    /// another loaded module, so a subsequent load re-runs source selection and
+    /// indexing.
+    pub fn invalidate_modules(&self, dtb: Dtb, base_addresses: &[VirtAddr]) {
+        let keys = base_addresses
+            .iter()
+            .map(|base| Self::module_key(dtb, *base))
+            .collect::<Vec<_>>();
+        let mut candidate_guids = HashSet::new();
+        for key in &keys {
+            if let Some((_, module)) = self.modules.remove(key) {
+                candidate_guids.insert(module.guid);
+            }
+            self.module_status.remove(key);
+            self.module_source.remove(key);
+        }
+
+        for guid in candidate_guids {
+            if self.modules.iter().any(|module| module.guid == guid) {
+                continue;
+            }
+            if let Some((_, pdb)) = self.pdbs.remove(&guid) {
+                drop(pdb);
+            }
+            self.mmaps.remove(&guid);
+            self.pdb_ages.remove(&guid);
+            self.index_build_results.remove(&guid);
+            self.index.remove(&guid);
+            self.index_types.remove(&guid);
+            self.index_enums.remove(&guid);
+            self.symbol_rvas.remove(&guid);
+            self.source_lines.remove(&guid);
+            self.index_diagnostics.remove(&guid);
+            self.type_cache
+                .retain(|(cached_guid, _), _| *cached_guid != guid);
+        }
+    }
+
+    pub fn retain_modules_for_dtb(&self, dtb: Dtb, live_modules: &[ModuleInfo]) -> usize {
         let live_bases = live_modules
             .iter()
             .map(|module| module.base_address.0)
@@ -667,6 +1712,7 @@ impl SymbolStore {
                     .then_some(*module.key())
             })
             .collect();
+        let removed = module_keys.len();
         for key in module_keys {
             self.modules.remove(&key);
         }
@@ -694,6 +1740,7 @@ impl SymbolStore {
         for key in source_keys {
             self.module_source.remove(&key);
         }
+        removed
     }
 
     pub fn set_module_symbol_status(
@@ -717,6 +1764,15 @@ impl SymbolStore {
         self.module_status
             .get(&Self::module_key(dtb, base_address))
             .map(|status| status.clone())
+    }
+
+    pub fn module_pdb_identity(&self, dtb: Dtb, base_address: VirtAddr) -> Option<PdbIdentity> {
+        let module = self.modules.get(&Self::module_key(dtb, base_address))?;
+        let age = *self.pdb_ages.get(&module.guid)?;
+        Some(PdbIdentity {
+            guid: module.guid,
+            age,
+        })
     }
 
     pub fn set_module_symbol_source(
@@ -784,6 +1840,7 @@ impl SymbolStore {
     }
 
     fn read_codeview_from_memory<B: MemoryOps<PhysAddr>>(
+        &self,
         memory: &memory::AddressSpace<'_, B>,
         base_address: VirtAddr,
         entry: &IMAGE_DEBUG_DIRECTORY,
@@ -812,7 +1869,7 @@ impl SymbolStore {
                 let path =
                     Self::read_c_string_lossy(&bytes[size_of::<IMAGE_DEBUG_CV_INFO_PDB70>()..]);
                 let summary = format!("CodeView RSDS age={} path={}", image.Age, path);
-                let job = Self::build_download_job(&path, image.Signature, image.Age)?;
+                let job = self.build_download_job(&path, image.Signature, image.Age)?;
                 Ok((summary, Some(job)))
             }
             b"NB10" => {
@@ -836,6 +1893,7 @@ impl SymbolStore {
     }
 
     fn build_download_job(
+        &self,
         pdb_file_name: &str,
         guid: GUID,
         age: u32,
@@ -876,6 +1934,11 @@ impl SymbolStore {
             urls,
             path,
             filename: format!("{}.pdb", stem),
+            pdb: Some(PdbRequest {
+                identity: PdbIdentity { guid, age },
+                server_name: server_name.to_string(),
+                sources: self.symbol_sources(),
+            }),
         };
 
         Ok((job, guid))
@@ -915,6 +1978,7 @@ impl SymbolStore {
             urls,
             path,
             filename: server_name.to_string(),
+            pdb: None,
         })
     }
 
@@ -927,11 +1991,18 @@ impl SymbolStore {
     // NOTE dont check for more than 1 CV entry, there shouldn't be more than 1
     pub fn load_from_binary(&self, object: &mut WinObject, name: &str) -> Result<Option<u128>> {
         let view = object.view().ok_or(Error::ViewFailed)?;
+        if name.eq_ignore_ascii_case("ntoskrnl.exe") && view.file_header().Machine != 0x8664 {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "kernel image {} (machine {:#06x})",
+                name,
+                view.file_header().Machine
+            )));
+        }
         let debug = view.debug()?;
 
-        if let Some((job, guid)) = Self::download_job_from_debug(&debug)? {
+        if let Some((job, guid)) = self.download_job_from_debug(&debug)? {
             download_job(&job, ProgressBar::new(0))?;
-            self.ensure_pdb_loaded(guid, &job.path)?;
+            self.ensure_pdb_loaded(job.expected_identity().unwrap(), &job.path)?;
 
             let module_key = Self::module_key(object.dtb(), object.base_address);
             if !self.modules.contains_key(&module_key) {
@@ -969,13 +2040,13 @@ impl SymbolStore {
         let image_job = Self::build_image_download_job(name, time_date_stamp, size_of_image)?;
         download_job(&image_job, ProgressBar::new(0))?;
 
-        let Some((pdb_job, guid)) = Self::extract_download_job_from_image_file(&image_job.path)?
+        let Some((pdb_job, guid)) = self.extract_download_job_from_image_file(&image_job.path)?
         else {
             return Ok(None);
         };
 
         download_job(&pdb_job, ProgressBar::new(0))?;
-        self.ensure_pdb_loaded(guid, &pdb_job.path)?;
+        self.ensure_pdb_loaded(pdb_job.expected_identity().unwrap(), &pdb_job.path)?;
 
         let module_key = Self::module_key(dtb, base_address);
         if !self.modules.contains_key(&module_key) {
@@ -998,14 +2069,19 @@ impl SymbolStore {
         self.pdbs.contains_key(&guid)
     }
 
+    pub fn has_matching_pdb(&self, job: &DownloadJob) -> bool {
+        job.matches_loaded_identity(&self.pdb_ages)
+    }
+
     pub fn extract_download_job<B: MemoryOps<PhysAddr>>(
+        &self,
         backend: &B,
         dtb: Dtb,
         module_name: &str,
         base_address: VirtAddr,
     ) -> Result<ModuleSymbolDiscovery> {
         let addr_space = memory::AddressSpace::new(backend, dtb);
-        match Self::extract_download_job_from_memory(&addr_space, base_address) {
+        match self.extract_download_job_from_memory(&addr_space, base_address) {
             Ok(Some((job, guid))) => Ok(ModuleSymbolDiscovery::Ready {
                 job,
                 guid,
@@ -1035,7 +2111,7 @@ impl SymbolStore {
             return Ok(());
         }
 
-        self.ensure_pdb_loaded(load.guid, &load.job.path)?;
+        self.ensure_pdb_loaded(load.job.expected_identity().unwrap(), &load.job.path)?;
         self.modules.insert(module_key, load.loaded_module());
         self.set_module_symbol_status(
             load.dtb,
@@ -1048,6 +2124,7 @@ impl SymbolStore {
     }
 
     fn download_job_from_debug<'a, P>(
+        &self,
         debug: &pelite::pe64::debug::Debug<'a, P>,
     ) -> Result<Option<(DownloadJob, u128)>>
     where
@@ -1065,7 +2142,7 @@ impl SymbolStore {
                     {
                         let pdb_path = pdb_file_name.to_string();
                         let (job, guid) =
-                            Self::build_download_job(&pdb_path, image.Signature, image.Age)?;
+                            self.build_download_job(&pdb_path, image.Signature, image.Age)?;
                         return Ok(Some((job, guid)));
                     }
                 }
@@ -1085,6 +2162,7 @@ impl SymbolStore {
     }
 
     fn extract_download_job_from_memory<B: MemoryOps<PhysAddr>>(
+        &self,
         memory: &memory::AddressSpace<'_, B>,
         base_address: VirtAddr,
     ) -> Result<Option<(DownloadJob, u128)>> {
@@ -1101,7 +2179,7 @@ impl SymbolStore {
                 continue;
             }
 
-            let (_, job) = Self::read_codeview_from_memory(memory, base_address, &entry)?;
+            let (_, job) = self.read_codeview_from_memory(memory, base_address, &entry)?;
             if let Some(job) = job {
                 return Ok(Some(job));
             }
@@ -1122,13 +2200,14 @@ impl SymbolStore {
     }
 
     pub fn extract_download_job_from_image_file(
+        &self,
         image_path: &Path,
     ) -> Result<Option<(DownloadJob, u128)>> {
         let file = File::open(image_path)?;
         let mmap = unsafe { Mmap::map(&file)? };
         let pe = PeFile::from_bytes(&mmap[..])?;
         let debug = pe.debug()?;
-        Self::download_job_from_debug(&debug)
+        self.download_job_from_debug(&debug)
     }
 
     fn read_image_lookup_info<B: MemoryOps<PhysAddr>>(
@@ -1144,9 +2223,29 @@ impl SymbolStore {
         ))
     }
 
-    fn ensure_pdb_loaded(&self, guid: u128, path: &Path) -> Result<()> {
-        if self.pdbs.contains_key(&guid) {
-            return Ok(());
+    fn ensure_index_built(&self, guid: u128) -> Result<()> {
+        let state = self
+            .index_build_results
+            .entry(guid)
+            .or_insert_with(|| Arc::new(OnceLock::new()))
+            .clone();
+        match state.get_or_init(|| self.build_index(guid).map_err(|error| error.to_string())) {
+            Ok(()) => Ok(()),
+            Err(message) => Err(Error::DebugInfo(format!("PDB indexing failed: {message}"))),
+        }
+    }
+
+    fn ensure_pdb_loaded(&self, expected: PdbIdentity, path: &Path) -> Result<()> {
+        if let Some(age) = self.pdb_ages.get(&expected.guid) {
+            let validation = expected
+                .matches(PdbIdentity {
+                    guid: expected.guid,
+                    age: *age,
+                })
+                .map_err(Error::DebugInfo);
+            drop(age);
+            validation?;
+            return self.ensure_index_built(expected.guid);
         }
 
         if !path.exists() {
@@ -1160,7 +2259,13 @@ impl SymbolStore {
 
         let static_slice: &'static [u8] = unsafe { std::mem::transmute(mmap_slice) };
         let cursor = Cursor::new(static_slice);
-        let pdb = pdb2::PDB::open(cursor)?;
+        let mut pdb = pdb2::PDB::open(cursor)?;
+        let info = pdb.pdb_information()?;
+        let actual = PdbIdentity {
+            guid: info.guid.as_u128(),
+            age: info.age,
+        };
+        expected.matches(actual).map_err(Error::DebugInfo)?;
 
         // Exactly one loader may win per guid: parallel loads of two modules
         // sharing a PDB both get past the contains_key fast path, and a plain
@@ -1168,16 +2273,33 @@ impl SymbolStore {
         // stored PDB's 'static cursor still points into (a cold-cache SIGSEGV).
         // The loser drops its own pdb+mmap pair instead. `build_index` takes
         // the pdbs shard again, so it must run after the entry guard drops.
-        match self.pdbs.entry(guid) {
-            Entry::Occupied(_) => return Ok(()),
+        match self.pdbs.entry(expected.guid) {
+            Entry::Occupied(_) => {
+                let matches = self
+                    .pdb_ages
+                    .get(&expected.guid)
+                    .and_then(|age| {
+                        expected
+                            .matches(PdbIdentity {
+                                guid: expected.guid,
+                                age: *age,
+                            })
+                            .ok()
+                    })
+                    .is_some();
+                if !matches {
+                    return Err(Error::DebugInfo(
+                        "a non-matching PDB won a concurrent load".to_string(),
+                    ));
+                }
+            }
             Entry::Vacant(entry) => {
-                self.mmaps.insert(guid, mmap);
+                self.mmaps.insert(expected.guid, mmap);
+                self.pdb_ages.insert(expected.guid, actual.age);
                 entry.insert(pdb.into());
             }
         }
-        self.build_index(guid);
-
-        Ok(())
+        self.ensure_index_built(expected.guid)
     }
 
     pub fn merged_symbol_index(&self, dtb: Option<Dtb>) -> SymbolIndex {
@@ -1349,24 +2471,24 @@ impl SymbolStore {
         }
     }
 
-    pub fn find_symbol_across_modules(&self, dtb: Dtb, symbol_name: &str) -> Option<VirtAddr> {
-        self.find_symbol_with_module(dtb, symbol_name)
-            .map(|(addr, _)| addr)
-    }
-
-    /// Like `find_symbol_across_modules`, but also returns the resolving
-    /// module's short name (for namespaced display, e.g. `nt!KiSwapThread`).
-    pub fn find_symbol_with_module(
+    pub fn find_symbol_across_modules(
         &self,
         dtb: Dtb,
         symbol_name: &str,
-    ) -> Option<(VirtAddr, String)> {
-        // `module!symbol` restricts the lookup to the named module (by short
-        // name, e.g. `nt!KiSwapThread`); a bare name matches in any module
+    ) -> Result<Option<VirtAddr>> {
+        self.find_symbol_with_module(dtb, symbol_name)
+            .map(|resolved| resolved.map(|(address, _)| address))
+    }
+
+    /// Return every PDB candidate for a symbol, retaining module, visibility,
+    /// and private-compiland provenance. `module!symbol` restricts the module;
+    /// a bare symbol searches the active address space.
+    pub fn find_symbol_candidates(&self, dtb: Dtb, symbol_name: &str) -> Vec<SymbolCandidate> {
         let (module_filter, name) = match symbol_name.split_once('!') {
             Some((module, name)) => (Some(module), name),
             None => (None, symbol_name),
         };
+        let mut candidates = Vec::new();
         for module in self.modules.iter() {
             if module.dtb != dtb {
                 continue;
@@ -1377,11 +2499,69 @@ impl SymbolStore {
             {
                 continue;
             }
-            if let Some(rva) = self.symbol_rva(module.guid, name) {
-                return Some((module.base_address + rva as u64, short));
+            for record in self.symbol_records(module.guid, name) {
+                candidates.push(SymbolCandidate {
+                    module: short.clone(),
+                    address: module.base_address + u64::from(record.rva),
+                    visibility: record.visibility,
+                    compiland: record.compiland,
+                });
             }
         }
-        None
+        candidates.sort_by(|left, right| {
+            left.module
+                .to_ascii_lowercase()
+                .cmp(&right.module.to_ascii_lowercase())
+                .then_with(|| left.address.0.cmp(&right.address.0))
+                .then_with(|| left.compiland.cmp(&right.compiland))
+        });
+        candidates
+    }
+
+    /// Resolve one unambiguous symbol and retain its module for display.
+    pub fn find_symbol_with_module(
+        &self,
+        dtb: Dtb,
+        symbol_name: &str,
+    ) -> Result<Option<(VirtAddr, String)>> {
+        let candidates = self.find_symbol_candidates(dtb, symbol_name);
+        let unique_locations: HashSet<(String, u64)> = candidates
+            .iter()
+            .map(|candidate| (candidate.module.to_ascii_lowercase(), candidate.address.0))
+            .collect();
+        if unique_locations.is_empty() {
+            return Ok(None);
+        }
+        if unique_locations.len() == 1 {
+            let candidate = &candidates[0];
+            return Ok(Some((candidate.address, candidate.module.clone())));
+        }
+
+        let display_name = symbol_name
+            .rsplit_once('!')
+            .map(|(_, name)| name)
+            .unwrap_or(symbol_name);
+        let labels = candidates
+            .iter()
+            .map(|candidate| {
+                let visibility = match candidate.visibility {
+                    SymbolVisibility::Public => "public".to_string(),
+                    SymbolVisibility::Private => candidate
+                        .compiland
+                        .as_deref()
+                        .map(|compiland| format!("private in {compiland}"))
+                        .unwrap_or_else(|| "private".to_string()),
+                };
+                format!(
+                    "{}!{} at {:#x} ({visibility})",
+                    candidate.module, display_name, candidate.address.0
+                )
+            })
+            .collect();
+        Err(Error::AmbiguousSymbol {
+            name: symbol_name.to_string(),
+            candidates: labels,
+        })
     }
 
     /// Fuzzy-search symbol names within a single module (by short name, e.g.
@@ -1440,50 +2620,664 @@ impl SymbolStore {
             .map(|module| module.clone())
     }
 
-    fn build_index(&self, guid: u128) -> Option<()> {
-        let pdb = self.pdbs.get_mut(&guid)?;
+    /// Resolve the module containing `address`, preferring the active address
+    /// space and then consulting an explicit fallback such as the kernel DTB.
+    pub fn find_module_for_address_in_context(
+        &self,
+        primary_dtb: Dtb,
+        fallback_dtb: Dtb,
+        address: VirtAddr,
+    ) -> Option<LoadedModule> {
+        self.find_module_for_address(primary_dtb, address)
+            .or_else(|| {
+                (fallback_dtb != primary_dtb)
+                    .then(|| self.find_module_for_address(fallback_dtb, address))
+                    .flatten()
+            })
+    }
+
+    /// Resolve a virtual address to cached C13 source information.
+    pub fn source_location(&self, dtb: Dtb, address: VirtAddr) -> Option<SourceLocation> {
+        let module = self.find_module_for_address(dtb, address)?;
+        let rva = u32::try_from(address.0.checked_sub(module.base_address.0)?).ok()?;
+        let lines = self.source_lines.get(&module.guid)?;
+        let mut location = lookup_source_line(&lines, rva)?;
+        let (local_path, local_exists) =
+            remap_source_file(&location.file, &self.source_paths.read());
+        location.local_path = local_path;
+        location.local_exists = local_exists;
+        Some(location)
+    }
+
+    /// Resolve a PDB source file and line to every loaded address in the
+    /// selected address space. A bare filename matches any recorded basename;
+    /// a path matches the full recorded path case-insensitively.
+    pub fn source_addresses(&self, dtb: Dtb, file: &str, line: u32) -> Vec<VirtAddr> {
+        let mut addresses = Vec::new();
+        let mappings = self.source_paths.read();
+        for module in self.modules.iter() {
+            if module.dtb != dtb {
+                continue;
+            }
+            let Some(lines) = self.source_lines.get(&module.guid) else {
+                continue;
+            };
+            addresses.extend(
+                lines
+                    .iter()
+                    .filter(|entry| {
+                        if entry.location.line != line {
+                            return false;
+                        }
+                        if source_file_matches(&entry.location.file, file) {
+                            return true;
+                        }
+                        remap_source_file(&entry.location.file, &mappings)
+                            .0
+                            .is_some_and(|candidate| {
+                                candidate.to_string_lossy().eq_ignore_ascii_case(file)
+                            })
+                    })
+                    .map(|entry| module.base_address + u64::from(entry.rva)),
+            );
+        }
+        addresses.sort_by_key(|address| address.0);
+        addresses.dedup();
+        addresses
+    }
+
+    fn procedure_local(
+        &self,
+        finder: &TypeFinder<'_>,
+        name: String,
+        type_index: TypeIndex,
+        is_parameter: bool,
+        location: LocalVariableLocation,
+    ) -> ProcedureLocal {
+        ProcedureLocal {
+            name,
+            type_name: self
+                .resolve_type(finder, type_index)
+                .map(|parsed| parsed.to_string())
+                .unwrap_or_else(|_| format!("type({:#x})", type_index.0)),
+            byte_size: self.type_size(finder, type_index, 8).ok(),
+            is_parameter,
+            location,
+        }
+    }
+
+    /// Return locals and parameters belonging to the procedure that covers
+    /// `address`. Definition ranges are filtered against the requested RVA and
+    /// gaps. Unsupported DIA recipes and split locations remain explicit
+    /// `Unavailable` entries rather than guessed values.
+    pub fn procedure_locals(
+        &self,
+        dtb: Dtb,
+        address: VirtAddr,
+    ) -> Result<Option<Vec<ProcedureLocal>>> {
+        let Some(module) = self.find_module_for_address(dtb, address) else {
+            return Ok(None);
+        };
+        let Some(relative) = address.0.checked_sub(module.base_address.0) else {
+            return Ok(None);
+        };
+        let Ok(target_rva) = u32::try_from(relative) else {
+            return Ok(None);
+        };
+        let Some(pdb) = self.pdbs.get_mut(&module.guid) else {
+            return Ok(None);
+        };
         let mut pdb_lock = pdb.lock();
-        let symbol_table = pdb_lock.global_symbols().ok()?;
-        let address_map = pdb_lock.address_map().ok()?;
-        let mut symbols = symbol_table.iter();
+        let address_map = pdb_lock.address_map()?;
 
-        let mut strings: Vec<String> = Vec::new();
-        let mut rvas: HashMap<String, u32> = HashMap::new();
+        let type_information = pdb_lock.type_information()?;
+        let mut finder = type_information.finder();
+        let mut types = type_information.iter();
+        while types.next()?.is_some() {
+            finder.update(&types);
+        }
 
-        while let Some(symbol) = symbols.next().ok()? {
-            if let Ok(pdb2::SymbolData::Public(data)) = symbol.parse() {
-                let name: String = data.name.to_string().into();
-                if let Some(rva) = data.offset.to_rva(&address_map) {
-                    rvas.insert(name.clone(), rva.0);
+        let debug_information = pdb_lock.debug_information()?;
+        let mut modules = debug_information.modules()?;
+        while let Some(dbi_module) = modules.next()? {
+            let Some(module_info) = pdb_lock.module_info(&dbi_module)? else {
+                continue;
+            };
+            let mut symbols = module_info.symbols()?;
+
+            let mut procedure_end = None;
+            let mut block_scopes: Vec<(pdb2::SymbolIndex, bool)> = Vec::new();
+            let mut locals = Vec::new();
+            let mut current_local = None;
+            let mut current_optimized_out = false;
+            let mut cpu_type = None;
+
+            while let Some(symbol) = symbols.next()? {
+                if let Some(end) = procedure_end {
+                    if symbol.index() == end {
+                        return Ok(Some(locals));
+                    }
+                    while block_scopes
+                        .last()
+                        .is_some_and(|(block_end, _)| *block_end == symbol.index())
+                    {
+                        block_scopes.pop();
+                    }
                 }
-                strings.push(name);
+
+                if is_pdb2_function_list_symbol(symbol.raw_kind()) {
+                    continue;
+                }
+                let data = symbol.parse()?;
+                if let pdb2::SymbolData::CompileFlags(compile) = &data {
+                    cpu_type = Some(compile.cpu_type);
+                }
+                if procedure_end.is_none() {
+                    let pdb2::SymbolData::Procedure(procedure) = data else {
+                        continue;
+                    };
+                    let Some(start) = procedure.offset.to_rva(&address_map) else {
+                        continue;
+                    };
+                    if target_rva >= start.0 && target_rva < start.0.saturating_add(procedure.len) {
+                        procedure_end = Some(procedure.end);
+                    }
+                    continue;
+                }
+
+                let visible = block_scopes.iter().all(|(_, contains)| *contains);
+                match data {
+                    pdb2::SymbolData::Block(block) => {
+                        let contains = block.offset.to_rva(&address_map).is_some_and(|start| {
+                            target_rva >= start.0 && target_rva < start.0.saturating_add(block.len)
+                        });
+                        block_scopes.push((block.end, contains));
+                        current_local = None;
+                    }
+                    pdb2::SymbolData::Local(local) if visible => {
+                        current_optimized_out = local.flags.isoptimizedout;
+                        let reason = if current_optimized_out {
+                            "optimized out"
+                        } else {
+                            "not live at this address"
+                        };
+                        locals.push(self.procedure_local(
+                            &finder,
+                            local.name.to_string().into(),
+                            local.type_index,
+                            local.flags.isparam,
+                            LocalVariableLocation::Unavailable {
+                                reason: reason.to_string(),
+                            },
+                        ));
+                        current_local = Some(locals.len() - 1);
+                    }
+                    pdb2::SymbolData::Local(_) => {
+                        current_local = None;
+                        current_optimized_out = false;
+                    }
+                    pdb2::SymbolData::DefRangeRegister(range)
+                        if !current_optimized_out
+                            && current_local.is_some()
+                            && pdb_live_range_contains(
+                                &range.range,
+                                &range.gaps,
+                                &address_map,
+                                target_rva,
+                            ) =>
+                    {
+                        let location = if range.flags.maybe {
+                            LocalVariableLocation::Unavailable {
+                                reason: format!(
+                                    "conditionally available in {}",
+                                    pdb_register_name(range.register, cpu_type)
+                                ),
+                            }
+                        } else {
+                            LocalVariableLocation::Register {
+                                register: pdb_register_name(range.register, cpu_type),
+                            }
+                        };
+                        locals[current_local.unwrap()].location = location;
+                    }
+                    pdb2::SymbolData::DefRangeRegisterRelative(range)
+                        if !current_optimized_out
+                            && current_local.is_some()
+                            && pdb_live_range_contains(
+                                &range.range,
+                                &range.gaps,
+                                &address_map,
+                                target_rva,
+                            ) =>
+                    {
+                        locals[current_local.unwrap()].location =
+                            if range.spilled_udt_member == 0 && range.offset_parent == 0 {
+                                LocalVariableLocation::RegisterRelative {
+                                    register: pdb_register_name(range.base_register, cpu_type),
+                                    offset: range.offset_base_pointer,
+                                }
+                            } else {
+                                LocalVariableLocation::Unavailable {
+                                    reason: "split register-relative location".to_string(),
+                                }
+                            };
+                    }
+                    pdb2::SymbolData::DefRangeFramePointerRelative(range)
+                        if !current_optimized_out
+                            && current_local.is_some()
+                            && pdb_live_range_contains(
+                                &range.range,
+                                &range.gaps,
+                                &address_map,
+                                target_rva,
+                            ) =>
+                    {
+                        locals[current_local.unwrap()].location =
+                            LocalVariableLocation::FrameRelative {
+                                offset: range.offset,
+                            };
+                    }
+                    pdb2::SymbolData::DefRangeFramePointerRelativeFullScope(range)
+                        if !current_optimized_out && current_local.is_some() =>
+                    {
+                        locals[current_local.unwrap()].location =
+                            LocalVariableLocation::FrameRelative {
+                                offset: range.offset,
+                            };
+                    }
+                    pdb2::SymbolData::DefRange(range)
+                        if !current_optimized_out
+                            && current_local.is_some()
+                            && pdb_live_range_contains(
+                                &range.range,
+                                &range.gaps,
+                                &address_map,
+                                target_rva,
+                            ) =>
+                    {
+                        locals[current_local.unwrap()].location =
+                            LocalVariableLocation::Unavailable {
+                                reason: format!(
+                                    "unsupported DIA location program {}",
+                                    range.program
+                                ),
+                            };
+                    }
+                    pdb2::SymbolData::DefRangeSubField(range)
+                        if !current_optimized_out
+                            && current_local.is_some()
+                            && pdb_live_range_contains(
+                                &range.range,
+                                &range.gaps,
+                                &address_map,
+                                target_rva,
+                            ) =>
+                    {
+                        locals[current_local.unwrap()].location =
+                            LocalVariableLocation::Unavailable {
+                                reason: "split subfield location".to_string(),
+                            };
+                    }
+                    pdb2::SymbolData::DefRangeSubFieldRegister(range)
+                        if !current_optimized_out
+                            && current_local.is_some()
+                            && pdb_live_range_contains(
+                                &range.range,
+                                &range.gaps,
+                                &address_map,
+                                target_rva,
+                            ) =>
+                    {
+                        locals[current_local.unwrap()].location =
+                            LocalVariableLocation::Unavailable {
+                                reason: "split subfield register location".to_string(),
+                            };
+                    }
+                    pdb2::SymbolData::RegisterVariable(variable) if visible => {
+                        locals.push(self.procedure_local(
+                            &finder,
+                            variable.name.to_string().into(),
+                            variable.type_index,
+                            variable.slot.is_some(),
+                            LocalVariableLocation::Register {
+                                register: pdb_register_name(variable.register, cpu_type),
+                            },
+                        ));
+                        current_local = None;
+                    }
+                    pdb2::SymbolData::RegisterRelative(variable) if visible => {
+                        locals.push(self.procedure_local(
+                            &finder,
+                            variable.name.to_string().into(),
+                            variable.type_index,
+                            variable.slot.is_some(),
+                            LocalVariableLocation::RegisterRelative {
+                                register: pdb_register_name(variable.register, cpu_type),
+                                offset: variable.offset,
+                            },
+                        ));
+                        current_local = None;
+                    }
+                    pdb2::SymbolData::BasePointerRelative(variable) if visible => {
+                        locals.push(self.procedure_local(
+                            &finder,
+                            variable.name.to_string().into(),
+                            variable.type_index,
+                            variable.slot.is_some(),
+                            LocalVariableLocation::FrameRelative {
+                                offset: variable.offset,
+                            },
+                        ));
+                        current_local = None;
+                    }
+                    pdb2::SymbolData::MultiRegisterVariable(variable) if visible => {
+                        if let Some((_, name)) = variable.registers.first() {
+                            locals.push(self.procedure_local(
+                                &finder,
+                                name.to_string().into(),
+                                variable.type_index,
+                                false,
+                                LocalVariableLocation::Unavailable {
+                                    reason: "value spans multiple registers".to_string(),
+                                },
+                            ));
+                        }
+                        current_local = None;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn build_index(&self, guid: u128) -> Result<()> {
+        let pdb = self.pdbs.get_mut(&guid).ok_or(Error::ExpectedSymbols)?;
+        let mut pdb_lock = pdb.lock();
+        let address_map = pdb_lock.address_map()?;
+        let mut diagnostics = Vec::new();
+        let string_table = match pdb_lock.string_table() {
+            Ok(table) => Some(table),
+            Err(error) => {
+                record_index_diagnostic(
+                    &mut diagnostics,
+                    "source strings",
+                    None,
+                    error.to_string(),
+                );
+                None
+            }
+        };
+
+        let mut strings = Vec::new();
+        let mut rvas: HashMap<String, Vec<IndexedSymbol>> = HashMap::new();
+        let mut source_lines = Vec::new();
+
+        // Module streams contain private procedures and addressable data that
+        // are absent from the global public stream. SymbolData::Local records
+        // are deliberately ignored: stack locals are not global symbols.
+        match pdb_lock.debug_information() {
+            Ok(debug_information) => match debug_information.modules() {
+                Ok(mut modules) => loop {
+                    let module = match modules.next() {
+                        Ok(Some(module)) => module,
+                        Ok(None) => break,
+                        Err(error) => {
+                            record_index_diagnostic(
+                                &mut diagnostics,
+                                "module iteration",
+                                None,
+                                error.to_string(),
+                            );
+                            break;
+                        }
+                    };
+                    let compiland = module.module_name().into_owned();
+                    let module_info = match pdb_lock.module_info(&module) {
+                        Ok(Some(module_info)) => module_info,
+                        Ok(None) => {
+                            record_index_diagnostic(
+                                &mut diagnostics,
+                                "module info",
+                                Some(&compiland),
+                                "module information is absent",
+                            );
+                            continue;
+                        }
+                        Err(error) => {
+                            record_index_diagnostic(
+                                &mut diagnostics,
+                                "module info",
+                                Some(&compiland),
+                                error.to_string(),
+                            );
+                            continue;
+                        }
+                    };
+
+                    match module_info.symbols() {
+                        Ok(mut module_symbols) => loop {
+                            let symbol = match module_symbols.next() {
+                                Ok(Some(symbol)) => symbol,
+                                Ok(None) => break,
+                                Err(error) => {
+                                    record_index_diagnostic(
+                                        &mut diagnostics,
+                                        "private symbol iteration",
+                                        Some(&compiland),
+                                        error.to_string(),
+                                    );
+                                    break;
+                                }
+                            };
+                            if !is_private_address_symbol_kind(symbol.raw_kind()) {
+                                continue;
+                            }
+                            let data = match symbol.parse() {
+                                Ok(data) => data,
+                                Err(error) => {
+                                    record_index_diagnostic(
+                                        &mut diagnostics,
+                                        "private symbol record",
+                                        Some(&compiland),
+                                        format!("kind {:#06x}: {error}", symbol.raw_kind()),
+                                    );
+                                    continue;
+                                }
+                            };
+                            let named_offset: Option<(String, pdb2::PdbInternalSectionOffset)> =
+                                match data {
+                                    pdb2::SymbolData::Procedure(procedure) => {
+                                        Some((procedure.name.to_string().into(), procedure.offset))
+                                    }
+                                    pdb2::SymbolData::Data(data) => {
+                                        Some((data.name.to_string().into(), data.offset))
+                                    }
+                                    _ => None,
+                                };
+                            if let Some((name, offset)) = named_offset
+                                && let Some(rva) = offset.to_rva(&address_map)
+                            {
+                                insert_symbol_rva(
+                                    &mut rvas,
+                                    name.clone(),
+                                    rva.0,
+                                    SymbolVisibility::Private,
+                                    Some(compiland.clone()),
+                                );
+                                strings.push(name);
+                            }
+                        },
+                        Err(error) => record_index_diagnostic(
+                            &mut diagnostics,
+                            "private symbol stream",
+                            Some(&compiland),
+                            error.to_string(),
+                        ),
+                    }
+
+                    let Some(strings_table) = string_table.as_ref() else {
+                        continue;
+                    };
+                    let line_program = match module_info.line_program() {
+                        Ok(line_program) => line_program,
+                        Err(error) => {
+                            record_index_diagnostic(
+                                &mut diagnostics,
+                                "line program",
+                                Some(&compiland),
+                                error.to_string(),
+                            );
+                            continue;
+                        }
+                    };
+                    let mut lines = line_program.lines();
+                    loop {
+                        // pdb2 0.10.1 asserts while bounding some valid
+                        // non-monotonic C13 line records. Isolate that module,
+                        // but retain an explicit diagnostic rather than silently
+                        // truncating all remaining source information.
+                        let next =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lines.next()));
+                        let line = match next {
+                            Ok(Ok(Some(line))) => line,
+                            Ok(Ok(None)) => break,
+                            Ok(Err(error)) => {
+                                record_index_diagnostic(
+                                    &mut diagnostics,
+                                    "line iteration",
+                                    Some(&compiland),
+                                    error.to_string(),
+                                );
+                                break;
+                            }
+                            Err(payload) => {
+                                let message = payload
+                                    .downcast_ref::<&str>()
+                                    .map(|message| (*message).to_string())
+                                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                                    .unwrap_or_else(|| "pdb2 line iterator panicked".to_string());
+                                record_index_diagnostic(
+                                    &mut diagnostics,
+                                    "line iteration",
+                                    Some(&compiland),
+                                    message,
+                                );
+                                break;
+                            }
+                        };
+                        let Some(rva) = line.offset.to_rva(&address_map) else {
+                            continue;
+                        };
+                        let file_info = match line_program.get_file_info(line.file_index) {
+                            Ok(file_info) => file_info,
+                            Err(error) => {
+                                record_index_diagnostic(
+                                    &mut diagnostics,
+                                    "source file",
+                                    Some(&compiland),
+                                    error.to_string(),
+                                );
+                                continue;
+                            }
+                        };
+                        let file = match strings_table.get(file_info.name) {
+                            Ok(file) => file,
+                            Err(error) => {
+                                record_index_diagnostic(
+                                    &mut diagnostics,
+                                    "source string",
+                                    Some(&compiland),
+                                    error.to_string(),
+                                );
+                                continue;
+                            }
+                        };
+                        source_lines.push(SourceLineEntry {
+                            rva: rva.0,
+                            length: line.length,
+                            location: SourceLocation {
+                                file: file.to_string().into(),
+                                line: line.line_start,
+                                column: line.column_start.filter(|column| *column != 0),
+                                local_path: None,
+                                local_exists: false,
+                            },
+                        });
+                    }
+                },
+                Err(error) => record_index_diagnostic(
+                    &mut diagnostics,
+                    "module list",
+                    None,
+                    error.to_string(),
+                ),
+            },
+            Err(error) => record_index_diagnostic(
+                &mut diagnostics,
+                "debug information",
+                None,
+                error.to_string(),
+            ),
+        }
+
+        // Public records have intentional precedence over duplicate private
+        // names, regardless of module stream order.
+        let symbol_table = pdb_lock.global_symbols()?;
+        let mut symbols = symbol_table.iter();
+        while let Some(symbol) = symbols.next()? {
+            match symbol.parse() {
+                Ok(pdb2::SymbolData::Public(data)) => {
+                    let name: String = data.name.to_string().into();
+                    if let Some(rva) = data.offset.to_rva(&address_map) {
+                        insert_symbol_rva(
+                            &mut rvas,
+                            name.clone(),
+                            rva.0,
+                            SymbolVisibility::Public,
+                            None,
+                        );
+                    }
+                    strings.push(name);
+                }
+                Ok(_) => {}
+                Err(error) => record_index_diagnostic(
+                    &mut diagnostics,
+                    "public symbol record",
+                    None,
+                    format!("kind {:#06x}: {error}", symbol.raw_kind()),
+                ),
             }
         }
 
         strings.sort();
         strings.dedup();
-
-        self.index.insert(guid, SymbolIndex { names: strings });
-        self.symbol_rvas.insert(guid, rvas);
+        source_lines.sort_by_key(|line| line.rva);
 
         // NOW FOR TYPES!
         let mut type_strings: Vec<String> = Vec::new();
         let mut enum_strings: Vec<String> = Vec::new();
 
-        let type_information = pdb_lock.type_information().ok()?;
+        let type_information = pdb_lock.type_information()?;
         let mut type_finder = type_information.finder();
         let mut iter = type_information.iter();
 
-        while let Some(typ) = iter.next().ok()? {
+        while let Some(typ) = iter.next()? {
             type_finder.update(&iter);
 
-            if let Ok(type_data) = typ.parse() {
-                match type_data {
+            match typ.parse() {
+                Ok(type_data) => match type_data {
                     TypeData::Class(class)
                         if !class.properties.forward_reference()
                             && class.name.to_string() != "<anonymous-tag>" =>
                     {
                         type_strings.push(class.name.to_string().into());
+                    }
+                    TypeData::Union(union)
+                        if !union.properties.forward_reference()
+                            && union.name.to_string() != "<anonymous-tag>" =>
+                    {
+                        type_strings.push(union.name.to_string().into());
                     }
                     TypeData::Enumeration(en)
                         if !en.properties.forward_reference()
@@ -1492,7 +3286,13 @@ impl SymbolStore {
                         enum_strings.push(en.name.to_string().into());
                     }
                     _ => {}
-                }
+                },
+                Err(error) => record_index_diagnostic(
+                    &mut diagnostics,
+                    "type record",
+                    None,
+                    error.to_string(),
+                ),
             }
         }
 
@@ -1501,6 +3301,12 @@ impl SymbolStore {
         enum_strings.sort();
         enum_strings.dedup();
 
+        // Publish every derived index together only after all mandatory PDB
+        // streams have been parsed. A fatal type/public stream error must not
+        // leave a partially indexed PDB that later lookups mistake for success.
+        self.index.insert(guid, SymbolIndex { names: strings });
+        self.symbol_rvas.insert(guid, rvas);
+        self.source_lines.insert(guid, source_lines);
         self.index_types.insert(
             guid,
             SymbolIndex {
@@ -1514,7 +3320,8 @@ impl SymbolStore {
             },
         );
 
-        Some(())
+        self.index_diagnostics.insert(guid, diagnostics);
+        Ok(())
     }
 
     // pub fn symbol_index(&self, guid: u128) -> Option<Arc<SymbolIndex>> {
@@ -1525,35 +3332,75 @@ impl SymbolStore {
     //     self.index_types.get(&guid).map(|v| Arc::new(v.clone()))
     // }
 
-    pub fn symbol_rva<S>(&self, guid: u128, symbol_name: S) -> Option<u32>
+    fn symbol_records(&self, guid: u128, symbol_name: &str) -> Vec<IndexedSymbol> {
+        if let Some(map) = self.symbol_rvas.get(&guid) {
+            return map
+                .get(symbol_name)
+                .map(|records| {
+                    preferred_symbol_records(records)
+                        .into_iter()
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+        }
+
+        // Before indexing completes, the global stream can still provide public
+        // records. Private candidates become available when `build_index` runs.
+        let Some(pdb) = self.pdbs.get_mut(&guid) else {
+            return Vec::new();
+        };
+        let mut pdb_lock = pdb.lock();
+        let Ok(symbol_table) = pdb_lock.global_symbols() else {
+            return Vec::new();
+        };
+        let Ok(address_map) = pdb_lock.address_map() else {
+            return Vec::new();
+        };
+        let mut symbols = symbol_table.iter();
+        let mut records = Vec::new();
+        while let Ok(Some(symbol)) = symbols.next() {
+            if let Ok(pdb2::SymbolData::Public(data)) = symbol.parse()
+                && data.name.to_string() == symbol_name
+                && let Some(rva) = data.offset.to_rva(&address_map)
+            {
+                records.push(IndexedSymbol {
+                    rva: rva.0,
+                    visibility: SymbolVisibility::Public,
+                    compiland: None,
+                });
+            }
+        }
+        records
+    }
+
+    pub fn symbol_rva<S>(&self, guid: u128, symbol_name: S) -> Result<Option<u32>>
     where
         S: AsRef<str>,
     {
         let symbol_name = symbol_name.as_ref();
-
-        // fast path: the prebuilt name->rva map (built by build_index). It covers
-        // every public the scan below would find, minus those whose offset has no
-        // RVA (the scan returns 0 for those; here they're simply absent -> None)
-        if let Some(map) = self.symbol_rvas.get(&guid) {
-            return map.get(symbol_name).copied();
+        let records = self.symbol_records(guid, symbol_name);
+        let mut rvas: Vec<u32> = records.iter().map(|record| record.rva).collect();
+        rvas.sort_unstable();
+        rvas.dedup();
+        match rvas.as_slice() {
+            [] => Ok(None),
+            [rva] => Ok(Some(*rva)),
+            _ => Err(Error::AmbiguousSymbol {
+                name: symbol_name.to_string(),
+                candidates: records
+                    .iter()
+                    .map(|record| {
+                        let provenance = record
+                            .compiland
+                            .as_deref()
+                            .map(|compiland| format!(" in {compiland}"))
+                            .unwrap_or_default();
+                        format!("RVA {:#x}{provenance}", record.rva)
+                    })
+                    .collect(),
+            }),
         }
-
-        // fallback: scan the PDB when the index hasn't been built for this module
-        let pdb = self.pdbs.get_mut(&guid)?;
-        let mut pdb_lock = pdb.lock();
-        let symbol_table = pdb_lock.global_symbols().ok()?;
-        let address_map = pdb_lock.address_map().ok()?;
-        let mut symbols = symbol_table.iter();
-
-        while let Some(symbol) = symbols.next().ok()? {
-            if let Ok(pdb2::SymbolData::Public(data)) = symbol.parse()
-                && data.name.to_string() == symbol_name
-            {
-                return Some(data.offset.to_rva(&address_map).unwrap_or_default().0);
-            }
-        }
-
-        None
     }
 
     pub fn closest_symbol(
@@ -1562,36 +3409,39 @@ impl SymbolStore {
         base_address: VirtAddr,
         address: VirtAddr,
     ) -> Option<(String, u32)> {
-        let pdb = self.pdbs.get_mut(&guid)?;
-        let mut pdb_lock = pdb.lock();
-        let symbol_table = pdb_lock.global_symbols().ok()?;
-        let address_map = pdb_lock.address_map().ok()?;
-        let mut symbols = symbol_table.iter();
-
-        let mut closest: Option<(String, u32)> = None;
-        let max_offset = 8192u32;
-
-        while let Some(symbol) = symbols.next().ok()? {
-            if let Ok(pdb2::SymbolData::Public(data)) = symbol.parse()
-                && let Some(rva) = data.offset.to_rva(&address_map)
-            {
-                let symbol_address = base_address + rva.0 as u64;
-                if address.0 >= symbol_address.0 {
-                    let offset = (address.0 - symbol_address.0) as u32;
-                    if offset <= max_offset {
-                        if let Some((_, best_offset)) = closest {
-                            if offset < best_offset {
-                                closest = Some((data.name.to_string().into(), offset));
-                            }
-                        } else {
-                            closest = Some((data.name.to_string().into(), offset));
-                        }
-                    }
-                }
-            }
-        }
-
-        closest
+        let target_rva = u32::try_from(address.0.checked_sub(base_address.0)?).ok()?;
+        let symbols = self.symbol_rvas.get(&guid)?;
+        symbols
+            .iter()
+            .flat_map(|(name, records)| {
+                records.iter().filter_map(move |record| {
+                    target_rva
+                        .checked_sub(record.rva)
+                        .filter(|offset| *offset <= 8192)
+                        .map(|offset| {
+                            (
+                                name.clone(),
+                                offset,
+                                record.visibility,
+                                record.compiland.clone(),
+                            )
+                        })
+                })
+            })
+            .min_by(|left, right| {
+                left.1
+                    .cmp(&right.1)
+                    .then_with(|| {
+                        let rank = |visibility| match visibility {
+                            SymbolVisibility::Public => 0,
+                            SymbolVisibility::Private => 1,
+                        };
+                        rank(left.2).cmp(&rank(right.2))
+                    })
+                    .then_with(|| left.0.cmp(&right.0))
+                    .then_with(|| left.3.cmp(&right.3))
+            })
+            .map(|(name, offset, _, _)| (name, offset))
     }
 
     fn type_size<'p>(
@@ -1811,25 +3661,33 @@ impl SymbolStore {
         while let Some(typ) = iter.next().ok()? {
             type_finder.update(&iter);
 
-            if let Ok(TypeData::Class(class)) = typ.parse()
-                && class.name.to_string() == struct_name.as_ref()
-                && !class.properties.forward_reference()
-            {
-                let mut fields_map: HashMap<String, FieldInfo> = HashMap::new();
-                if let Some(field_index) = class.fields {
-                    self.process_field_list(&type_finder, field_index, &mut fields_map)
-                        .ok()?;
+            let (name, size, field_index) = match typ.parse() {
+                Ok(TypeData::Class(class)) if !class.properties.forward_reference() => {
+                    (class.name.to_string(), class.size, class.fields)
                 }
-
-                let type_info = TypeInfo {
-                    name: struct_name.into(),
-                    size: class.size as usize,
-                    fields: fields_map,
-                };
-                self.type_cache
-                    .insert(cache_key, Arc::new(type_info.clone()));
-                return Some(type_info);
+                Ok(TypeData::Union(union)) if !union.properties.forward_reference() => {
+                    (union.name.to_string(), union.size, Some(union.fields))
+                }
+                _ => continue,
+            };
+            if name != struct_name.as_ref() {
+                continue;
             }
+
+            let mut fields_map: HashMap<String, FieldInfo> = HashMap::new();
+            if let Some(field_index) = field_index {
+                self.process_field_list(&type_finder, field_index, &mut fields_map)
+                    .ok()?;
+            }
+
+            let type_info = TypeInfo {
+                name: struct_name.into(),
+                size: size as usize,
+                fields: fields_map,
+            };
+            self.type_cache
+                .insert(cache_key, Arc::new(type_info.clone()));
+            return Some(type_info);
         }
 
         None

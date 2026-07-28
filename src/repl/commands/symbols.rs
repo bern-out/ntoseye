@@ -1,7 +1,10 @@
 use crate::error::Result;
 use crate::expr::Expr;
-use crate::symbols::format_symbol_with_offset;
+use crate::symbols::{
+    LocalVariableLocation, SourcePathMapping, SymbolSource, format_symbol_with_offset,
+};
 use crate::target::UserVar;
+use crate::types::VirtAddr;
 use crate::ui;
 
 use crate::repl::*;
@@ -54,6 +57,70 @@ repl_command! {
     summary: "Remove a convenience variable.",
 }
 
+repl_command! {
+    cmd_sympath;
+    names: [".sympath"],
+    usage: ".sympath [<directory|http-server> ...]",
+    summary: "Display or replace the ordered symbol source path.",
+}
+
+repl_command! {
+    cmd_sympath_append;
+    names: [".sympath+"],
+    usage: ".sympath+ <directory|http-server> ...",
+    summary: "Append entries to the ordered symbol source path.",
+}
+
+repl_command! {
+    cmd_symfix();
+    names: [".symfix"],
+    usage: ".symfix",
+    summary: "Restore the ntoseye cache and Microsoft symbol server defaults.",
+}
+
+repl_command! {
+    cmd_srcpath;
+    names: [".srcpath"],
+    usage: ".srcpath [<local-root|recorded-prefix=local-root> ...]",
+    summary: "Display or replace ordered local source path mappings.",
+}
+
+repl_command! {
+    cmd_srcpath_append;
+    names: [".srcpath+"],
+    usage: ".srcpath+ <local-root|recorded-prefix=local-root> ...",
+    summary: "Append local source path mappings.",
+}
+
+repl_command! {
+    cmd_dv;
+    names: ["dv"],
+    usage: "dv [address]",
+    summary: "Display procedure locals and parameters at an address.",
+    completion: Expression,
+}
+
+repl_command! {
+    cmd_reload_symbols;
+    names: [".reload"],
+    usage: ".reload [module]",
+    summary: "Reload symbols for one module or every module in the current scope.",
+}
+
+repl_command! {
+    cmd_ld;
+    names: ["ld"],
+    usage: "ld <module>",
+    summary: "Force symbol source selection and indexing for one module.",
+}
+
+repl_command! {
+    cmd_lmv;
+    names: ["lmv"],
+    usage: "lmv [module]",
+    summary: "Display detailed per-module symbol status and PDB identity.",
+}
+
 impl ReplState<'_> {
     fn cmd_x(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
         let Some(query) = invocation.arg(0) else {
@@ -92,7 +159,7 @@ impl ReplState<'_> {
                 .ctx
                 .target
                 .symbols
-                .find_symbol_with_module(dtb, &lookup)
+                .find_symbol_with_module(dtb, &lookup)?
             {
                 println!(
                     "{}  {}",
@@ -128,7 +195,7 @@ impl ReplState<'_> {
             println!("{}\n", command_help("ln"));
             return Ok(());
         };
-        let addr = match Expr::eval(arg, &self.ctx.target) {
+        let addr = match Expr::eval_with_radix(arg, &self.ctx.target, self.radix) {
             Ok(a) => a,
             Err(e) => {
                 error!("{}", e);
@@ -164,7 +231,7 @@ impl ReplState<'_> {
             return Ok(());
         }
 
-        match Expr::eval(expr_str, &self.ctx.target) {
+        match Expr::eval_with_radix(expr_str, &self.ctx.target, self.radix) {
             Ok(addr) => {
                 self.ctx.target.set_results(vec![addr.0], self.line.clone());
                 println!("{}", ui::addr(addr.0));
@@ -198,7 +265,7 @@ impl ReplState<'_> {
             return Ok(());
         }
         let source = rhs.trim().to_string();
-        match Expr::eval(&source, &self.ctx.target) {
+        match Expr::eval_with_radix(&source, &self.ctx.target, self.radix) {
             Ok(v) => {
                 self.ctx
                     .target
@@ -285,10 +352,315 @@ impl ReplState<'_> {
 
         Ok(())
     }
+
+    fn cmd_sympath(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        if invocation.argv.is_empty() {
+            self.print_symbol_sources();
+            return Ok(());
+        }
+
+        self.ctx
+            .target
+            .symbols
+            .set_symbol_sources(parse_symbol_sources(&invocation.argv));
+        self.print_symbol_sources();
+        Ok(())
+    }
+
+    fn cmd_sympath_append(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        if invocation.argv.is_empty() {
+            println!("{}\n", command_help(".sympath+"));
+            return Ok(());
+        }
+
+        for source in parse_symbol_sources(&invocation.argv) {
+            self.ctx.target.symbols.append_symbol_source(source);
+        }
+        self.print_symbol_sources();
+        Ok(())
+    }
+
+    fn cmd_symfix(&mut self) -> Result<()> {
+        self.ctx.target.symbols.reset_symbol_sources();
+        self.print_symbol_sources();
+        Ok(())
+    }
+
+    fn print_symbol_sources(&self) {
+        println!("symbol sources:");
+        for (index, source) in self.ctx.target.symbols.symbol_sources().iter().enumerate() {
+            println!("  {:>2}: {}", index, source);
+        }
+        println!();
+    }
+
+    fn cmd_srcpath(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        if !invocation.argv.is_empty() {
+            self.ctx
+                .target
+                .symbols
+                .set_source_paths(parse_source_paths(&invocation.argv));
+        }
+        self.print_source_paths();
+        Ok(())
+    }
+
+    fn cmd_srcpath_append(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        if invocation.argv.is_empty() {
+            println!("{}\n", command_help(".srcpath+"));
+            return Ok(());
+        }
+        for mapping in parse_source_paths(&invocation.argv) {
+            self.ctx.target.symbols.append_source_path(mapping);
+        }
+        self.print_source_paths();
+        Ok(())
+    }
+
+    fn print_source_paths(&self) {
+        let paths = self.ctx.target.symbols.source_paths();
+        if paths.is_empty() {
+            println!("source paths: <empty>\n");
+            return;
+        }
+        println!("source paths:");
+        for (index, path) in paths.iter().enumerate() {
+            println!("  {:>2}: {}", index, path);
+        }
+        println!();
+    }
+
+    fn cmd_dv(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        let address = if let Some(arg) = invocation.arg(0) {
+            match Expr::eval_with_radix(arg, &self.ctx.target, self.radix) {
+                Ok(address) => address,
+                Err(err) => {
+                    error!("{}", err);
+                    return Ok(());
+                }
+            }
+        } else {
+            let Some(rip) = self
+                .ctx
+                .target
+                .registers
+                .as_ref()
+                .and_then(|registers| registers.get("rip"))
+                .copied()
+            else {
+                error!("dv requires a halted register context or an explicit address");
+                return Ok(());
+            };
+            VirtAddr(rip)
+        };
+
+        let Some(locals) = self.ctx.target.procedure_locals(address)? else {
+            println!("no procedure locals found at {}\n", ui::addr(address.0));
+            return Ok(());
+        };
+        if locals.is_empty() {
+            println!("no locals in scope at {}\n", ui::addr(address.0));
+            return Ok(());
+        }
+
+        for local in locals {
+            let kind = if local.is_parameter { "param" } else { "local" };
+            let location = format_local_location(&local.location);
+            match self
+                .ctx
+                .target
+                .resolve_procedure_local_value(address, &local)
+            {
+                Some(value) => println!(
+                    "{:<20} {:<24} {:<7} {:<24} {:#x}",
+                    local.name, local.type_name, kind, location, value
+                ),
+                None => println!(
+                    "{:<20} {:<24} {:<7} {}",
+                    local.name, local.type_name, kind, location
+                ),
+            }
+        }
+        println!();
+        Ok(())
+    }
+
+    fn cmd_reload_symbols(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        self.reload_symbols(invocation.arg(0));
+        Ok(())
+    }
+
+    fn cmd_ld(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        let Some(module) = invocation.arg(0) else {
+            println!("{}\n", command_help("ld"));
+            return Ok(());
+        };
+        self.reload_symbols(Some(module));
+        Ok(())
+    }
+
+    fn reload_symbols(&mut self, module: Option<&str>) {
+        match self.ctx.target.reload_module_symbols(module) {
+            Ok(report) => {
+                print_module_symbol_report(&report);
+                *self.caches.symbols.write().unwrap() = self.ctx.target.current_symbol_index();
+                *self.caches.types.write().unwrap() = self.ctx.target.current_types_index();
+                if let Err(err) = self
+                    .ctx
+                    .breakpoints
+                    .resolve_symbolic(&mut *self.ctx.backend, &self.ctx.target)
+                {
+                    error!("symbolic breakpoint re-resolution failed: {}", err);
+                }
+                self.caches.refresh_breakpoints(&self.ctx.breakpoints);
+            }
+            Err(err) => error!("symbol reload failed: {}", err),
+        }
+    }
+
+    fn cmd_lmv(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        let filter = invocation.arg(0);
+        let dtb = self
+            .ctx
+            .target
+            .current_process_info
+            .as_ref()
+            .map(|process| process.dtb)
+            .unwrap_or_else(|| self.ctx.target.kernel_dtb());
+        let modules = match self.ctx.target.modules() {
+            Ok(modules) => modules,
+            Err(err) => {
+                error!("failed to enumerate modules: {}", err);
+                return Ok(());
+            }
+        };
+        let mut shown = 0;
+        for module in modules {
+            if filter.is_some_and(|filter| {
+                !module.short_name.eq_ignore_ascii_case(filter)
+                    && !module.name.eq_ignore_ascii_case(filter)
+            }) {
+                continue;
+            }
+            shown += 1;
+            let status = self
+                .ctx
+                .target
+                .symbols
+                .module_symbol_status(dtb, module.base_address);
+            let source = self
+                .ctx
+                .target
+                .symbols
+                .module_symbol_source(dtb, module.base_address);
+            let identity = self
+                .ctx
+                .target
+                .symbols
+                .module_pdb_identity(dtb, module.base_address);
+            println!("{} ({})", module.name, module.short_name);
+            println!(
+                "  range   : {} - {}",
+                ui::addr(module.base_address.0),
+                ui::addr(module.end_address().0)
+            );
+            println!(
+                "  symbols : {}",
+                status
+                    .as_ref()
+                    .map(|status| status.label())
+                    .unwrap_or("unknown")
+            );
+            println!(
+                "  source  : {}",
+                source.as_ref().map(|source| source.label()).unwrap_or("-")
+            );
+            match identity {
+                Some(identity) => {
+                    println!("  pdb guid: {:032X}", identity.guid);
+                    println!("  pdb age : {}", identity.age);
+                }
+                None => println!("  pdb     : -"),
+            }
+            if let Some(crate::symbols::ModuleSymbolStatus::Failed(reason)) = status {
+                println!("  error   : {}", reason);
+            }
+            println!();
+        }
+        if shown == 0 {
+            println!("no matching modules\n");
+        }
+        Ok(())
+    }
 }
 
+fn format_signed_hex(offset: i32) -> String {
+    if offset < 0 {
+        format!("-0x{:x}", offset.unsigned_abs())
+    } else {
+        format!("+0x{:x}", offset)
+    }
+}
+
+fn format_local_location(location: &LocalVariableLocation) -> String {
+    match location {
+        LocalVariableLocation::Register { register } => register.clone(),
+        LocalVariableLocation::RegisterRelative { register, offset } => {
+            format!("[{}{}]", register, format_signed_hex(*offset))
+        }
+        LocalVariableLocation::FrameRelative { offset } => {
+            format!("[frame{}]", format_signed_hex(*offset))
+        }
+        LocalVariableLocation::Unavailable { reason } => format!("<{}>", reason),
+    }
+}
+
+fn parse_symbol_sources<S: AsRef<str>>(args: &[S]) -> Vec<SymbolSource> {
+    args.iter()
+        .flat_map(|arg| arg.as_ref().split(';'))
+        .filter(|entry| !entry.is_empty())
+        .flat_map(|entry| {
+            if entry.eq_ignore_ascii_case("cache") || entry.starts_with("cache*") {
+                vec![SymbolSource::Cache]
+            } else if let Some(rest) = entry.strip_prefix("srv*") {
+                let parts = rest.split('*').filter(|part| !part.is_empty());
+                parts
+                    .map(|part| {
+                        if part.starts_with("http://") || part.starts_with("https://") {
+                            SymbolSource::Http(part.trim_end_matches('/').to_string())
+                        } else {
+                            SymbolSource::LocalDirectory(part.into())
+                        }
+                    })
+                    .collect()
+            } else if entry.starts_with("http://") || entry.starts_with("https://") {
+                vec![SymbolSource::Http(entry.trim_end_matches('/').to_string())]
+            } else {
+                vec![SymbolSource::LocalDirectory(entry.into())]
+            }
+        })
+        .collect()
+}
+
+fn parse_source_paths<S: AsRef<str>>(args: &[S]) -> Vec<SourcePathMapping> {
+    args.iter()
+        .flat_map(|arg| arg.as_ref().split(';'))
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| match entry.split_once('=') {
+            Some((recorded, local)) => SourcePathMapping {
+                recorded_prefix: Some(recorded.to_string()),
+                local_root: local.into(),
+            },
+            None => SourcePathMapping {
+                recorded_prefix: None,
+                local_root: entry.into(),
+            },
+        })
+        .collect()
+}
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::repl::{CommandStyle, parse_command};
 
     #[test]
@@ -297,5 +669,72 @@ mod tests {
         let invocation = parsed.invocation(CommandStyle::ExpressionTail).unwrap();
         assert_eq!(invocation.raw_tail, "rax + rbx");
         assert!(invocation.argv.is_empty());
+    }
+
+    #[test]
+    fn symbol_path_parser_supports_local_http_and_srv_syntax() {
+        let sources = parse_symbol_sources(&[
+            "/private",
+            "https://symbols.example.test/",
+            "srv*/cache*https://backup.example.test",
+        ]);
+        assert_eq!(
+            sources,
+            vec![
+                SymbolSource::LocalDirectory("/private".into()),
+                SymbolSource::Http("https://symbols.example.test".to_string()),
+                SymbolSource::LocalDirectory("/cache".into()),
+                SymbolSource::Http("https://backup.example.test".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn sympath_append_is_registered_as_a_command_name() {
+        let parsed = parse_command(".sympath+ /private").unwrap().unwrap();
+        assert_eq!(parsed.name, ".sympath+");
+        assert!(command_registry().get(".sympath+").is_some());
+        assert!(command_registry().get(".sympath").is_some());
+        assert!(command_registry().get(".symfix").is_some());
+    }
+
+    #[test]
+    fn source_path_parser_supports_roots_and_prefix_mappings() {
+        assert_eq!(
+            parse_source_paths(&["/source", r"C:\build\src=/checkout"]),
+            vec![
+                SourcePathMapping {
+                    recorded_prefix: None,
+                    local_root: "/source".into(),
+                },
+                SourcePathMapping {
+                    recorded_prefix: Some(r"C:\build\src".to_string()),
+                    local_root: "/checkout".into(),
+                },
+            ]
+        );
+        assert!(command_registry().get(".srcpath").is_some());
+        assert!(command_registry().get(".srcpath+").is_some());
+        assert!(command_registry().get("dv").is_some());
+        assert!(command_registry().get(".reload").is_some());
+        assert!(command_registry().get("ld").is_some());
+        assert!(command_registry().get("lmv").is_some());
+    }
+
+    #[test]
+    fn local_location_presentation_preserves_provenance() {
+        assert_eq!(
+            format_local_location(&LocalVariableLocation::RegisterRelative {
+                register: "rsp".to_string(),
+                offset: -0x20,
+            }),
+            "[rsp-0x20]"
+        );
+        assert_eq!(
+            format_local_location(&LocalVariableLocation::Unavailable {
+                reason: "optimized out".to_string(),
+            }),
+            "<optimized out>"
+        );
     }
 }

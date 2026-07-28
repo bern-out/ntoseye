@@ -52,8 +52,14 @@ pub fn parse_state_change(payload: &[u8]) -> Result<StateChange> {
     //   ULONG64 Thread         @ 16
     //   ULONG64 ProgramCounter @ 24
     //   <union starts at 32>:
-    //     DBGKM_EXCEPTION64.ExceptionRecord.ExceptionCode @ 32
-    //     (and more EXCEPTION_RECORD64 fields)
+    //     DBGKM_EXCEPTION64.ExceptionRecord.ExceptionCode    @ 32
+    //     DBGKM_EXCEPTION64.ExceptionRecord.ExceptionAddress @ 48
+    //     DBGKM_EXCEPTION64.FirstChance                       @ 184
+    //
+    // EXCEPTION_RECORD64 is 0x98 bytes: its 15 ULONG64 information
+    // parameters end at offset 0x98. DBGKM_EXCEPTION64 then stores the ULONG
+    // FirstChance field immediately after it. These are the windbgkd.h wire
+    // structure offsets, not host Rust layout.
     if payload.len() < 32 {
         return Err(Error::Kd(format!(
             "state-change payload too short: {} bytes",
@@ -66,6 +72,17 @@ pub fn parse_state_change(payload: &[u8]) -> Result<StateChange> {
     } else {
         0
     };
+    let exception_address = if new_state == DBG_KD_EXCEPTION_STATE_CHANGE && payload.len() >= 56 {
+        Some(read_u64(payload, 48))
+    } else {
+        None
+    };
+    let exception_first_chance =
+        if new_state == DBG_KD_EXCEPTION_STATE_CHANGE && payload.len() >= 188 {
+            Some(read_u32(payload, 184) != 0)
+        } else {
+            None
+        };
     let kernel_base_hint = if new_state == DBG_KD_LOAD_SYMBOLS_STATE_CHANGE && payload.len() >= 48 {
         let base = read_u64(payload, 40);
         (base != 0).then_some(VirtAddr(base))
@@ -78,6 +95,8 @@ pub fn parse_state_change(payload: &[u8]) -> Result<StateChange> {
         processor: read_u16(payload, 6),
         number_processors: number_processors_u32.min(u16::MAX as u32) as u16,
         exception_code,
+        exception_first_chance,
+        exception_address,
         program_counter: read_u64(payload, 24),
         kernel_base_hint,
         is_bugcheck: false,
@@ -261,9 +280,12 @@ pub fn is_initial_resync_error(error: &Error) -> bool {
     }
 }
 
-pub fn probe_initial_request(framing: &mut KdFraming<UnixStream>, processor: u16) -> Result<()> {
+pub fn probe_initial_request(
+    framing: &mut KdFraming<UnixStream>,
+    processor: u16,
+) -> Result<api::Version> {
     with_framing_read_timeout_raw(framing, KD_INITIAL_PROBE_TIMEOUT, |framing| {
-        api::get_version(framing, processor).map(|_| ())
+        api::get_version(framing, processor)
     })
 }
 

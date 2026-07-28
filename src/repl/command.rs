@@ -507,6 +507,41 @@ mod tests {
         assert_eq!(registry.get("q").unwrap().names[0], "quit");
         assert_eq!(registry.get("q").unwrap().flow, Flow::Quit);
         assert_eq!(registry.get("?").unwrap().names[0], "ev");
+        for (alias, canonical) in [
+            ("!pte", "pte"),
+            ("!pool", "pool"),
+            ("!irp", "irp"),
+            ("!drvobj", "drvobj"),
+            ("!devobj", "devobj"),
+            ("!object", "object"),
+            ("!analyze", "analyze"),
+        ] {
+            assert_eq!(registry.get(alias).unwrap().names[0], canonical);
+        }
+        for stack_variant in ["kb", "kp", "kv"] {
+            assert_eq!(registry.get(stack_variant).unwrap().names[0], "k");
+        }
+        for command in [
+            "uf",
+            "lmv",
+            ".reload",
+            ".sympath",
+            ".symfix",
+            "ld",
+            "gh",
+            "gn",
+            "sxe",
+            "sxd",
+            "sxn",
+            "sxi",
+            "n",
+            "reload-scripts",
+        ] {
+            assert!(
+                registry.get(command).is_some(),
+                "{command} is not registered"
+            );
+        }
         assert_eq!(
             registry.get("?").unwrap().style,
             CommandStyle::ExpressionTail

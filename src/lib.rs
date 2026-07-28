@@ -24,6 +24,7 @@ pub mod bugchecks;
 #[cfg(feature = "cli")]
 pub mod cli;
 pub mod dbg_backend;
+pub mod debugger_data;
 pub mod diagnostics;
 pub mod disasm;
 pub mod dmp;
@@ -46,6 +47,7 @@ pub mod symbols;
 pub mod target;
 pub mod trapframe;
 pub mod triage;
+pub mod triage_report;
 pub mod types;
 pub mod ui;
 pub mod unwind;

@@ -41,6 +41,26 @@ fn test_parse_bare_decimal_stays_decimal_literal() {
 }
 
 #[test]
+fn test_parse_with_hexadecimal_default_radix() {
+    assert_eq!(
+        Expr::parse_with_radix("1000 + 10", NumberRadix::Hexadecimal).unwrap(),
+        Expr::Add(lit(0x1000), lit(0x10))
+    );
+    assert_eq!(
+        Expr::parse_with_radix("123abc", NumberRadix::Hexadecimal).unwrap(),
+        Expr::Literal(VirtAddr(0x123abc))
+    );
+}
+
+#[test]
+fn test_explicit_decimal_overrides_default_radix() {
+    assert_eq!(
+        Expr::parse_with_radix("0n1000 + 0n10", NumberRadix::Hexadecimal).unwrap(),
+        Expr::Add(lit(1000), lit(10))
+    );
+}
+
+#[test]
 fn test_bare_hex_literal_fallback_requires_hex_letter() {
     assert_eq!(
         Expr::parse_bare_hex_literal("fffff80123456789"),

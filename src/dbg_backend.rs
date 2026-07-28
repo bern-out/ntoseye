@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::debugger_data::DebuggerDataCandidate;
 use crate::dmp::TriageCrashInfo;
 use crate::error::{Error, Result};
 use crate::gdb::RegisterMap;
@@ -138,12 +139,79 @@ pub struct BugcheckInfo {
     pub driver: Option<String>,
 }
 
+/// How an exception stop is acknowledged when execution resumes.
+///
+/// Windows KD maps these choices to `DBG_CONTINUE` and
+/// `DBG_EXCEPTION_NOT_HANDLED`. Backends without a native exception
+/// disposition continue normally for either value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContinueDisposition {
+    Handled,
+    NotHandled,
+}
+
+impl ContinueDisposition {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Handled => "handled",
+            Self::NotHandled => "not handled",
+        }
+    }
+
+    /// Stable API spelling used by structured frontends.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Handled => "handled",
+            Self::NotHandled => "not_handled",
+        }
+    }
+}
+
+impl std::str::FromStr for ContinueDisposition {
+    type Err = Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "handled" => Ok(Self::Handled),
+            "not_handled" | "not-handled" => Ok(Self::NotHandled),
+            _ => Err(Error::Rsp(format!(
+                "invalid continuation disposition '{value}' (use 'handled' or 'not_handled')"
+            ))),
+        }
+    }
+}
+/// Session-visible details for the most recently observed stop and, after a
+/// resume, the disposition used to acknowledge it.
+#[derive(Clone, Debug)]
+pub struct LastEvent {
+    pub stop: StopEvent,
+    pub disposition: Option<ContinueDisposition>,
+}
+
+impl LastEvent {
+    pub fn new(stop: StopEvent) -> Self {
+        Self {
+            stop,
+            disposition: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 /// Backend-neutral stop event
+///
+/// `first_chance` and `exception_address` are populated only when the
+/// transport provides an exception record. They remain `None` for synthetic
+/// stops and backends that expose only a generic stop signal.
 pub struct StopEvent {
     /// Backend execution-context id, if the stop packet provided one
     pub thread_id: Option<String>,
     /// Backend exception/status code, when the stop packet carries one
     pub exception_code: Option<u32>,
+    /// Whether this is the exception's first debugger notification.
+    pub first_chance: Option<bool>,
+    /// Address from the exception record, when distinct metadata is available.
+    pub exception_address: Option<u64>,
     /// Program counter reported by the stop packet, when available
     pub program_counter: Option<u64>,
     /// Set when the stop was surfaced because the guest is processing a
@@ -437,7 +505,26 @@ pub trait DebugBackend {
         Ok(None)
     }
 
+    /// Best-effort debugger-data block address reported by the transport or
+    /// snapshot container. The target validates the remote header before use.
+    fn target_debugger_data_hint(&mut self) -> Result<Option<DebuggerDataCandidate>> {
+        Ok(None)
+    }
+
     fn continue_execution(&mut self) -> Result<()>;
+    /// Continue with an explicit exception disposition. Ordinary handled
+    /// continuation maps to every transport. A backend must override this
+    /// method before accepting `NotHandled`; silently degrading `gn` to `g`
+    /// would change guest exception dispatch.
+    fn continue_execution_with_disposition(
+        &mut self,
+        disposition: ContinueDisposition,
+    ) -> Result<()> {
+        match disposition {
+            ContinueDisposition::Handled => self.continue_execution(),
+            ContinueDisposition::NotHandled => Err(Error::ExceptionDispositionUnsupported),
+        }
+    }
     fn step(&mut self) -> Result<()>;
     fn interrupt(&mut self) -> Result<StopEvent>;
 

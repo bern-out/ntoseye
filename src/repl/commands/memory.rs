@@ -8,14 +8,16 @@ use crate::expr::Expr;
 use crate::symbols::{FieldValue, ParsedType};
 use crate::types::{Value, VirtAddr};
 use crate::ui;
-use crate::unwind::{format_symbol, resolve_thread_trace_context, try_format_symbol};
+use crate::unwind::{
+    format_symbol, function_range, resolve_thread_trace_context, try_format_symbol,
+};
 
 use crate::repl::*;
 
 repl_command! {
     cmd_db;
     names: ["db"],
-    usage: "db <address> [length or end]",
+    usage: "db <address> [L<count>|length|end]",
     summary: "Display memory as bytes.",
     completion: Expression,
 }
@@ -23,7 +25,7 @@ repl_command! {
 repl_command! {
     cmd_dd;
     names: ["dd"],
-    usage: "dd <address> [length or end]",
+    usage: "dd <address> [L<count>|length|end]",
     summary: "Display memory as doublewords (4 bytes).",
     completion: Expression,
 }
@@ -31,7 +33,7 @@ repl_command! {
 repl_command! {
     cmd_dq;
     names: ["dq"],
-    usage: "dq <address> [length or end]",
+    usage: "dq <address> [L<count>|length|end]",
     summary: "Display memory as quadwords (8 bytes).",
     completion: Expression,
 }
@@ -39,7 +41,7 @@ repl_command! {
 repl_command! {
     cmd_dqs;
     names: ["dqs", "dps"],
-    usage: "dqs <address> [count or end]",
+    usage: "dqs <address> [L<count>|count|end]",
     summary: "Display memory as quadwords, annotating values that resolve to symbols.",
     details: "raw stack triage: dqs @rsp scrapes return addresses when the unwinder can't",
     completion: Expression,
@@ -64,8 +66,16 @@ repl_command! {
 repl_command! {
     cmd_disasm;
     names: ["disasm", "u"],
-    usage: "disasm <address> [length or end]",
+    usage: "disasm <address> [L<count>|length|end]",
     summary: "Disassemble memory at a symbol or address.",
+    completion: Expression,
+}
+
+repl_command! {
+    cmd_uf;
+    names: ["uf"],
+    usage: "uf [address]",
+    summary: "Disassemble the function containing an address.",
     completion: Expression,
 }
 
@@ -104,7 +114,7 @@ repl_command! {
 repl_command! {
     cmd_f;
     names: ["f"],
-    usage: "f <address> <hex bytes> [length or end]",
+    usage: "f <address> <hex bytes> [L<count>|length|end]",
     summary: "Fill memory with a repeated byte pattern.",
     details: "hex bytes: 90, 4883792000740a, or \\x90\\x90",
     completion: [Expression, None, Expression],
@@ -160,14 +170,19 @@ impl ReplState<'_> {
         item_size: u64,
         mode: MemoryDisplayMode,
     ) -> Result<()> {
-        let range =
-            match AddressRange::parse(invocation, &self.ctx.target, default_count, item_size) {
-                Ok(r) => r,
-                Err(e) => {
-                    error!("{}", e);
-                    return Ok(());
-                }
-            };
+        let range = match AddressRange::parse(
+            invocation,
+            &self.ctx.target,
+            self.radix,
+            default_count,
+            item_size,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                error!("{}", e);
+                return Ok(());
+            }
+        };
 
         let mut data: Vec<u8> = vec![0u8; range.len()];
         if let Err(e) = self.read_for_display(range.start, &mut data) {
@@ -193,16 +208,17 @@ impl ReplState<'_> {
             return Ok(());
         }
 
-        let address = match Expr::eval(invocation.arg(0).unwrap(), &self.ctx.target) {
-            Ok(a) => a,
-            Err(e) => {
-                error!("{}", e);
-                return Ok(());
-            }
-        };
+        let address =
+            match Expr::eval_with_radix(invocation.arg(0).unwrap(), &self.ctx.target, self.radix) {
+                Ok(a) => a,
+                Err(e) => {
+                    error!("{}", e);
+                    return Ok(());
+                }
+            };
 
         let expr_str = invocation.join_args(1);
-        let value = match Expr::eval(&expr_str, &self.ctx.target) {
+        let value = match Expr::eval_with_radix(&expr_str, &self.ctx.target, self.radix) {
             Ok(v) => v.0,
             Err(e) => {
                 error!("{}", e);
@@ -240,7 +256,7 @@ impl ReplState<'_> {
     }
 
     fn cmd_dqs(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
-        let range = match AddressRange::parse(&invocation, &self.ctx.target, 16, 8) {
+        let range = match AddressRange::parse(&invocation, &self.ctx.target, self.radix, 16, 8) {
             Ok(r) => r,
             Err(e) => {
                 error!("{}", e);
@@ -295,7 +311,7 @@ impl ReplState<'_> {
             println!("{}\n", command_help(command));
             return Ok(());
         };
-        let start = match Expr::eval(start_arg, &self.ctx.target) {
+        let start = match Expr::eval_with_radix(start_arg, &self.ctx.target, self.radix) {
             Ok(a) => a,
             Err(e) => {
                 error!("{}", e);
@@ -303,7 +319,7 @@ impl ReplState<'_> {
             }
         };
         let max_chars = match invocation.arg(1) {
-            Some(arg) => match Expr::eval(arg, &self.ctx.target) {
+            Some(arg) => match Expr::eval_with_radix(arg, &self.ctx.target, self.radix) {
                 Ok(v) if v.0 > 0 => v.0 as usize,
                 Ok(_) => {
                     error!("invalid max-chars: {}", arg);
@@ -365,7 +381,7 @@ impl ReplState<'_> {
     }
 
     fn cmd_disasm(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
-        let range = match AddressRange::parse(&invocation, &self.ctx.target, 32, 1) {
+        let range = match AddressRange::parse(&invocation, &self.ctx.target, self.radix, 32, 1) {
             Ok(r) => r,
             Err(e) => {
                 error!("{}", e);
@@ -389,6 +405,54 @@ impl ReplState<'_> {
         // TODO dont hardcode 64-bit for WOW64 process? / support other formats?
         let mut formatter = disasm_formatter();
         let rows = decode_rows(&bytes, start_addr.0, None, &mut formatter, resolve);
+        render_rows(&rows, |_| None);
+        println!();
+
+        Ok(())
+    }
+
+    fn cmd_uf(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        let expression = invocation.arg(0).unwrap_or("@rip");
+        let address = match Expr::eval_with_radix(expression, &self.ctx.target, self.radix) {
+            Ok(address) => address,
+            Err(e) => {
+                error!("{}", e);
+                return Ok(());
+            }
+        };
+
+        let dtb = self.ctx.target.current_process()?.dtb();
+        let trace = resolve_thread_trace_context(&self.ctx.target, dtb);
+        let Some((start, end)) = function_range(&self.ctx.target, &trace, address.0) else {
+            error!(
+                "no x64 runtime-function entry contains {}",
+                ui::addr(address.0)
+            );
+            return Ok(());
+        };
+        let Some(len) = end
+            .checked_sub(start)
+            .and_then(|len| usize::try_from(len).ok())
+        else {
+            error!("invalid function range {start:#x}..{end:#x}");
+            return Ok(());
+        };
+        const MAX_FUNCTION_BYTES: usize = 1024 * 1024;
+        if len == 0 || len > MAX_FUNCTION_BYTES {
+            error!("refusing invalid function size {len:#x} bytes");
+            return Ok(());
+        }
+
+        let symbol = format_symbol(&self.ctx.target, &trace, start);
+        println!("{}  {} bytes", ui::symbol(&symbol), len);
+        let mut bytes = vec![0u8; len];
+        if let Err(e) = self.read_for_display(VirtAddr(start), &mut bytes) {
+            println!("{e}\n");
+            return Ok(());
+        }
+        let resolve = |target: u64| format_symbol(&self.ctx.target, &trace, target);
+        let mut formatter = disasm_formatter();
+        let rows = decode_rows(&bytes, start, None, &mut formatter, resolve);
         render_rows(&rows, |_| None);
         println!();
 
@@ -431,13 +495,14 @@ impl ReplState<'_> {
             return Ok(());
         }
 
-        let address = match Expr::eval(invocation.arg(0).unwrap(), &self.ctx.target) {
-            Ok(a) => a,
-            Err(e) => {
-                error!("{}", e);
-                return Ok(());
-            }
-        };
+        let address =
+            match Expr::eval_with_radix(invocation.arg(0).unwrap(), &self.ctx.target, self.radix) {
+                Ok(a) => a,
+                Err(e) => {
+                    error!("{}", e);
+                    return Ok(());
+                }
+            };
 
         let pattern_str = invocation.arg(1).unwrap();
         let pattern = match parse_byte_pattern(pattern_str) {
@@ -449,19 +514,15 @@ impl ReplState<'_> {
         };
 
         let length = match invocation.arg(2) {
-            Some(length_arg) => match Expr::eval(length_arg, &self.ctx.target) {
-                Ok(value) => match resolve_length_or_end(address, value) {
-                    Some(length) => length,
-                    None => {
-                        error!("invalid length or end: {}", length_arg);
+            Some(length_arg) => {
+                match eval_range_length(length_arg, &self.ctx.target, self.radix, address, 1) {
+                    Ok(length) => length,
+                    Err(e) => {
+                        error!("invalid length or end '{}': {}", length_arg, e);
                         return Ok(());
                     }
-                },
-                Err(e) => {
-                    error!("{}", e);
-                    return Ok(());
                 }
-            },
+            }
             None => pattern.len(),
         };
 
@@ -491,13 +552,14 @@ impl ReplState<'_> {
 
         let pattern_str = invocation.arg(1).unwrap();
 
-        let start_addr = match Expr::eval(invocation.arg(0).unwrap(), &self.ctx.target) {
-            Ok(a) => a,
-            Err(e) => {
-                error!("{}", e);
-                return Ok(());
-            }
-        };
+        let start_addr =
+            match Expr::eval_with_radix(invocation.arg(0).unwrap(), &self.ctx.target, self.radix) {
+                Ok(a) => a,
+                Err(e) => {
+                    error!("{}", e);
+                    return Ok(());
+                }
+            };
 
         let pattern = match parse_byte_pattern(pattern_str) {
             Some(pattern) => pattern,
@@ -508,19 +570,21 @@ impl ReplState<'_> {
         };
 
         let length = match invocation.arg(2) {
-            Some(length_arg) => match Expr::eval(length_arg, &self.ctx.target) {
-                Ok(value) => match usize::try_from(value.0) {
-                    Ok(length) => length,
-                    Err(_) => {
-                        error!("invalid length: {}", length_arg);
+            Some(length_arg) => {
+                match Expr::eval_with_radix(length_arg, &self.ctx.target, self.radix) {
+                    Ok(value) => match usize::try_from(value.0) {
+                        Ok(length) => length,
+                        Err(_) => {
+                            error!("invalid length: {}", length_arg);
+                            return Ok(());
+                        }
+                    },
+                    Err(e) => {
+                        error!("{}", e);
                         return Ok(());
                     }
-                },
-                Err(e) => {
-                    error!("{}", e);
-                    return Ok(());
                 }
-            },
+            }
             None => 0x100,
         };
 
@@ -568,7 +632,11 @@ impl ReplState<'_> {
     fn cmd_dt(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
         let arg = require_arg!(invocation, 0, "dt");
 
-        let address = match Expr::eval(invocation.arg(1).unwrap_or("0"), &self.ctx.target) {
+        let address = match Expr::eval_with_radix(
+            invocation.arg(1).unwrap_or("0"),
+            &self.ctx.target,
+            self.radix,
+        ) {
             Ok(a) => a,
             Err(e) => {
                 error!("{}", e);

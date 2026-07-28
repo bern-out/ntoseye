@@ -7,11 +7,13 @@
 
 use crate::backend::MemoryOps;
 use crate::error::{Error, Result};
+use crate::memory::AddressSpace;
 use crate::symbols::{TypeInfo, le_uint};
-use crate::target::Target;
-use crate::types::VirtAddr;
+use crate::target::{SavedThreadRegisters, Target};
+use crate::types::{Dtb, VirtAddr};
 
 pub const KTRAP_FRAME_TYPE: &str = "_KTRAP_FRAME";
+pub const KSWITCH_FRAME_TYPE: &str = "_KSWITCH_FRAME";
 
 /// A decoded x64 `_KTRAP_FRAME`. Only the state the kernel actually saves in
 /// the frame is here: the volatile registers plus rbx/rdi/rsi/rbp and the
@@ -85,18 +87,117 @@ impl KtrapFrame {
         })
     }
 }
+impl From<&KtrapFrame> for SavedThreadRegisters {
+    fn from(frame: &KtrapFrame) -> Self {
+        Self {
+            rip: Some(frame.rip),
+            rsp: Some(frame.rsp),
+            rax: Some(frame.rax),
+            rcx: Some(frame.rcx),
+            rdx: Some(frame.rdx),
+            rbx: Some(frame.rbx),
+            rbp: Some(frame.rbp),
+            rsi: Some(frame.rsi),
+            rdi: Some(frame.rdi),
+            r8: Some(frame.r8),
+            r9: Some(frame.r9),
+            r10: Some(frame.r10),
+            r11: Some(frame.r11),
+            // These registers live in a KEXCEPTION_FRAME, not KTRAP_FRAME.
+            r12: None,
+            r13: None,
+            r14: None,
+            r15: None,
+            rflags: Some(u64::from(frame.eflags)),
+        }
+    }
+}
+
+fn read_frame_bytes(
+    debugger: &Target,
+    dtb: Dtb,
+    type_name: &str,
+    address: VirtAddr,
+) -> Result<(TypeInfo, Vec<u8>)> {
+    let layout = debugger
+        .symbols
+        .find_type_across_modules(dtb, type_name)
+        .ok_or_else(|| Error::StructNotFound(type_name.to_string()))?;
+    let mut buf = vec![0u8; layout.size];
+    AddressSpace::new(&debugger.phys, dtb).read_bytes(address, &mut buf)?;
+    Ok((layout, buf))
+}
+
+pub fn decode_ktrap_frame_for_thread(
+    debugger: &Target,
+    dtb: Dtb,
+    addr: VirtAddr,
+) -> Result<SavedThreadRegisters> {
+    let (layout, buf) = read_frame_bytes(debugger, dtb, KTRAP_FRAME_TYPE, addr)?;
+    let frame = KtrapFrame::decode(&layout, addr.0, &buf)?;
+    Ok(SavedThreadRegisters::from(&frame))
+}
+
+fn decode_kswitch_frame(
+    layout: &TypeInfo,
+    address: VirtAddr,
+    buf: &[u8],
+) -> Result<SavedThreadRegisters> {
+    let field = |name: &str| -> Result<(u64, u32)> {
+        let field = layout
+            .fields
+            .get(name)
+            .ok_or_else(|| Error::FieldNotFound(name.to_string()))?;
+        let offset = field.offset as usize;
+        let size = (field.size as usize).min(8);
+        if size == 0 || offset + size > buf.len() {
+            return Err(Error::FieldNotFound(name.to_string()));
+        }
+        Ok((le_uint(&buf[offset..offset + size]), field.offset))
+    };
+    let optional = |name: &str| field(name).ok().map(|(value, _)| value);
+    let (rip, return_offset) = field("Return")?;
+    let rsp = address
+        .0
+        .checked_add(u64::from(return_offset))
+        .and_then(|value| value.checked_add(8))
+        .ok_or_else(|| Error::DebugInfo("KSWITCH_FRAME stack pointer overflow".into()))?;
+
+    Ok(SavedThreadRegisters {
+        rip: Some(rip),
+        rsp: Some(rsp),
+        // Only fields explicitly described by this build's PDB are exposed.
+        rbx: optional("Rbx"),
+        rbp: optional("Rbp"),
+        rsi: optional("Rsi"),
+        rdi: optional("Rdi"),
+        r12: optional("R12"),
+        r13: optional("R13"),
+        r14: optional("R14"),
+        r15: optional("R15"),
+        ..SavedThreadRegisters::default()
+    })
+}
+
+pub fn decode_kswitch_frame_seed(
+    debugger: &Target,
+    dtb: Dtb,
+    address: VirtAddr,
+) -> Result<SavedThreadRegisters> {
+    let layout = debugger
+        .symbols
+        .find_type_across_modules(dtb, KSWITCH_FRAME_TYPE)
+        .ok_or_else(|| Error::StructNotFound(KSWITCH_FRAME_TYPE.to_string()))?;
+    let mut buf = vec![0u8; layout.size];
+    AddressSpace::new(&debugger.phys, dtb).read_bytes(address, &mut buf)?;
+    decode_kswitch_frame(&layout, address, &buf)
+}
 
 /// Read and decode an `_KTRAP_FRAME` at a kernel address. Fails when the
 /// type is not in the loaded symbols or the memory is unreadable.
 pub fn read_ktrap_frame(debugger: &Target, addr: VirtAddr) -> Result<KtrapFrame> {
-    let process = debugger.current_process()?;
-    let dtb = process.dtb();
-    let layout = debugger
-        .symbols
-        .find_type_across_modules(dtb, KTRAP_FRAME_TYPE)
-        .ok_or_else(|| Error::StructNotFound(KTRAP_FRAME_TYPE.to_string()))?;
-    let mut buf = vec![0u8; layout.size];
-    process.memory().read_bytes(addr, &mut buf)?;
+    let dtb = debugger.current_dtb();
+    let (layout, buf) = read_frame_bytes(debugger, dtb, KTRAP_FRAME_TYPE, addr)?;
     KtrapFrame::decode(&layout, addr.0, &buf)
 }
 
@@ -210,5 +311,76 @@ mod tests {
         // Buffer ends before Rsp/SegSs.
         let buf = vec![0u8; 0x70];
         assert!(KtrapFrame::decode(&layout, 0, &buf).is_err());
+    }
+
+    #[test]
+    fn trap_frame_conversion_reports_unsaved_nonvolatile_registers() {
+        let layout = test_layout();
+        let mut buf = vec![0u8; layout.size];
+        buf[0x40..0x48].copy_from_slice(&0x44u64.to_le_bytes());
+        buf[0x58..0x60].copy_from_slice(&0x55u64.to_le_bytes());
+        buf[0x68..0x70].copy_from_slice(&0xffff_f800_0000_1000u64.to_le_bytes());
+        buf[0x78..0x80].copy_from_slice(&0xffff_a000_0000_2000u64.to_le_bytes());
+
+        let frame = KtrapFrame::decode(&layout, 0xffff_a000_0000_1800, &buf).unwrap();
+        let registers = SavedThreadRegisters::from(&frame);
+        assert_eq!(registers.rip, Some(0xffff_f800_0000_1000));
+        assert_eq!(registers.rsp, Some(0xffff_a000_0000_2000));
+        assert_eq!(registers.rbx, Some(0x44));
+        assert_eq!(registers.rbp, Some(0x55));
+        assert_eq!(registers.r12, None);
+        assert_eq!(registers.r13, None);
+        assert_eq!(registers.r14, None);
+        assert_eq!(registers.r15, None);
+    }
+
+    #[test]
+    fn switch_frame_seed_uses_only_pdb_described_fields() {
+        let mut fields = HashMap::new();
+        fields.insert(
+            "Rbp".to_string(),
+            FieldInfo {
+                offset: 0x30,
+                size: 8,
+                type_data: ParsedType::Primitive("test".into()),
+            },
+        );
+        fields.insert(
+            "Return".to_string(),
+            FieldInfo {
+                offset: 0x38,
+                size: 8,
+                type_data: ParsedType::Primitive("test".into()),
+            },
+        );
+        let layout = TypeInfo {
+            name: KSWITCH_FRAME_TYPE.to_string(),
+            size: 0x40,
+            fields,
+        };
+        let mut buf = vec![0u8; layout.size];
+        buf[0x30..0x38].copy_from_slice(&0x1234u64.to_le_bytes());
+        buf[0x38..0x40].copy_from_slice(&0xffff_f800_0000_3000u64.to_le_bytes());
+
+        let registers =
+            decode_kswitch_frame(&layout, VirtAddr(0xffff_a000_0000_1000), &buf).unwrap();
+        assert_eq!(registers.rip, Some(0xffff_f800_0000_3000));
+        assert_eq!(registers.rsp, Some(0xffff_a000_0000_1040));
+        assert_eq!(registers.rbp, Some(0x1234));
+        assert_eq!(registers.rbx, None);
+        assert_eq!(registers.rax, None);
+    }
+
+    #[test]
+    fn switch_frame_without_return_is_explicitly_unusable() {
+        let layout = TypeInfo {
+            name: KSWITCH_FRAME_TYPE.to_string(),
+            size: 8,
+            fields: HashMap::new(),
+        };
+        assert!(matches!(
+            decode_kswitch_frame(&layout, VirtAddr(0x1000), &[0; 8]),
+            Err(Error::FieldNotFound(name)) if name == "Return"
+        ));
     }
 }

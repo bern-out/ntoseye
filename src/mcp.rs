@@ -18,8 +18,9 @@ use std::time::Duration;
 
 use crate::backend::MemoryOps;
 use crate::bugchecks::{analyze_bugcheck, bugcheck_from_dump_info, current_bugcheck};
-use crate::dbg_backend::{DebugBackend, WatchpointAccess};
-use crate::dmp::{DmpBackend, DmpException, DmpSystemInfo, TriageCrashInfo, UnloadedDriver};
+use crate::dbg_backend::{ContinueDisposition, DebugBackend, WatchpointAccess};
+use crate::diagnostics;
+use crate::dmp::DmpBackend;
 use crate::error::Error;
 use crate::expr::Expr;
 use crate::gdb::GdbClient;
@@ -31,7 +32,7 @@ use crate::session::{ContinueOutcome, RunStatus, Session};
 use crate::symbols::{FieldValue, TypeInfo};
 use crate::target::{kthread_state_name, wait_reason_name};
 use crate::trapframe::read_ktrap_frame_at_or_current;
-use crate::triage::TriagePrcbInfo;
+use crate::triage_report::TriageReport;
 use crate::types::VirtAddr;
 use crate::unwind::StackFrame;
 use crate::view;
@@ -50,9 +51,9 @@ enum Command {
         job: SessionJob,
         reply: oneshot::Sender<Result<Value, ToolError>>,
     },
-    /// Clean up the session (remove our breakpoints, resume the VM) and stop the
-    /// actor. `ack` fires once cleanup is done so the caller can exit knowing the
-    /// guest isn't left frozen with `int3`s installed.
+    /// Clean up the session and stop the actor. The guest resumes only after
+    /// every debugger-owned breakpoint is restored; cleanup failure is reported
+    /// and leaves the target halted rather than running with an orphaned int3.
     Shutdown { ack: oneshot::Sender<()> },
     /// A periodic nudge (from the background ticker) for the actor to service the
     /// guest while otherwise idle; absorb wrong-process hits on a shared-page
@@ -66,11 +67,14 @@ enum Command {
 /// absorbed within a frame, large enough that the idle no-op is negligible.
 const SERVICE_TICK: Duration = Duration::from_millis(20);
 
-/// Tear down so the guest isn't left frozen at a stop with our `int3`s patched
-/// in: remove breakpoints and leave the VM running (the halt-then-resume detail
-/// lives in `Session::cleanup_for_exit`).
+/// Restore debugger-owned breakpoint sites and resume the guest only when
+/// cleanup succeeds. On failure, leave the target halted and report the error.
 fn cleanup_session(ctx: &mut Session) {
-    let _ = ctx.cleanup_for_exit();
+    if let Err(error) = ctx.cleanup_for_exit() {
+        diagnostics::eprint_warning(format!(
+            "debugger cleanup failed; target was not resumed: {error}"
+        ));
+    }
 }
 
 /// Spawn the actor thread that owns the (`!Send`) debugging session. The backend
@@ -279,6 +283,53 @@ struct AddressArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SymbolArgs {
+    #[schemars(description = "Exact symbol name, optionally qualified as module!name")]
+    name: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SourceLineArgs {
+    #[schemars(description = "PDB-recorded path, remapped path, or bare filename")]
+    file: String,
+    #[schemars(range(min = 1), description = "1-based source line")]
+    line: u32,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct HandleArgs {
+    #[schemars(description = "Handle value as a debugger expression")]
+    handle: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct HandleListArgs {
+    #[schemars(
+        range(min = 1, max = 4096),
+        description = "Maximum handle-table slots to inspect (default 256, range 1-4096)"
+    )]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ResourceListArgs {
+    #[schemars(
+        range(min = 1, max = 1024),
+        description = "Maximum resource-list entries to inspect (default 256, range 1-1024)"
+    )]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct MemoryUsageArgs {
+    #[schemars(
+        range(min = 1, max = 256),
+        description = "Maximum processes to include (default 64, range 1-256)"
+    )]
+    process_limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct TrapFrameArgs {
     #[schemars(
         description = "Optional trap-frame address as a debugger expression; omit to use the current Windows thread's saved KTHREAD.TrapFrame"
@@ -440,6 +491,24 @@ struct SetBreakpointArgs {
     condition: Option<String>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SetSymbolBreakpointArgs {
+    #[schemars(description = "Exact symbol identity, optionally module-qualified")]
+    symbol: String,
+    #[schemars(description = "Optional break condition evaluated on every hit")]
+    condition: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SetSourceBreakpointArgs {
+    #[schemars(description = "PDB-recorded path, remapped path, or bare filename")]
+    file: String,
+    #[schemars(range(min = 1), description = "1-based source line")]
+    line: u32,
+    #[schemars(description = "Optional break condition evaluated on every hit")]
+    condition: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 enum WatchpointAccessArg {
@@ -454,6 +523,30 @@ impl From<WatchpointAccessArg> for WatchpointAccess {
             WatchpointAccessArg::ReadWrite => Self::ReadWrite,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum ContinueDispositionArg {
+    Handled,
+    NotHandled,
+}
+
+impl From<ContinueDispositionArg> for ContinueDisposition {
+    fn from(disposition: ContinueDispositionArg) -> Self {
+        match disposition {
+            ContinueDispositionArg::Handled => Self::Handled,
+            ContinueDispositionArg::NotHandled => Self::NotHandled,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ResumeArgs {
+    #[schemars(
+        description = "Exception acknowledgement: handled (default) or not_handled. not_handled requires native transport support (currently KD) and otherwise returns an error."
+    )]
+    disposition: Option<ContinueDispositionArg>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -611,6 +704,7 @@ const SEARCH_MAX_LIMIT: usize = 500;
 const DISASSEMBLE_MAX_COUNT: usize = 128;
 const BACKTRACE_DEFAULT_LIMIT: usize = 64;
 const BACKTRACE_MAX_LIMIT: usize = 256;
+const TRIAGE_MODULE_LIMIT: usize = 200;
 const CONTINUE_DEFAULT_TIMEOUT_MS: u64 = 10_000;
 // Capped well under common MCP client request timeouts (e.g. oh-my-pi defaults to
 // 30s) so a wait returns {stop:"running"} and frees the single-session actor
@@ -765,6 +859,7 @@ fn continue_outcome_json(ctx: &Session, outcome: ContinueOutcome) -> Value {
             temporary,
             rip,
             condition_error,
+            ..
         } => {
             let bp = ctx.breakpoint(id);
             let watch_access = bp.and_then(|bp| bp.watch_access_name());
@@ -795,10 +890,14 @@ fn continue_outcome_json(ctx: &Session, outcome: ContinueOutcome) -> Value {
         ContinueOutcome::Stopped {
             rip,
             exception_code,
+            first_chance,
+            exception_address,
         } => serde_json::json!({
             "stop": "exception",
             "rip": hex(rip),
             "exception_code": exception_code,
+            "first_chance": first_chance,
+            "exception_address": exception_address.map(hex),
             "symbol": symbol_at(rip),
             "process": process,
         }),
@@ -994,149 +1093,8 @@ fn module_json(m: &ModuleInfo) -> Value {
     v
 }
 
-fn exception_json(exc: &DmpException) -> Value {
-    serde_json::json!({
-        "code": exc.code,
-        "code_hex": hex(exc.code as u64),
-        "code_name": exception_code_name(exc.code),
-        "flags": exc.flags,
-        "address": hex(exc.address),
-        "parameters": exc.parameters.iter().map(|p| hex(*p)).collect::<Vec<_>>(),
-    })
-}
-
-fn exception_code_name(code: u32) -> &'static str {
-    match code {
-        0xC0000005 => "STATUS_ACCESS_VIOLATION",
-        0xC000001D => "STATUS_ILLEGAL_INSTRUCTION",
-        0xC0000094 => "STATUS_INTEGER_DIVIDE_BY_ZERO",
-        0xC0000095 => "STATUS_INTEGER_OVERFLOW",
-        0xC0000096 => "STATUS_PRIVILEGED_INSTRUCTION",
-        0xC00000FD => "STATUS_STACK_OVERFLOW",
-        0xC0000006 => "STATUS_IN_PAGE_ERROR",
-        0x80000003 => "STATUS_BREAKPOINT",
-        0x80000004 => "STATUS_SINGLE_STEP",
-        0xC000008E => "STATUS_FLOAT_DIVIDE_BY_ZERO",
-        0xC0000090 => "STATUS_FLOAT_INVALID_OPERATION",
-        0xC0000091 => "STATUS_FLOAT_OVERFLOW",
-        0xC000008D => "STATUS_FLOAT_DENORMAL_OPERAND",
-        0xC0000092 => "STATUS_FLOAT_STACK_CHECK",
-        0xC0000093 => "STATUS_FLOAT_UNDERFLOW",
-        0xC000008F => "STATUS_FLOAT_INEXACT_RESULT",
-        _ => "unknown",
-    }
-}
-
-fn system_info_json(info: &DmpSystemInfo) -> Value {
-    let product = match info.product_type {
-        1 => "Workstation",
-        2 => "DomainController",
-        3 => "Server",
-        _ => "Unknown",
-    };
-    let system_time = if info.system_time != 0 {
-        filetime_to_iso(info.system_time as u64)
-    } else {
-        None
-    };
-    let machine = match info.machine_image_type {
-        0x014c => "I386",
-        0x8664 => "AMD64",
-        0xAA64 => "ARM64",
-        _ => "Unknown",
-    };
-    serde_json::json!({
-        "major_version": info.major_version,
-        "build": info.minor_version,
-        "service_pack_build": info.service_pack_build,
-        "machine_image_type": hex(info.machine_image_type as u64),
-        "machine": machine,
-        "system_time": system_time,
-        "system_up_time_secs": if info.system_up_time != 0 {
-            Some(info.system_up_time / 10_000_000)
-        } else {
-            None
-        },
-        "product_type": product,
-        "suite_mask": hex(info.suite_mask as u64),
-    })
-}
-
-/// Crash context extracted from the triage EPROCESS/ETHREAD snapshots,
-/// shared by `open_dump` and `triage`.
-fn crash_context_json(ci: &TriageCrashInfo) -> Value {
-    let mut v = serde_json::json!({
-        "process_name": ci.process_name,
-        "process_id": ci.process_id,
-        "thread_id": ci.thread_id,
-    });
-    let obj = v.as_object_mut().unwrap();
-    if let Some(ppid) = ci.parent_process_id {
-        obj.insert("parent_process_id".into(), serde_json::json!(ppid));
-    }
-    if let Some(es) = ci.exit_status {
-        obj.insert("exit_status".into(), hex(es as u64).into());
-    }
-    if let Some(ct) = ci.create_time {
-        obj.insert("create_time".into(), filetime_to_iso(ct).into());
-    }
-    if let Some(es) = ci.thread_exit_status {
-        obj.insert("thread_exit_status".into(), hex(es as u64).into());
-    }
-    v
-}
-
-/// Crashing processor's PRCB summary, shared by `open_dump` and `triage`.
-fn prcb_json(p: &TriagePrcbInfo) -> Value {
-    serde_json::json!({
-        "current_thread": hex(p.current_thread),
-        "processor_number": p.processor_number,
-        "mhz": p.mhz,
-        "cpu_type": p.cpu_type,
-        "vendor_string": p.vendor_string,
-    })
-}
-
-fn filetime_to_iso(ft: u64) -> Option<String> {
-    // Windows FILETIME: 100-ns intervals since 1601-01-01 UTC.
-    // Unix epoch is 11644473600 seconds after that.
-    const EPOCH_DIFF: i64 = 11_644_473_600;
-    let secs = (ft / 10_000_000) as i64 - EPOCH_DIFF;
-    if !(0..=253_402_300_799).contains(&secs) {
-        return None;
-    }
-    let s = secs % 60;
-    let total_m = secs / 60;
-    let m = total_m % 60;
-    let total_h = total_m / 60;
-    let h = total_h % 24;
-    let days = total_h / 24;
-    // Approximate date from days since epoch (good enough for display)
-    let (y, mo, d) = days_to_ymd(days);
-    Some(format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z"))
-}
-
-fn days_to_ymd(mut days: i64) -> (i64, i64, i64) {
-    // Civil days since 1970-01-01 to (year, month, day)
-    days += 719_468;
-    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
-    let doe = days - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
-}
-
-fn unloaded_driver_json(d: &UnloadedDriver) -> Value {
-    serde_json::json!({
-        "name": d.name,
-        "start_address": hex(d.start_address),
-        "end_address": hex(d.end_address),
-    })
+fn triage_report_json(report: TriageReport) -> Value {
+    view::to_json(&view::triage_report(&report, TRIAGE_MODULE_LIMIT))
 }
 
 fn read_virt_bytes(ctx: &mut Session, addr: u64, buf: &mut [u8]) -> Result<(), ToolError> {
@@ -1404,7 +1362,7 @@ impl NtoseyeMcp {
         let v = self
             .run(|ctx| {
                 require_halted(ctx, "registers")?;
-                let regs = ctx.backend.read_registers().map_err(ToolError::from)?;
+                let regs = ctx.read_registers().map_err(ToolError::from)?;
                 let map: serde_json::Map<String, Value> = ctx
                     .register_map
                     .to_hashmap(&regs)
@@ -1606,6 +1564,139 @@ impl NtoseyeMcp {
     }
 
     #[tool(
+        description = "Enumerate bounded handles for the selected/current process. Each independently decoded field is {available,value,error}. Returns process/table metadata, truncation state, and entries."
+    )]
+    async fn handles(
+        &self,
+        Parameters(HandleListArgs { limit }): Parameters<HandleListArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let limit = optional_limit("limit", limit, 256, 4096)?;
+        let v = self
+            .run(move |ctx| {
+                let summary = ctx
+                    .target
+                    .enumerate_handles(limit)
+                    .map_err(ToolError::from)?;
+                Ok(view::to_json(&view::handle_table(&summary)))
+            })
+            .await?;
+        json_result(v)
+    }
+
+    #[tool(
+        description = "Decode one handle from the selected/current process handle table. The handle accepts a debugger expression; independently decoded fields are {available,value,error}."
+    )]
+    async fn inspect_handle(
+        &self,
+        Parameters(HandleArgs { handle }): Parameters<HandleArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let v = self
+            .run(move |ctx| {
+                let handle = eval_addr(ctx, &handle)?;
+                let detail = ctx.target.inspect_handle(handle).map_err(ToolError::from)?;
+                Ok(view::to_json(&view::handle_entry(&detail)))
+            })
+            .await?;
+        json_result(v)
+    }
+
+    #[tool(
+        description = "Decode the selected/current process primary token, including IDs, user/groups, privileges, type, impersonation level, and flags. Independently decoded fields are {available,value,error}."
+    )]
+    async fn inspect_process_token(&self) -> Result<CallToolResult, McpError> {
+        let v = self
+            .run(|ctx| {
+                let token = ctx
+                    .target
+                    .inspect_process_token()
+                    .map_err(ToolError::from)?;
+                Ok(view::to_json(&view::token(&token)))
+            })
+            .await?;
+        json_result(v)
+    }
+
+    #[tool(
+        description = "Decode a _FILE_OBJECT and its device/name relationships from an address expression. Independently decoded fields are {available,value,error}."
+    )]
+    async fn inspect_file_object(
+        &self,
+        Parameters(AddressArgs { address }): Parameters<AddressArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let v = self
+            .run(move |ctx| {
+                let address = eval_addr(ctx, &address)?;
+                let file = ctx
+                    .target
+                    .inspect_file_object(VirtAddr(address))
+                    .map_err(ToolError::from)?;
+                Ok(view::to_json(&view::file_object(&file)))
+            })
+            .await?;
+        json_result(v)
+    }
+
+    #[tool(
+        description = "Decode one executive resource at an address expression. Independently decoded fields are {available,value,error}."
+    )]
+    async fn inspect_resource(
+        &self,
+        Parameters(AddressArgs { address }): Parameters<AddressArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let v = self
+            .run(move |ctx| {
+                let address = eval_addr(ctx, &address)?;
+                let resource = ctx
+                    .target
+                    .inspect_resource(VirtAddr(address))
+                    .map_err(ToolError::from)?;
+                Ok(view::to_json(&view::resource(&resource)))
+            })
+            .await?;
+        json_result(v)
+    }
+
+    #[tool(
+        description = "Enumerate the symbol-backed executive-resource list without scanning memory. Returns the bounded resources plus structured list termination."
+    )]
+    async fn resources(
+        &self,
+        Parameters(ResourceListArgs { limit }): Parameters<ResourceListArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let limit = optional_limit("limit", limit, 256, 1024)?;
+        let v = self
+            .run(move |ctx| {
+                let resources = ctx
+                    .target
+                    .enumerate_resources(limit)
+                    .map_err(ToolError::from)?;
+                Ok(view::to_json(&view::resource_list(&resources)))
+            })
+            .await?;
+        json_result(v)
+    }
+
+    #[tool(
+        description = "Return bounded system and per-process memory-use counters. Every counter records {available,value,error,source}; page counters are pages and nonpaged_pool_bytes is bytes."
+    )]
+    async fn memory_usage(
+        &self,
+        Parameters(MemoryUsageArgs { process_limit }): Parameters<MemoryUsageArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let process_limit = optional_limit("process_limit", process_limit, 64, 256)?;
+        let v = self
+            .run(move |ctx| {
+                let summary = ctx
+                    .target
+                    .memory_use_summary(process_limit)
+                    .map_err(ToolError::from)?;
+                Ok(view::to_json(&view::memory_usage(&summary)))
+            })
+            .await?;
+        json_result(v)
+    }
+
+    #[tool(
         description = "Enumerate process/thread/image notification callbacks (Psp*NotifyRoutine arrays). `filter` is a case-insensitive substring matched against the resolved routine symbol. Paged via offset/limit. Returns {total, offset, returned, has_more, next_offset?, callbacks:[{kind, index, function, symbol, block, raw, context}]}."
     )]
     async fn notify_callbacks(
@@ -1731,13 +1822,107 @@ impl NtoseyeMcp {
         let v = self
             .run(move |ctx| {
                 let addr = eval_addr(ctx, &address)?;
-                let symbol = ctx.target.closest_symbol_current_context(VirtAddr(addr));
-                Ok(serde_json::json!({ "address": hex(addr), "symbol": symbol }))
+                let address = VirtAddr(addr);
+                Ok(view::to_json(&view::nearest_symbol(
+                    address,
+                    ctx.target.nearest_symbol_current_context(address),
+                )))
             })
             .await?;
         json_result(v)
     }
 
+    #[tool(
+        description = "Return every exact PDB symbol identity matching a name, retaining module, address, public/private visibility, and private-compiland provenance."
+    )]
+
+    async fn symbol_candidates(
+        &self,
+        Parameters(SymbolArgs { name }): Parameters<SymbolArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let v = self
+            .run(move |ctx| {
+                Ok(Value::Array(
+                    ctx.target
+                        .symbol_candidates(&name)
+                        .iter()
+                        .map(|candidate| view::to_json(&view::symbol_candidate(candidate)))
+                        .collect(),
+                ))
+            })
+            .await?;
+        json_result(v)
+    }
+
+    #[tool(
+        description = "Resolve an address expression to PDB source metadata {file,line,column,local_path,local_exists}; returns null when no source line covers the address."
+    )]
+    async fn source_location(
+        &self,
+        Parameters(AddressArgs { address }): Parameters<AddressArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let v = self
+            .run(move |ctx| {
+                let address = VirtAddr(eval_addr(ctx, &address)?);
+                Ok(ctx
+                    .target
+                    .source_location(address)
+                    .as_ref()
+                    .map(|location| view::to_json(&view::source_location(location)))
+                    .unwrap_or(Value::Null))
+            })
+            .await?;
+        json_result(v)
+    }
+
+    #[tool(
+        description = "Resolve every loaded address matching a PDB source file and line. A bare filename matches any recorded basename; returns a JSON array of addresses."
+    )]
+    async fn source_addresses(
+        &self,
+        Parameters(SourceLineArgs { file, line }): Parameters<SourceLineArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let v = self
+            .run(move |ctx| {
+                Ok(Value::Array(
+                    ctx.target
+                        .source_addresses(&file, line)
+                        .into_iter()
+                        .map(|address| Value::String(hex(address.0)))
+                        .collect(),
+                ))
+            })
+            .await?;
+        json_result(v)
+    }
+
+    #[tool(
+        description = "Return private locals and parameters in scope at an address expression. Each row has name/type/size/location and a scalar value only when the address equals the current halted RIP and its PDB recipe is safely evaluable."
+    )]
+    async fn procedure_locals(
+        &self,
+        Parameters(AddressArgs { address }): Parameters<AddressArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let v = self
+            .run(move |ctx| {
+                let address = VirtAddr(eval_addr(ctx, &address)?);
+                let locals = ctx
+                    .target
+                    .procedure_locals(address)
+                    .map_err(ToolError::from)?
+                    .unwrap_or_default();
+                Ok(Value::Array(
+                    locals
+                        .iter()
+                        .map(|local| {
+                            view::to_json(&view::procedure_local(&ctx.target, address, local))
+                        })
+                        .collect(),
+                ))
+            })
+            .await?;
+        json_result(v)
+    }
     #[tool(
         description = "Get a struct/class type's layout; returns {name, size, fields:[{name, offset, size, type}]} sorted by offset. Use enum_values for PDB enums."
     )]
@@ -1792,38 +1977,14 @@ impl NtoseyeMcp {
         let limit = optional_limit("limit", limit, 50, 500)?;
         let v = self
             .run(move |ctx| {
-                let dtb = ctx.target.current_dtb();
-                let (module, names) = match query.split_once('!') {
-                    Some((m, q)) => (
-                        Some(m.to_string()),
-                        ctx.target
-                            .symbols
-                            .search_symbols_in_module(dtb, m, q, limit),
-                    ),
-                    None => (
-                        None,
-                        ctx.target.current_symbol_index().search(&query, limit),
-                    ),
-                };
-                let symbols: Vec<Value> = names
-                    .iter()
-                    .map(|name| {
-                        let lookup = match &module {
-                            Some(m) => format!("{m}!{name}"),
-                            None => name.clone(),
-                        };
-                        let resolved = ctx.target.symbols.find_symbol_with_module(dtb, &lookup);
-                        serde_json::json!({
-                            "name": name,
-                            "address": resolved.as_ref().map(|(a, _)| hex(a.0)),
-                            "module": resolved.map(|(_, m)| m),
-                        })
-                    })
-                    .collect();
+                let symbols = ctx.target.search_symbols(&query, limit);
                 Ok(serde_json::json!({
                     "query": query,
                     "total": symbols.len(),
-                    "symbols": symbols,
+                    "symbols": symbols
+                        .iter()
+                        .map(|symbol| view::to_json(&view::symbol_search_match(symbol)))
+                        .collect::<Vec<_>>(),
                 }))
             })
             .await?;
@@ -2320,6 +2481,65 @@ impl NtoseyeMcp {
     }
 
     #[tool(
+        description = "Set a reload-stable symbol-identity breakpoint that may remain deferred until matching symbols load. Requires the VM halted. Returns the canonical breakpoint state."
+    )]
+    async fn set_symbol_breakpoint(
+        &self,
+        Parameters(SetSymbolBreakpointArgs { symbol, condition }): Parameters<
+            SetSymbolBreakpointArgs,
+        >,
+    ) -> Result<CallToolResult, McpError> {
+        let v = self
+            .run(move |ctx| {
+                require_halted(ctx, "set_symbol_breakpoint")?;
+                let id = ctx
+                    .add_symbol_breakpoint(symbol, condition)
+                    .map_err(ToolError::from)?;
+                let breakpoint = ctx.breakpoint(id).ok_or_else(|| {
+                    ToolError::Request(format!("breakpoint {id} disappeared after install"))
+                })?;
+                Ok(view::to_json(&view::breakpoint(breakpoint)))
+            })
+            .await?;
+        json_result(v)
+    }
+
+    #[tool(
+        description = "Set source-identity breakpoints for every loaded address matching file:line, or one deferred identity when no module matches. Requires the VM halted. Returns canonical breakpoint states."
+    )]
+    async fn set_source_breakpoint(
+        &self,
+        Parameters(SetSourceBreakpointArgs {
+            file,
+            line,
+            condition,
+        }): Parameters<SetSourceBreakpointArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let v = self
+            .run(move |ctx| {
+                require_halted(ctx, "set_source_breakpoint")?;
+                let ids = ctx
+                    .add_source_breakpoint(format!("{file}:{line}"), condition)
+                    .map_err(ToolError::from)?;
+                let breakpoints = ids
+                    .into_iter()
+                    .map(|id| {
+                        ctx.breakpoint(id)
+                            .map(|breakpoint| view::to_json(&view::breakpoint(breakpoint)))
+                            .ok_or_else(|| {
+                                ToolError::Request(format!(
+                                    "breakpoint {id} disappeared after install"
+                                ))
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Value::Array(breakpoints))
+            })
+            .await?;
+        json_result(v)
+    }
+
+    #[tool(
         description = "Watch a data address globally across guest address spaces for write or read/write access. length is 1, 2, 4, or 8 bytes and the address must be naturally aligned. Requires the VM halted and a backend with data-watch support (currently KD). Returns {id, address, access, length, condition}."
     )]
     async fn set_watchpoint(
@@ -2410,7 +2630,7 @@ impl NtoseyeMcp {
     }
 
     #[tool(
-        description = "List code breakpoints and data watchpoints as {id, address, enabled, symbol, scope, condition, temporary, watch_access, watch_length} objects. watch_access/watch_length are null for code breakpoints."
+        description = "List code breakpoints and data watchpoints. address is null while a symbolic/source breakpoint is deferred. Each entry includes {id, address, enabled, resolved, deferred, specification, symbol, scope, condition, pass_count, hit_count, remaining_pass_count, one_shot, action, temporary, watch_access, watch_length}."
     )]
     async fn list_breakpoints(&self) -> Result<CallToolResult, McpError> {
         let v = self
@@ -2427,11 +2647,17 @@ impl NtoseyeMcp {
     }
 
     #[tool(
-        description = "Resume the VM (go). Non-blocking: returns immediately as {running:true, already_running:bool}. To wait for the next stop, call wait_for_stop; to see where it is now without resuming, call status."
+        description = "Resume the VM with an optional exception acknowledgement (handled by default, or not_handled). not_handled requires the KD backend. Non-blocking: returns {running:true, already_running, disposition}. To wait for the next stop, call wait_for_stop."
     )]
-    async fn resume(&self) -> Result<CallToolResult, McpError> {
+    async fn resume(
+        &self,
+        Parameters(ResumeArgs { disposition }): Parameters<ResumeArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let disposition = disposition
+            .map(ContinueDisposition::from)
+            .unwrap_or(ContinueDisposition::Handled);
         let v = self
-            .run(|ctx| {
+            .run(move |ctx| {
                 // Drain any stop the servicer caught so a real halt that already
                 // surfaced is reflected as `already_running:false` and the resume
                 // below actually advances past it, rather than the stale running
@@ -2440,9 +2666,14 @@ impl NtoseyeMcp {
                 ctx.settle_pending_stop().map_err(ToolError::from)?;
                 let already_running = ctx.backend.is_running();
                 if !already_running {
-                    ctx.resume().map_err(ToolError::from)?;
+                    ctx.resume_with_disposition(disposition)
+                        .map_err(ToolError::from)?;
                 }
-                Ok(serde_json::json!({ "running": true, "already_running": already_running }))
+                Ok(serde_json::json!({
+                    "running": true,
+                    "already_running": already_running,
+                    "disposition": disposition.name(),
+                }))
             })
             .await?;
         json_result(v)
@@ -2534,8 +2765,7 @@ impl NtoseyeMcp {
                     ctx.interrupt().map_err(ToolError::from)?.program_counter
                 };
                 let rip = event_rip.or_else(|| {
-                    ctx.backend
-                        .read_registers()
+                    ctx.read_registers()
                         .ok()
                         .and_then(|r| ctx.register_map.read_u64("rip", &r).ok())
                 });
@@ -2556,7 +2786,7 @@ impl NtoseyeMcp {
             .run(|ctx| {
                 require_halted(ctx, "step")?;
                 ctx.step().map_err(ToolError::from)?;
-                let regs = ctx.backend.read_registers().map_err(ToolError::from)?;
+                let regs = ctx.read_registers().map_err(ToolError::from)?;
                 let rip = ctx.register_map.read_u64("rip", &regs).unwrap_or(0);
                 let symbol = ctx.target.closest_symbol_current_context(VirtAddr(rip));
                 Ok(serde_json::json!({ "rip": hex(rip), "symbol": symbol }))
@@ -2686,15 +2916,22 @@ impl NtoseyeMcp {
                 let bc =
                     current_bugcheck(&ctx.target).or_else(|| bugcheck_from_dump_info(&ctx.target));
                 let dmp = ctx.target.phys.dmp_info();
-                let crash_context = ctx.backend.triage_crash_info().map(crash_context_json);
-                let prcb = dmp.and_then(|d| d.triage_prcb_info.as_ref()).map(prcb_json);
+                let crash_context = ctx
+                    .backend
+                    .triage_crash_info()
+                    .map(|context| view::to_json(&view::crash_context(context)));
+                let prcb = dmp
+                    .and_then(|dump| dump.triage_prcb_info.as_ref())
+                    .map(|prcb| view::to_json(&view::prcb(prcb)));
                 Ok(serde_json::json!({
                     "status": "opened",
                     "path": path,
                     "processors": processors,
                     "bugcheck": bc.map(|a| view::to_json(&view::bugcheck(&a))),
-                    "exception": dmp.and_then(|d| d.exception.as_ref().map(exception_json)),
-                    "system_info": dmp.and_then(|d| d.system_info.as_ref().map(system_info_json)),
+                    "exception": dmp.and_then(|dump| dump.exception.as_ref())
+                        .map(|exception| view::to_json(&view::dump_exception(exception))),
+                    "system_info": dmp.and_then(|dump| dump.system_info.as_ref())
+                        .map(|info| view::to_json(&view::system_info(info))),
                     "crash_context": crash_context,
                     "prcb": prcb,
                     "broken_driver": dmp.and_then(|d| d.broken_driver.clone()),
@@ -2765,57 +3002,7 @@ impl NtoseyeMcp {
     )]
     async fn triage(&self) -> Result<CallToolResult, McpError> {
         let v = self
-            .run(|ctx| {
-                let s = ctx.run_status();
-                let running = s.running;
-                let status = run_status_json(s);
-
-                let bc = current_bugcheck(&ctx.target)
-                    .or_else(|| bugcheck_from_dump_info(&ctx.target))
-                    .map(|a| view::to_json(&view::bugcheck(&a)));
-
-                let bt = if !running {
-                    ctx.backtrace(BACKTRACE_DEFAULT_LIMIT)
-                        .ok()
-                        .map(|trace| Value::Array(trace.frames.iter().map(frame_json).collect()))
-                } else {
-                    None
-                };
-
-                let all_mods = ctx.target.kernel_modules_with_versions().unwrap_or_default();
-                let modules_total = all_mods.len();
-                let mods: Vec<Value> = all_mods.iter().take(200).map(module_json).collect();
-
-                let dmp = ctx.target.phys.dmp_info();
-                let exception = dmp.and_then(|d| d.exception.as_ref().map(exception_json));
-                let system_info = dmp.and_then(|d| d.system_info.as_ref().map(system_info_json));
-                let unloaded: Vec<Value> = dmp
-                    .map(|d| {
-                        d.unloaded_drivers
-                            .iter()
-                            .map(unloaded_driver_json)
-                            .collect()
-                    })
-                    .unwrap_or_default();
-
-                let crash_context = ctx.backend.triage_crash_info().map(crash_context_json);
-                let prcb = dmp.and_then(|d| d.triage_prcb_info.as_ref()).map(prcb_json);
-
-                Ok(serde_json::json!({
-                    "status": status,
-                    "bugcheck": bc,
-                    "exception": exception,
-                    "system_info": system_info,
-                    "backtrace": bt,
-                    "modules": mods,
-                    "modules_total": modules_total,
-                    "unloaded_drivers": unloaded,
-                    "crash_context": crash_context,
-                    "prcb": prcb,
-                    "broken_driver": dmp.and_then(|d| d.broken_driver.clone()),
-                    "triage_overflowed": dmp.map(|d| d.triage_overflowed),
-                }))
-            })
+            .run(|ctx| Ok(triage_report_json(TriageReport::build(ctx))))
             .await?;
         json_result(v)
     }
@@ -3208,9 +3395,26 @@ mod tests {
     }
 
     #[test]
-    fn structured_trap_frame_and_watchpoint_tools_are_registered() {
+    fn structured_debugger_tools_are_registered() {
         let mcp = empty_mcp();
-        for name in ["inspect_trap_frame", "set_watchpoint", "list_breakpoints"] {
+        for name in [
+            "inspect_trap_frame",
+            "set_watchpoint",
+            "list_breakpoints",
+            "handles",
+            "inspect_handle",
+            "inspect_process_token",
+            "inspect_file_object",
+            "inspect_resource",
+            "resources",
+            "memory_usage",
+            "symbol_candidates",
+            "source_location",
+            "source_addresses",
+            "procedure_locals",
+            "set_symbol_breakpoint",
+            "set_source_breakpoint",
+        ] {
             assert!(
                 mcp.tool_router.get(name).is_some(),
                 "missing MCP tool {name}"
@@ -3449,6 +3653,86 @@ mod tests {
             matches!(&*mcp.session.lock().unwrap(), SessionSlot::Vacant),
             "session should be vacant after close"
         );
+    }
+
+    #[test]
+    fn triage_report_json_retains_response_shape_and_module_cap() {
+        let modules = (0..=TRIAGE_MODULE_LIMIT)
+            .map(|index| {
+                ModuleInfo::new(
+                    format!("driver{index}.sys"),
+                    VirtAddr(0xffff_f800_0000_0000 + index as u64 * 0x1000),
+                    0x1000,
+                )
+            })
+            .collect();
+        let report = TriageReport {
+            status: RunStatus {
+                running: true,
+                current_thread: "p0.1".into(),
+                rip: None,
+                symbol: None,
+                process: None,
+                coherent: true,
+                kernel_base: 0xffff_f800_0000_0000,
+            },
+            bugcheck: None,
+            exception: None,
+            system_info: None,
+            backtrace: None,
+            modules,
+            unloaded_drivers: Vec::new(),
+            crash_context: None,
+            prcb: None,
+            broken_driver: None,
+            triage_overflowed: None,
+            failure_signature: None,
+            culprit: None,
+            verifier: None,
+            whea: None,
+            blackboxes: Vec::new(),
+            warnings: vec!["backtrace: unavailable".into()],
+        };
+
+        let json = triage_report_json(report);
+        let object = json.as_object().unwrap();
+        assert_eq!(
+            object
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            [
+                "backtrace",
+                "broken_driver",
+                "blackboxes",
+                "bugcheck",
+                "crash_context",
+                "culprit",
+                "exception",
+                "modules",
+                "failure_signature",
+                "modules_total",
+                "prcb",
+                "verifier",
+                "whea",
+                "status",
+                "system_info",
+                "triage_overflowed",
+                "unloaded_drivers",
+                "warnings",
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert_eq!(json["modules_total"], TRIAGE_MODULE_LIMIT + 1);
+        assert_eq!(
+            json["modules"].as_array().unwrap().len(),
+            TRIAGE_MODULE_LIMIT
+        );
+        assert_eq!(json["status"]["running"], true);
+        assert_eq!(json["warnings"][0], "backtrace: unavailable");
+        assert!(json["backtrace"].is_null());
+        assert!(json["triage_overflowed"].is_null());
     }
 
     #[tokio::test]

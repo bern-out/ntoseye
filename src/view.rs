@@ -1,11 +1,30 @@
 use crate::bugchecks::{BugcheckAnalysis, BugcheckTrapFrame};
+use crate::dmp::{DmpException, DmpSystemInfo, TriageCrashInfo, UnloadedDriver};
 use crate::gdb::breakpoints::Breakpoint;
+use crate::guest::{ModuleInfo, ProcessInfo};
+use crate::session::RunStatus;
+use crate::symbols::{
+    LocalVariableLocation, ProcedureLocal, SourceLocation, SymbolCandidate, SymbolVisibility,
+};
 use crate::target::{
-    AddressDescription, AddressModule, DeviceObjectDetail, DriverObjectDetail, IoStackLocationInfo,
-    IrpHit, IrpInfo, MemoryRegionInfo, MemorySearchMatch, NotifyCallback, ObjectHeaderDetail,
-    PteLevel, SsdtTable, Target, irp_major_function_name, kthread_state_name, wait_reason_name,
+    AddressDescription, AddressModule, DeviceObjectDetail, DiagnosticMetric, DiagnosticValue,
+    DriverObjectDetail, FileObjectDetail, HandleEntryDetail, HandleTableSummary,
+    IoStackLocationInfo, IrpHit, IrpInfo, ListTermination, MemoryRegionInfo, MemorySearchMatch,
+    NotifyCallback, ObjectHeaderDetail, PrivilegeInfo, ProcessMemoryUsage, PteLevel,
+    ResourceDetail, ResourceListSummary, ResourceOwner, SidAndAttributes, SsdtTable,
+    SymbolSearchMatch, SystemMemorySummary, Target, TokenDetail, irp_major_function_name,
+    kthread_state_name, wait_reason_name,
 };
 use crate::trapframe::KtrapFrame;
+use crate::triage::TriagePrcbInfo;
+use crate::triage_report::{
+    BlackboxFinding, BlackboxKind, BlackboxState, CulpritAttribution, CulpritConfidence,
+    CulpritEvidenceKind, FailureCodeKind, FailureSignature, FailureSignatureSource, TriageReport,
+    VerifierFinding, WheaFinding, WheaRecordState, WheaSectionKind, exception_code_name,
+    filetime_to_iso,
+};
+use crate::types::VirtAddr;
+use crate::unwind::StackFrame;
 
 // Shared shape for SDK/MCP structure rendering; surfaces disagree only on how
 // address-like values are encoded.
@@ -457,17 +476,31 @@ pub fn bugcheck_trap_frame(tf: &BugcheckTrapFrame) -> View {
     ])
 }
 
-/// One code-breakpoint/data-watchpoint row (MCP `list_breakpoints`); the
-/// `watch_*` fields are null for code breakpoints, and the Python handle keeps
-/// the same field set in its cached snapshot.
+/// One code-breakpoint/data-watchpoint row. `address` is null while a symbolic
+/// or source breakpoint is deferred; `resolved` distinguishes that state from a
+/// deliberately disabled breakpoint.
 pub fn breakpoint(bp: &Breakpoint) -> View {
     View::Object(vec![
         ("id", View::Num(bp.id.into())),
-        ("address", View::Hex(bp.address.0)),
+        (
+            "address",
+            View::OptHex(bp.resolved_address().map(|address| address.0)),
+        ),
         ("enabled", View::Bool(bp.enabled)),
+        ("resolved", View::Bool(bp.resolved)),
+        ("deferred", View::Bool(bp.deferred())),
+        (
+            "specification",
+            View::OptStr(bp.specification().map(str::to_string)),
+        ),
         ("symbol", View::OptStr(bp.symbol.clone())),
         ("scope", View::Str(bp.scope.label())),
         ("condition", View::OptStr(bp.condition.clone())),
+        ("pass_count", View::Num(bp.pass_count)),
+        ("hit_count", View::Num(bp.hit_count)),
+        ("remaining_pass_count", View::Num(bp.remaining_pass_count)),
+        ("one_shot", View::Bool(bp.one_shot)),
+        ("action", View::OptStr(bp.action.clone())),
         ("temporary", View::Bool(bp.temporary)),
         (
             "watch_access",
@@ -480,11 +513,955 @@ pub fn breakpoint(bp: &Breakpoint) -> View {
     ])
 }
 
+pub fn run_status(status: &RunStatus) -> View {
+    let process = status
+        .process
+        .as_ref()
+        .map(|(pid, name, eprocess)| {
+            View::Object(vec![
+                ("pid", View::Num(*pid)),
+                ("name", View::Str(name.clone())),
+                ("eprocess", View::Hex(*eprocess)),
+            ])
+        })
+        .unwrap_or(View::Null);
+    View::Object(vec![
+        ("running", View::Bool(status.running)),
+        ("current_thread", View::Str(status.current_thread.clone())),
+        ("rip", View::OptHex(status.rip)),
+        ("symbol", View::OptStr(status.symbol.clone())),
+        ("process", process),
+        ("coherent", View::Bool(status.coherent)),
+        ("kernel_base", View::Hex(status.kernel_base)),
+    ])
+}
+
+pub fn stack_frame(frame: &StackFrame) -> View {
+    View::Object(vec![
+        ("ip", View::Hex(frame.ip)),
+        ("sp", View::Hex(frame.sp)),
+        ("symbol", View::Str(frame.symbol.clone())),
+        ("source", View::Str(frame.source.as_str().to_string())),
+    ])
+}
+
+pub fn module(module: &ModuleInfo) -> View {
+    let mut fields = vec![
+        ("name", View::Str(module.name.clone())),
+        ("short_name", View::Str(module.short_name.clone())),
+        ("base", View::Hex(module.base_address.0)),
+        ("end", View::Hex(module.end_address().0)),
+        ("size", View::Num(module.size.into())),
+    ];
+    if let Some(timestamp) = module.time_date_stamp {
+        fields.push(("time_date_stamp", View::Hex(timestamp.into())));
+    }
+    if let Some(checksum) = module.checksum {
+        fields.push(("checksum", View::Hex(checksum.into())));
+    }
+    if let Some(version) = &module.file_version {
+        fields.push(("file_version", View::Str(version.clone())));
+    }
+    if let Some(version) = &module.product_version {
+        fields.push(("product_version", View::Str(version.clone())));
+    }
+    View::Object(fields)
+}
+
+pub fn dump_exception(exception: &DmpException) -> View {
+    View::Object(vec![
+        ("code", View::Num(exception.code.into())),
+        ("code_hex", View::Hex(exception.code.into())),
+        (
+            "code_name",
+            View::Str(exception_code_name(exception.code).to_string()),
+        ),
+        ("flags", View::Num(exception.flags.into())),
+        ("address", View::Hex(exception.address)),
+        (
+            "parameters",
+            View::List(
+                exception
+                    .parameters
+                    .iter()
+                    .copied()
+                    .map(View::Hex)
+                    .collect(),
+            ),
+        ),
+    ])
+}
+
+pub fn system_info(info: &DmpSystemInfo) -> View {
+    let product = match info.product_type {
+        1 => "Workstation",
+        2 => "DomainController",
+        3 => "Server",
+        _ => "Unknown",
+    };
+    let machine = match info.machine_image_type {
+        0x014c => "I386",
+        0x8664 => "AMD64",
+        0xAA64 => "ARM64",
+        _ => "Unknown",
+    };
+    View::Object(vec![
+        ("major_version", View::Num(info.major_version.into())),
+        ("build", View::Num(info.minor_version.into())),
+        (
+            "service_pack_build",
+            View::Num(info.service_pack_build.into()),
+        ),
+        (
+            "machine_image_type",
+            View::Hex(info.machine_image_type.into()),
+        ),
+        ("machine", View::Str(machine.to_string())),
+        (
+            "system_time",
+            View::OptStr(
+                (info.system_time != 0)
+                    .then(|| filetime_to_iso(info.system_time as u64))
+                    .flatten(),
+            ),
+        ),
+        (
+            "system_up_time_secs",
+            View::OptNum(
+                (info.system_up_time > 0)
+                    .then(|| u64::try_from(info.system_up_time / 10_000_000).ok())
+                    .flatten(),
+            ),
+        ),
+        ("product_type", View::Str(product.to_string())),
+        ("suite_mask", View::Hex(info.suite_mask.into())),
+    ])
+}
+
+pub fn crash_context(context: &TriageCrashInfo) -> View {
+    let mut fields = vec![
+        ("process_name", View::OptStr(context.process_name.clone())),
+        ("process_id", View::OptNum(context.process_id)),
+        ("thread_id", View::OptNum(context.thread_id)),
+    ];
+    if let Some(parent_process_id) = context.parent_process_id {
+        fields.push(("parent_process_id", View::Num(parent_process_id)));
+    }
+    if let Some(exit_status) = context.exit_status {
+        fields.push(("exit_status", View::Hex(exit_status as u64)));
+    }
+    if let Some(create_time) = context.create_time {
+        fields.push(("create_time", View::OptStr(filetime_to_iso(create_time))));
+    }
+    if let Some(exit_status) = context.thread_exit_status {
+        fields.push(("thread_exit_status", View::Hex(exit_status as u64)));
+    }
+    View::Object(fields)
+}
+
+pub fn prcb(prcb: &TriagePrcbInfo) -> View {
+    View::Object(vec![
+        ("current_thread", View::Hex(prcb.current_thread)),
+        ("processor_number", View::Num(prcb.processor_number.into())),
+        ("mhz", View::Num(prcb.mhz.into())),
+        ("cpu_type", View::Num(prcb.cpu_type.into())),
+        ("vendor_string", View::Str(prcb.vendor_string.clone())),
+    ])
+}
+
+fn failure_signature(signature: &FailureSignature) -> View {
+    let code_kind = match signature.code_kind {
+        FailureCodeKind::Bugcheck => "bugcheck",
+        FailureCodeKind::Exception => "exception",
+    };
+    let source = match signature.source {
+        FailureSignatureSource::BugcheckFault => "bugcheck_fault",
+        FailureSignatureSource::ExceptionAddress => "exception_address",
+        FailureSignatureSource::CurrentInstruction => "current_instruction",
+        FailureSignatureSource::TopFrame => "top_frame",
+        FailureSignatureSource::CodeOnly => "code_only",
+    };
+    View::Object(vec![
+        ("code_kind", View::Str(code_kind.to_string())),
+        ("code", View::Hex(signature.code.into())),
+        ("source", View::Str(source.to_string())),
+        ("module", View::OptStr(signature.module.clone())),
+        ("symbol", View::OptStr(signature.symbol.clone())),
+        (
+            "components",
+            View::List(
+                signature
+                    .components
+                    .iter()
+                    .cloned()
+                    .map(View::Str)
+                    .collect(),
+            ),
+        ),
+        ("bucket", View::Str(signature.bucket.clone())),
+    ])
+}
+
+fn culprit(culprit: &CulpritAttribution) -> View {
+    let confidence = match culprit.confidence {
+        CulpritConfidence::Low => "low",
+        CulpritConfidence::Medium => "medium",
+        CulpritConfidence::High => "high",
+    };
+    View::Object(vec![
+        ("module", View::Str(culprit.module.clone())),
+        ("confidence", View::Str(confidence.to_string())),
+        (
+            "evidence",
+            View::List(
+                culprit
+                    .evidence
+                    .iter()
+                    .map(|evidence| {
+                        let kind = match evidence.kind {
+                            CulpritEvidenceKind::RecordedBrokenDriver => "recorded_broken_driver",
+                            CulpritEvidenceKind::RecordedBugcheckDriver => {
+                                "recorded_bugcheck_driver"
+                            }
+                            CulpritEvidenceKind::BugcheckFaultAddress => "bugcheck_fault_address",
+                            CulpritEvidenceKind::ExceptionAddress => "exception_address",
+                            CulpritEvidenceKind::CurrentInstruction => "current_instruction",
+                            CulpritEvidenceKind::TopFrame => "top_frame",
+                        };
+                        View::Object(vec![
+                            ("kind", View::Str(kind.to_string())),
+                            ("detail", View::Str(evidence.detail.clone())),
+                            ("address", View::OptHex(evidence.address)),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+    ])
+}
+
+fn verifier(verifier: &VerifierFinding) -> View {
+    View::Object(vec![
+        ("bugcheck_code", View::Hex(verifier.bugcheck_code.into())),
+        ("bugcheck_name", View::Str(verifier.bugcheck_name.clone())),
+        ("subcode", View::Hex(verifier.subcode)),
+        ("known_subcode", View::Bool(verifier.known_subcode)),
+        (
+            "subcode_description",
+            View::Str(verifier.subcode_description.clone()),
+        ),
+        (
+            "associated_driver",
+            View::OptStr(verifier.associated_driver.clone()),
+        ),
+        (
+            "arguments",
+            View::List(
+                verifier
+                    .arguments
+                    .iter()
+                    .map(|argument| {
+                        View::Object(vec![
+                            ("value", View::Hex(argument.value)),
+                            ("description", View::Str(argument.description.clone())),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+        (
+            "addresses",
+            View::List(
+                verifier
+                    .addresses
+                    .iter()
+                    .map(|address| {
+                        View::Object(vec![
+                            ("role", View::Str(address.role.clone())),
+                            ("address", View::Hex(address.address)),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+    ])
+}
+
+fn whea(whea: &WheaFinding) -> View {
+    const SECTION_LIMIT: usize = 64;
+    match &whea.state {
+        WheaRecordState::Unavailable { reason } => View::Object(vec![
+            ("record_address", View::OptHex(whea.record_address)),
+            ("available", View::Bool(false)),
+            ("reason", View::Str(reason.clone())),
+        ]),
+        WheaRecordState::Decoded(record) => View::Object(vec![
+            ("record_address", View::OptHex(whea.record_address)),
+            ("available", View::Bool(true)),
+            ("revision", View::Hex(record.revision.into())),
+            ("severity", View::Num(record.severity.into())),
+            ("length", View::Num(record.length.into())),
+            ("sections_total", View::Num(record.sections.len() as u64)),
+            (
+                "sections",
+                View::List(
+                    record
+                        .sections
+                        .iter()
+                        .take(SECTION_LIMIT)
+                        .map(|section| {
+                            let kind = match section.kind {
+                                WheaSectionKind::ProcessorGeneric => "processor_generic",
+                                WheaSectionKind::Memory => "memory",
+                                WheaSectionKind::PciExpress => "pci_express",
+                                WheaSectionKind::X64Processor => "x64_processor",
+                                WheaSectionKind::Unknown => "unknown",
+                            };
+                            View::Object(vec![
+                                ("offset", View::Num(section.offset.into())),
+                                ("length", View::Num(section.length.into())),
+                                ("severity", View::Num(section.severity.into())),
+                                ("section_type", View::Str(section.section_type.clone())),
+                                ("kind", View::Str(kind.to_string())),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ),
+        ]),
+    }
+}
+
+fn blackbox(blackbox: &BlackboxFinding) -> View {
+    let kind = match blackbox.kind {
+        BlackboxKind::Pnp => "pnp",
+        BlackboxKind::Ntfs => "ntfs",
+        BlackboxKind::Bsd => "bsd",
+        BlackboxKind::Winlogon => "winlogon",
+    };
+    let (present, reason) = match &blackbox.state {
+        BlackboxState::Unavailable { reason } => (None, reason.clone()),
+        BlackboxState::PresentUnparsed => (
+            Some(true),
+            "stream payload is not exposed by the dump parser".to_string(),
+        ),
+    };
+    View::Object(vec![
+        ("kind", View::Str(kind.to_string())),
+        ("name", View::Str(blackbox.name.clone())),
+        ("size", View::OptNum(blackbox.size)),
+        ("present", View::OptBool(present)),
+        ("available", View::Bool(false)),
+        ("parsed", View::Bool(false)),
+        ("reason", View::Str(reason)),
+    ])
+}
+
+fn unloaded_driver(driver: &UnloadedDriver) -> View {
+    View::Object(vec![
+        ("name", View::Str(driver.name.clone())),
+        ("start_address", View::Hex(driver.start_address)),
+        ("end_address", View::Hex(driver.end_address)),
+    ])
+}
+
+/// Canonical structured crash-triage shape used by MCP and Python. The caller
+/// chooses its module cap; all other collections are already bounded by the
+/// presentation-free report builder.
+pub fn triage_report(report: &TriageReport, module_limit: usize) -> View {
+    View::Object(vec![
+        ("status", run_status(&report.status)),
+        (
+            "bugcheck",
+            report.bugcheck.as_ref().map(bugcheck).unwrap_or(View::Null),
+        ),
+        (
+            "exception",
+            report
+                .exception
+                .as_ref()
+                .map(dump_exception)
+                .unwrap_or(View::Null),
+        ),
+        (
+            "system_info",
+            report
+                .system_info
+                .as_ref()
+                .map(system_info)
+                .unwrap_or(View::Null),
+        ),
+        (
+            "backtrace",
+            report
+                .backtrace
+                .as_ref()
+                .map(|trace| View::List(trace.frames.iter().map(stack_frame).collect()))
+                .unwrap_or(View::Null),
+        ),
+        (
+            "modules",
+            View::List(
+                report
+                    .modules
+                    .iter()
+                    .take(module_limit)
+                    .map(module)
+                    .collect(),
+            ),
+        ),
+        ("modules_total", View::Num(report.modules.len() as u64)),
+        (
+            "unloaded_drivers",
+            View::List(
+                report
+                    .unloaded_drivers
+                    .iter()
+                    .map(unloaded_driver)
+                    .collect(),
+            ),
+        ),
+        (
+            "crash_context",
+            report
+                .crash_context
+                .as_ref()
+                .map(crash_context)
+                .unwrap_or(View::Null),
+        ),
+        ("prcb", report.prcb.as_ref().map(prcb).unwrap_or(View::Null)),
+        ("broken_driver", View::OptStr(report.broken_driver.clone())),
+        ("triage_overflowed", View::OptBool(report.triage_overflowed)),
+        (
+            "failure_signature",
+            report
+                .failure_signature
+                .as_ref()
+                .map(failure_signature)
+                .unwrap_or(View::Null),
+        ),
+        (
+            "culprit",
+            report.culprit.as_ref().map(culprit).unwrap_or(View::Null),
+        ),
+        (
+            "verifier",
+            report.verifier.as_ref().map(verifier).unwrap_or(View::Null),
+        ),
+        ("whea", report.whea.as_ref().map(whea).unwrap_or(View::Null)),
+        (
+            "blackboxes",
+            View::List(report.blackboxes.iter().map(blackbox).collect()),
+        ),
+        (
+            "warnings",
+            View::List(
+                report
+                    .warnings
+                    .iter()
+                    .map(|warning| View::Str(warning.clone()))
+                    .collect(),
+            ),
+        ),
+    ])
+}
+
+pub fn symbol_candidate(candidate: &SymbolCandidate) -> View {
+    View::Object(vec![
+        ("module", View::Str(candidate.module.clone())),
+        ("address", View::Hex(candidate.address.0)),
+        (
+            "visibility",
+            View::Str(
+                match candidate.visibility {
+                    SymbolVisibility::Public => "public",
+                    SymbolVisibility::Private => "private",
+                }
+                .to_string(),
+            ),
+        ),
+        ("compiland", View::OptStr(candidate.compiland.clone())),
+    ])
+}
+
+pub fn symbol_search_match(symbol: &SymbolSearchMatch) -> View {
+    View::Object(vec![
+        ("name", View::Str(symbol.name.clone())),
+        (
+            "address",
+            View::OptHex(symbol.address.map(|address| address.0)),
+        ),
+        ("module", View::OptStr(symbol.module.clone())),
+    ])
+}
+
+pub fn nearest_symbol(address: VirtAddr, symbol: Option<(String, String, u32)>) -> View {
+    let (formatted, module, name, offset) = match symbol {
+        Some((module, name, offset)) => (
+            View::Str(crate::symbols::format_symbol_with_offset(
+                &module, &name, offset,
+            )),
+            View::Str(module),
+            View::Str(name),
+            View::Num(offset.into()),
+        ),
+        None => (View::Null, View::Null, View::Null, View::Null),
+    };
+    View::Object(vec![
+        ("address", View::Hex(address.0)),
+        ("symbol", formatted),
+        ("module", module),
+        ("name", name),
+        ("offset", offset),
+    ])
+}
+
+pub fn source_location(location: &SourceLocation) -> View {
+    View::Object(vec![
+        ("file", View::Str(location.file.clone())),
+        ("line", View::Num(location.line.into())),
+        ("column", View::OptNum(location.column.map(u64::from))),
+        (
+            "local_path",
+            View::OptStr(
+                location
+                    .local_path
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
+            ),
+        ),
+        ("local_exists", View::Bool(location.local_exists)),
+    ])
+}
+
+fn local_location(location: &LocalVariableLocation) -> View {
+    let (kind, register, offset, reason) = match location {
+        LocalVariableLocation::Register { register } => {
+            ("register", Some(register.clone()), None, None)
+        }
+        LocalVariableLocation::RegisterRelative { register, offset } => (
+            "register_relative",
+            Some(register.clone()),
+            Some(i64::from(*offset)),
+            None,
+        ),
+        LocalVariableLocation::FrameRelative { offset } => {
+            ("frame_relative", None, Some(i64::from(*offset)), None)
+        }
+        LocalVariableLocation::Unavailable { reason } => {
+            ("unavailable", None, None, Some(reason.clone()))
+        }
+    };
+    View::Object(vec![
+        ("kind", View::Str(kind.to_string())),
+        ("register", View::OptStr(register)),
+        ("offset", offset.map(View::Int).unwrap_or(View::Null)),
+        ("reason", View::OptStr(reason)),
+    ])
+}
+
+pub fn procedure_local(target: &Target, address: VirtAddr, local: &ProcedureLocal) -> View {
+    View::Object(vec![
+        ("name", View::Str(local.name.clone())),
+        ("type_name", View::Str(local.type_name.clone())),
+        ("byte_size", View::OptNum(local.byte_size)),
+        ("parameter", View::Bool(local.is_parameter)),
+        ("location", local_location(&local.location)),
+        (
+            "value",
+            View::OptHex(target.resolve_procedure_local_value(address, local)),
+        ),
+    ])
+}
+
+fn diagnostic<T>(value: &DiagnosticValue<T>, encode: impl FnOnce(&T) -> View) -> View {
+    match value {
+        DiagnosticValue::Available(value) => View::Object(vec![
+            ("available", View::Bool(true)),
+            ("value", encode(value)),
+            ("error", View::Null),
+        ]),
+        DiagnosticValue::Unavailable(error) => View::Object(vec![
+            ("available", View::Bool(false)),
+            ("value", View::Null),
+            ("error", View::Str(error.clone())),
+        ]),
+    }
+}
+
+fn diagnostic_metric<T>(metric: &DiagnosticMetric<T>, encode: impl FnOnce(&T) -> View) -> View {
+    let mut fields = match diagnostic(&metric.value, encode) {
+        View::Object(fields) => fields,
+        _ => unreachable!(),
+    };
+    fields.push((
+        "source",
+        View::OptStr(metric.source.map(|source| source.to_string())),
+    ));
+    View::Object(fields)
+}
+
+fn process(process: &ProcessInfo) -> View {
+    View::Object(vec![
+        ("pid", View::Num(process.pid)),
+        ("name", View::Str(process.name.clone())),
+        ("dtb", View::Hex(process.dtb)),
+        ("eprocess", View::Hex(process.eprocess_va.0)),
+    ])
+}
+
+pub fn handle_entry(entry: &HandleEntryDetail) -> View {
+    View::Object(vec![
+        ("handle", View::Hex(entry.handle)),
+        ("entry", View::Hex(entry.entry.0)),
+        (
+            "object",
+            diagnostic(&entry.object, |address| View::Hex(address.0)),
+        ),
+        (
+            "type_name",
+            diagnostic(&entry.type_name, |name| View::OptStr(name.clone())),
+        ),
+        (
+            "name",
+            diagnostic(&entry.name, |name| View::OptStr(name.clone())),
+        ),
+        (
+            "granted_access",
+            diagnostic(&entry.granted_access, |access| View::Hex((*access).into())),
+        ),
+        (
+            "attributes",
+            diagnostic(&entry.attributes, |attributes| {
+                View::Hex((*attributes).into())
+            }),
+        ),
+    ])
+}
+
+pub fn handle_table(summary: &HandleTableSummary) -> View {
+    View::Object(vec![
+        ("process", process(&summary.process)),
+        ("table", View::Hex(summary.table.0)),
+        ("table_level", View::Num(summary.table_level.into())),
+        (
+            "advertised_handles",
+            View::Num(summary.advertised_handles as u64),
+        ),
+        ("scanned_handles", View::Num(summary.scanned_handles as u64)),
+        ("skipped_entries", View::Num(summary.skipped_entries as u64)),
+        ("truncated", View::Bool(summary.truncated)),
+        (
+            "entries",
+            View::List(summary.entries.iter().map(handle_entry).collect()),
+        ),
+    ])
+}
+
+fn sid_and_attributes(sid: &SidAndAttributes) -> View {
+    View::Object(vec![
+        ("sid", View::Str(sid.sid.clone())),
+        ("attributes", View::Hex(sid.attributes.into())),
+    ])
+}
+
+fn privilege(privilege: &PrivilegeInfo) -> View {
+    View::Object(vec![
+        ("luid", View::Hex(privilege.luid)),
+        ("attributes", View::Hex(privilege.attributes.into())),
+    ])
+}
+
+pub fn token(token: &TokenDetail) -> View {
+    View::Object(vec![
+        ("process", process(&token.process)),
+        ("token", View::Hex(token.token.0)),
+        (
+            "token_id",
+            diagnostic(&token.token_id, |value| View::Hex(*value)),
+        ),
+        (
+            "authentication_id",
+            diagnostic(&token.authentication_id, |value| View::Hex(*value)),
+        ),
+        (
+            "token_type",
+            diagnostic(&token.token_type, |value| View::Num((*value).into())),
+        ),
+        (
+            "impersonation_level",
+            diagnostic(&token.impersonation_level, |value| {
+                View::Num((*value).into())
+            }),
+        ),
+        (
+            "flags",
+            diagnostic(&token.flags, |value| View::Hex((*value).into())),
+        ),
+        (
+            "user",
+            diagnostic(&token.user, |user| {
+                user.as_ref().map(sid_and_attributes).unwrap_or(View::Null)
+            }),
+        ),
+        (
+            "groups",
+            diagnostic(&token.groups, |groups| {
+                View::List(groups.iter().map(sid_and_attributes).collect())
+            }),
+        ),
+        (
+            "privileges",
+            diagnostic(&token.privileges, |privileges| {
+                View::List(privileges.iter().map(privilege).collect())
+            }),
+        ),
+    ])
+}
+
+pub fn file_object(file: &FileObjectDetail) -> View {
+    View::Object(vec![
+        ("address", View::Hex(file.address.0)),
+        (
+            "file_type",
+            diagnostic(&file.file_type, |value| View::Int((*value).into())),
+        ),
+        (
+            "size",
+            diagnostic(&file.size, |value| View::Int((*value).into())),
+        ),
+        (
+            "device_object",
+            diagnostic(&file.device_object, |value| View::Hex(value.0)),
+        ),
+        (
+            "device_type",
+            diagnostic(&file.device_type, |value| View::Hex((*value).into())),
+        ),
+        (
+            "device_name",
+            diagnostic(&file.device_name, |value| View::OptStr(value.clone())),
+        ),
+        (
+            "file_name",
+            diagnostic(&file.file_name, |value| View::Str(value.clone())),
+        ),
+        (
+            "related_file_object",
+            diagnostic(&file.related_file_object, |value| View::Hex(value.0)),
+        ),
+        (
+            "flags",
+            diagnostic(&file.flags, |value| View::Hex((*value).into())),
+        ),
+        (
+            "current_byte_offset",
+            diagnostic(&file.current_byte_offset, |value| View::Int(*value)),
+        ),
+        (
+            "fs_context",
+            diagnostic(&file.fs_context, |value| View::Hex(value.0)),
+        ),
+        (
+            "fs_context2",
+            diagnostic(&file.fs_context2, |value| View::Hex(value.0)),
+        ),
+        (
+            "section_object_pointer",
+            diagnostic(&file.section_object_pointer, |value| View::Hex(value.0)),
+        ),
+        (
+            "private_cache_map",
+            diagnostic(&file.private_cache_map, |value| View::Hex(value.0)),
+        ),
+        (
+            "final_status",
+            diagnostic(&file.final_status, |value| View::Hex(*value as u32 as u64)),
+        ),
+        (
+            "lock_operation",
+            diagnostic(&file.lock_operation, |value| View::Bool(*value)),
+        ),
+        (
+            "delete_pending",
+            diagnostic(&file.delete_pending, |value| View::Bool(*value)),
+        ),
+        (
+            "read_access",
+            diagnostic(&file.read_access, |value| View::Bool(*value)),
+        ),
+        (
+            "write_access",
+            diagnostic(&file.write_access, |value| View::Bool(*value)),
+        ),
+        (
+            "delete_access",
+            diagnostic(&file.delete_access, |value| View::Bool(*value)),
+        ),
+        (
+            "shared_read",
+            diagnostic(&file.shared_read, |value| View::Bool(*value)),
+        ),
+        (
+            "shared_write",
+            diagnostic(&file.shared_write, |value| View::Bool(*value)),
+        ),
+        (
+            "shared_delete",
+            diagnostic(&file.shared_delete, |value| View::Bool(*value)),
+        ),
+    ])
+}
+
+fn resource_owner(owner: &ResourceOwner) -> View {
+    View::Object(vec![
+        ("thread", View::Hex(owner.thread.0)),
+        ("count", View::Int(owner.count.into())),
+    ])
+}
+
+pub fn resource(resource: &ResourceDetail) -> View {
+    View::Object(vec![
+        ("address", View::Hex(resource.address.0)),
+        (
+            "active_count",
+            diagnostic(&resource.active_count, |value| View::Int((*value).into())),
+        ),
+        (
+            "flags",
+            diagnostic(&resource.flags, |value| View::Hex((*value).into())),
+        ),
+        (
+            "contention_count",
+            diagnostic(&resource.contention_count, |value| {
+                View::Num((*value).into())
+            }),
+        ),
+        (
+            "shared_waiters",
+            diagnostic(&resource.shared_waiters, |value| View::Num((*value).into())),
+        ),
+        (
+            "exclusive_waiters",
+            diagnostic(&resource.exclusive_waiters, |value| {
+                View::Num((*value).into())
+            }),
+        ),
+        (
+            "owners",
+            diagnostic(&resource.owners, |owners| {
+                View::List(owners.iter().map(resource_owner).collect())
+            }),
+        ),
+    ])
+}
+
+fn list_termination(termination: &ListTermination) -> View {
+    let (kind, address, error) = match termination {
+        ListTermination::Head => ("head", None, None),
+        ListTermination::Null => ("null", None, None),
+        ListTermination::Cycle(address) => ("cycle", Some(address.0), None),
+        ListTermination::Bound => ("bound", None, None),
+        ListTermination::Corrupt(error) => ("corrupt", None, Some(error.clone())),
+    };
+    View::Object(vec![
+        ("kind", View::Str(kind.to_string())),
+        ("address", View::OptHex(address)),
+        ("error", View::OptStr(error)),
+    ])
+}
+
+pub fn resource_list(summary: &ResourceListSummary) -> View {
+    View::Object(vec![
+        ("head", View::Hex(summary.head.0)),
+        (
+            "resources",
+            View::List(summary.resources.iter().map(resource).collect()),
+        ),
+        ("termination", list_termination(&summary.termination)),
+    ])
+}
+
+fn process_memory_usage(usage: &ProcessMemoryUsage) -> View {
+    View::Object(vec![
+        ("process", process(&usage.process)),
+        (
+            "virtual_size",
+            diagnostic(&usage.virtual_size, |value| View::Num(*value)),
+        ),
+        (
+            "peak_virtual_size",
+            diagnostic(&usage.peak_virtual_size, |value| View::Num(*value)),
+        ),
+        (
+            "working_set_size",
+            diagnostic(&usage.working_set_size, |value| View::Num(*value)),
+        ),
+        (
+            "peak_working_set_size",
+            diagnostic(&usage.peak_working_set_size, |value| View::Num(*value)),
+        ),
+        (
+            "pagefile_usage",
+            diagnostic(&usage.pagefile_usage, |value| View::Num(*value)),
+        ),
+        (
+            "peak_pagefile_usage",
+            diagnostic(&usage.peak_pagefile_usage, |value| View::Num(*value)),
+        ),
+        (
+            "private_usage",
+            diagnostic(&usage.private_usage, |value| View::Num(*value)),
+        ),
+    ])
+}
+
+pub fn memory_usage(summary: &SystemMemorySummary) -> View {
+    View::Object(vec![
+        (
+            "physical_pages",
+            diagnostic_metric(&summary.physical_pages, |value| View::Num(*value)),
+        ),
+        (
+            "available_pages",
+            diagnostic_metric(&summary.available_pages, |value| View::Num(*value)),
+        ),
+        (
+            "committed_pages",
+            diagnostic_metric(&summary.committed_pages, |value| View::Num(*value)),
+        ),
+        (
+            "commit_limit_pages",
+            diagnostic_metric(&summary.commit_limit_pages, |value| View::Num(*value)),
+        ),
+        (
+            "paged_pool_pages",
+            diagnostic_metric(&summary.paged_pool_pages, |value| View::Num(*value)),
+        ),
+        (
+            "nonpaged_pool_bytes",
+            diagnostic_metric(&summary.nonpaged_pool_bytes, |value| View::Num(*value)),
+        ),
+        (
+            "processes",
+            View::List(summary.processes.iter().map(process_memory_usage).collect()),
+        ),
+        ("process_count", View::Num(summary.process_count as u64)),
+        ("truncated", View::Bool(summary.truncated)),
+    ])
+}
+
 #[cfg(all(test, feature = "mcp"))]
 mod tests {
-    use super::{bugcheck_trap_frame, to_json, trap_frame};
+    use super::{bugcheck_trap_frame, handle_table, memory_usage, to_json, trap_frame};
     use crate::bugchecks::BugcheckTrapFrame;
+    use crate::debugger_data::MetadataSource;
+    use crate::guest::ProcessInfo;
+    use crate::target::{
+        DiagnosticMetric, DiagnosticValue, HandleTableSummary, SystemMemorySummary,
+    };
     use crate::trapframe::KtrapFrame;
+    use crate::types::VirtAddr;
 
     #[test]
     fn bugcheck_trap_frame_exposes_decode_failure() {
@@ -528,5 +1505,59 @@ mod tests {
         assert_eq!(json["rip_symbol"], "nt!KiDispatchException");
         assert_eq!(json["frame"]["rip"], "0xfffff80043211000");
         assert_eq!(json["frame"]["previous_irql"], 2);
+    }
+
+    #[test]
+    fn handle_table_view_exposes_skipped_entries() {
+        let summary = HandleTableSummary {
+            process: ProcessInfo {
+                pid: 4,
+                name: "System".into(),
+                dtb: 0x1000,
+                eprocess_va: VirtAddr(0xffff_8000_0000_1000),
+            },
+            table: VirtAddr(0xffff_8000_0000_2000),
+            table_level: 1,
+            advertised_handles: 64,
+            scanned_handles: 32,
+            skipped_entries: 3,
+            truncated: true,
+            entries: Vec::new(),
+        };
+
+        let json = to_json(&handle_table(&summary));
+        assert_eq!(json["scanned_handles"], 32);
+        assert_eq!(json["skipped_entries"], 3);
+    }
+
+    #[test]
+    fn diagnostic_memory_view_retains_values_errors_and_provenance() {
+        let available = DiagnosticMetric {
+            value: DiagnosticValue::Available(0x1234),
+            source: Some(MetadataSource::KernelSymbol),
+        };
+        let unavailable = DiagnosticMetric {
+            value: DiagnosticValue::Unavailable("missing MmAvailablePages".into()),
+            source: None,
+        };
+        let summary = SystemMemorySummary {
+            physical_pages: available.clone(),
+            available_pages: unavailable.clone(),
+            committed_pages: available.clone(),
+            commit_limit_pages: available.clone(),
+            paged_pool_pages: available.clone(),
+            nonpaged_pool_bytes: unavailable,
+            processes: Vec::new(),
+            process_count: 3,
+            truncated: true,
+        };
+
+        let json = to_json(&memory_usage(&summary));
+        assert_eq!(json["physical_pages"]["value"], 0x1234);
+        assert_eq!(json["physical_pages"]["source"], "kernel symbol");
+        assert_eq!(json["available_pages"]["available"], false);
+        assert_eq!(json["available_pages"]["error"], "missing MmAvailablePages");
+        assert_eq!(json["process_count"], 3);
+        assert_eq!(json["truncated"], true);
     }
 }

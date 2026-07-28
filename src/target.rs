@@ -5,6 +5,10 @@ use std::sync::Arc;
 use crate::{
     backend::MemoryOps,
     bugchecks::looks_like_kernel_pointer,
+    debugger_data::{
+        DebuggerDataBlock, DebuggerDataCandidate, MetadataSource, MetadataValue,
+        locate_debugger_data_block, read_counter_from_getter,
+    },
     diagnostics,
     error::{Error, Result},
     guest::{
@@ -13,7 +17,10 @@ use crate::{
     },
     memory::{AddressSpace, DTB_IDENTITY, PAGE_SIZE},
     phys::PhysMem,
-    symbols::{ParsedType, SymbolIndex, SymbolStore, TypeInfo},
+    symbols::{
+        LocalVariableLocation, ParsedType, ProcedureLocal, SourceLocation, SymbolCandidate,
+        SymbolIndex, SymbolStore, TypeInfo,
+    },
     types::{Dtb, PageTableEntry, Value, VirtAddr},
 };
 
@@ -21,6 +28,7 @@ pub struct Target {
     pub phys: Arc<PhysMem>,
     pub symbols: Arc<SymbolStore>,
     pub guest: Option<Guest>,
+    debugger_data: Option<DebuggerDataBlock>,
     pub current_process: Option<WinObject>,
     pub current_process_info: Option<ProcessInfo>,
     /// Bare WinObject for triage dumps without a discovered kernel, providing
@@ -29,8 +37,10 @@ pub struct Target {
     triage_modules_cache: Option<Vec<ModuleInfo>>,
     context_dtb_override: Option<Dtb>,
     pub registers: Option<HashMap<String, u64>>,
-    /// Windows thread metadata for the currently inspected live vCPU context.
-    pub current_windows_thread: Option<ThreadInfo>,
+    /// Windows thread metadata selected for inspection. Whether it is live on
+    /// the backend vCPU or parked is session state; Target only owns identity
+    /// and the corresponding process/address-space view.
+    pub windows_thread_selection: Option<ThreadInfo>,
     /// User-defined convenience variables (`$name`), sticky for the session
     pub user_vars: HashMap<String, UserVar>,
     /// Volatile result slots (`$0`, `$1`, ...) repopulated by the most recent
@@ -248,6 +258,61 @@ pub struct MemorySearchMatch {
     pub description: AddressDescription,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolSearchMatch {
+    pub name: String,
+    pub address: Option<VirtAddr>,
+    pub module: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SavedThreadRegisters {
+    pub rip: Option<u64>,
+    pub rsp: Option<u64>,
+    pub rax: Option<u64>,
+    pub rcx: Option<u64>,
+    pub rdx: Option<u64>,
+    pub rbx: Option<u64>,
+    pub rbp: Option<u64>,
+    pub rsi: Option<u64>,
+    pub rdi: Option<u64>,
+    pub r8: Option<u64>,
+    pub r9: Option<u64>,
+    pub r10: Option<u64>,
+    pub r11: Option<u64>,
+    pub r12: Option<u64>,
+    pub r13: Option<u64>,
+    pub r14: Option<u64>,
+    pub r15: Option<u64>,
+    pub rflags: Option<u64>,
+}
+
+impl SavedThreadRegisters {
+    pub fn get(&self, name: &str) -> Option<u64> {
+        match name.to_ascii_lowercase().as_str() {
+            "rip" => self.rip,
+            "rsp" => self.rsp,
+            "rax" => self.rax,
+            "rcx" => self.rcx,
+            "rdx" => self.rdx,
+            "rbx" => self.rbx,
+            "rbp" => self.rbp,
+            "rsi" => self.rsi,
+            "rdi" => self.rdi,
+            "r8" => self.r8,
+            "r9" => self.r9,
+            "r10" => self.r10,
+            "r11" => self.r11,
+            "r12" => self.r12,
+            "r13" => self.r13,
+            "r14" => self.r14,
+            "r15" => self.r15,
+            "rflags" | "eflags" => self.rflags,
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ThreadInfo {
     pub ethread: VirtAddr,
@@ -296,6 +361,31 @@ impl ThreadInfo {
             _ => None,
         }
     }
+}
+fn thread_owner_matches(thread: &ThreadInfo, process: &ProcessInfo) -> bool {
+    match thread.eprocess {
+        Some(eprocess) => eprocess == process.eprocess_va,
+        None => thread.pid.is_some_and(|pid| pid == process.pid),
+    }
+}
+
+fn select_thread_process_dtb(
+    thread: &ThreadInfo,
+    current: Option<&ProcessInfo>,
+    processes: &[ProcessInfo],
+    kernel_dtb: Dtb,
+) -> Option<Dtb> {
+    if thread.pid == Some(0) {
+        return Some(kernel_dtb);
+    }
+    current
+        .filter(|process| thread_owner_matches(thread, process))
+        .or_else(|| {
+            processes
+                .iter()
+                .find(|process| thread_owner_matches(thread, process))
+        })
+        .map(|process| process.dtb)
 }
 
 /// Name for an `IRP_MJ_*` major function code (without the `IRP_MJ_` prefix).
@@ -436,11 +526,305 @@ impl MemoryRegionInfo {
     }
 }
 
+/// A diagnostic field that can be decoded independently of its siblings.
+///
+/// Kernel layouts and dump capture are frequently partial.  Keeping the
+/// precise failure beside each field lets presentation layers report honest
+/// gaps without discarding the rest of a useful diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiagnosticValue<T> {
+    Available(T),
+    Unavailable(String),
+}
+
+impl<T> DiagnosticValue<T> {
+    fn from_result(result: Result<T>) -> Self {
+        match result {
+            Ok(value) => Self::Available(value),
+            Err(error) => Self::Unavailable(error.to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiagnosticMetric<T> {
+    pub value: DiagnosticValue<T>,
+    pub source: Option<MetadataSource>,
+}
+
+impl<T> DiagnosticMetric<T> {
+    fn available(value: MetadataValue<T>) -> Self {
+        Self {
+            value: DiagnosticValue::Available(value.value),
+            source: Some(value.source),
+        }
+    }
+
+    fn unavailable(errors: Vec<String>) -> Self {
+        Self {
+            value: DiagnosticValue::Unavailable(errors.join("; ")),
+            source: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct HandleEntryDetail {
+    pub handle: u64,
+    pub entry: VirtAddr,
+    pub object: DiagnosticValue<VirtAddr>,
+    pub type_name: DiagnosticValue<Option<String>>,
+    pub name: DiagnosticValue<Option<String>>,
+    pub granted_access: DiagnosticValue<u32>,
+    pub attributes: DiagnosticValue<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HandleTableSummary {
+    pub process: ProcessInfo,
+    pub table: VirtAddr,
+    pub table_level: u8,
+    pub advertised_handles: usize,
+    pub scanned_handles: usize,
+    pub skipped_entries: usize,
+    pub truncated: bool,
+    pub entries: Vec<HandleEntryDetail>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidAndAttributes {
+    pub sid: String,
+    pub attributes: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrivilegeInfo {
+    pub luid: u64,
+    pub attributes: u32,
+}
+
+const SE_PRIVILEGE_ENABLED_BY_DEFAULT: u32 = 0x1;
+const SE_PRIVILEGE_ENABLED: u32 = 0x2;
+
+fn decode_token_privilege_bitmaps(
+    present: u64,
+    enabled: u64,
+    enabled_by_default: u64,
+) -> Vec<PrivilegeInfo> {
+    let mut remaining = present;
+    let mut privileges = Vec::with_capacity(present.count_ones() as usize);
+    while remaining != 0 {
+        let bit = remaining.trailing_zeros();
+        let mask = 1u64 << bit;
+        let mut attributes = 0;
+        if enabled_by_default & mask != 0 {
+            attributes |= SE_PRIVILEGE_ENABLED_BY_DEFAULT;
+        }
+        if enabled & mask != 0 {
+            attributes |= SE_PRIVILEGE_ENABLED;
+        }
+        privileges.push(PrivilegeInfo {
+            luid: u64::from(bit),
+            attributes,
+        });
+        remaining &= remaining - 1;
+    }
+    privileges
+}
+
+#[derive(Debug, Clone)]
+pub struct TokenDetail {
+    pub process: ProcessInfo,
+    pub token: VirtAddr,
+    pub token_id: DiagnosticValue<u64>,
+    pub authentication_id: DiagnosticValue<u64>,
+    pub token_type: DiagnosticValue<u32>,
+    pub impersonation_level: DiagnosticValue<u32>,
+    pub flags: DiagnosticValue<u32>,
+    pub user: DiagnosticValue<Option<SidAndAttributes>>,
+    pub groups: DiagnosticValue<Vec<SidAndAttributes>>,
+    pub privileges: DiagnosticValue<Vec<PrivilegeInfo>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FileObjectDetail {
+    pub address: VirtAddr,
+    pub file_type: DiagnosticValue<i16>,
+    pub size: DiagnosticValue<i16>,
+    pub device_object: DiagnosticValue<VirtAddr>,
+    pub device_type: DiagnosticValue<u32>,
+    pub device_name: DiagnosticValue<Option<String>>,
+    pub file_name: DiagnosticValue<String>,
+    pub related_file_object: DiagnosticValue<VirtAddr>,
+    pub flags: DiagnosticValue<u32>,
+    pub current_byte_offset: DiagnosticValue<i64>,
+    pub fs_context: DiagnosticValue<VirtAddr>,
+    pub fs_context2: DiagnosticValue<VirtAddr>,
+    pub section_object_pointer: DiagnosticValue<VirtAddr>,
+    pub private_cache_map: DiagnosticValue<VirtAddr>,
+    pub final_status: DiagnosticValue<i32>,
+    pub lock_operation: DiagnosticValue<bool>,
+    pub delete_pending: DiagnosticValue<bool>,
+    pub read_access: DiagnosticValue<bool>,
+    pub write_access: DiagnosticValue<bool>,
+    pub delete_access: DiagnosticValue<bool>,
+    pub shared_read: DiagnosticValue<bool>,
+    pub shared_write: DiagnosticValue<bool>,
+    pub shared_delete: DiagnosticValue<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceOwner {
+    pub thread: VirtAddr,
+    pub count: i32,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResourceDetail {
+    pub address: VirtAddr,
+    pub active_count: DiagnosticValue<i16>,
+    pub flags: DiagnosticValue<u16>,
+    pub contention_count: DiagnosticValue<u32>,
+    pub shared_waiters: DiagnosticValue<u32>,
+    pub exclusive_waiters: DiagnosticValue<u32>,
+    pub owners: DiagnosticValue<Vec<ResourceOwner>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListTermination {
+    Head,
+    Null,
+    Cycle(VirtAddr),
+    Bound,
+    Corrupt(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct ResourceListSummary {
+    pub head: VirtAddr,
+    pub resources: Vec<ResourceDetail>,
+    pub termination: ListTermination,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProcessMemoryUsage {
+    pub process: ProcessInfo,
+    pub virtual_size: DiagnosticValue<u64>,
+    pub peak_virtual_size: DiagnosticValue<u64>,
+    pub working_set_size: DiagnosticValue<u64>,
+    pub peak_working_set_size: DiagnosticValue<u64>,
+    pub pagefile_usage: DiagnosticValue<u64>,
+    pub peak_pagefile_usage: DiagnosticValue<u64>,
+    pub private_usage: DiagnosticValue<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SystemMemorySummary {
+    pub physical_pages: DiagnosticMetric<u64>,
+    pub available_pages: DiagnosticMetric<u64>,
+    pub committed_pages: DiagnosticMetric<u64>,
+    pub commit_limit_pages: DiagnosticMetric<u64>,
+    pub paged_pool_pages: DiagnosticMetric<u64>,
+    pub nonpaged_pool_bytes: DiagnosticMetric<u64>,
+    pub processes: Vec<ProcessMemoryUsage>,
+    pub process_count: usize,
+    pub truncated: bool,
+}
+
+fn bounded_list_walk<F>(
+    head: VirtAddr,
+    limit: usize,
+    mut read_next: F,
+) -> (Vec<VirtAddr>, ListTermination)
+where
+    F: FnMut(VirtAddr) -> Result<VirtAddr>,
+{
+    let mut links = Vec::new();
+    let mut visited = HashSet::new();
+    let mut current = match read_next(head) {
+        Ok(current) => current,
+        Err(error) => return (links, ListTermination::Corrupt(error.to_string())),
+    };
+
+    loop {
+        if current == head {
+            return (links, ListTermination::Head);
+        }
+        if current.is_zero() {
+            return (links, ListTermination::Null);
+        }
+        if !visited.insert(current.0) {
+            return (links, ListTermination::Cycle(current));
+        }
+        if links.len() >= limit {
+            return (links, ListTermination::Bound);
+        }
+        links.push(current);
+        current = match read_next(current) {
+            Ok(next) => next,
+            Err(error) => return (links, ListTermination::Corrupt(error.to_string())),
+        };
+    }
+}
+
 struct ObjectNameLayout {
     body_offset: u64,
     info_mask_offset: u64,
+    creator_info_size: Option<u64>,
     name_info_size: u64,
     name_offset: u64,
+}
+
+impl ObjectNameLayout {
+    fn name_info_address(&self, header: VirtAddr, info_mask: u8) -> Result<Option<VirtAddr>> {
+        const CREATOR_INFO_BIT: u8 = 0x01;
+        const NAME_INFO_BIT: u8 = 0x02;
+
+        if info_mask & NAME_INFO_BIT == 0 {
+            return Ok(None);
+        }
+
+        // Optional headers run backwards from OBJECT_HEADER in increasing bit
+        // order. NameInfo is therefore displaced only by lower-bit CreatorInfo,
+        // never by HandleInfo or any higher-bit header.
+        let creator_size = if info_mask & CREATOR_INFO_BIT != 0 {
+            self.creator_info_size
+                .ok_or_else(|| Error::StructNotFound("_OBJECT_HEADER_CREATOR_INFO".to_string()))?
+        } else {
+            0
+        };
+        let offset = self
+            .name_info_size
+            .checked_add(creator_size)
+            .ok_or_else(|| Error::DebugInfo("object name-info offset overflow".to_string()))?;
+        let address =
+            header.0.checked_sub(offset).map(VirtAddr).ok_or_else(|| {
+                Error::DebugInfo("object name-info address underflow".to_string())
+            })?;
+        Ok(Some(address))
+    }
+}
+
+fn select_object_header_candidate(
+    input: VirtAddr,
+    body_offset: u64,
+    body_candidate: Option<VirtAddr>,
+    direct_candidate: Option<VirtAddr>,
+    body_has_type: bool,
+    direct_has_type: bool,
+) -> Option<(VirtAddr, VirtAddr, &'static str)> {
+    match (body_candidate, direct_candidate) {
+        (Some(header), Some(_)) if body_has_type => Some((header, input, "body")),
+        (Some(_), Some(header)) if direct_has_type => {
+            Some((header, header + body_offset, "header"))
+        }
+        // Both locations are readable but neither decodes through the type
+        // table. Guessing here would make an arbitrary pool address look valid.
+        (Some(_), Some(_)) => None,
+        (Some(header), None) => Some((header, input, "body")),
+        (None, Some(header)) => Some((header, header + body_offset, "header")),
+        (None, None) => None,
+    }
 }
 
 struct ObjectDirectoryLayout {
@@ -579,13 +963,14 @@ impl Target {
             phys,
             symbols,
             guest,
+            debugger_data: None,
             current_process: None,
             current_process_info: None,
             triage_fallback,
             triage_modules_cache,
             context_dtb_override: None,
             registers: None,
-            current_windows_thread: None,
+            windows_thread_selection: None,
             user_vars: HashMap::new(),
             results: Vec::new(),
             results_origin: None,
@@ -845,15 +1230,36 @@ impl Target {
     }
 
     pub fn set_current_windows_thread_context(&mut self, thread: ThreadInfo) {
-        self.current_windows_thread = Some(thread);
+        self.windows_thread_selection = Some(thread);
+    }
+
+    pub fn set_parked_windows_thread(&mut self, thread: ThreadInfo) {
+        self.windows_thread_selection = Some(thread);
+        // A parked thread has no coherent register file. In particular, do not
+        // let expressions reuse registers cached from the still-selected vCPU.
+        self.registers = None;
     }
 
     pub fn clear_current_windows_thread_context(&mut self) {
-        self.current_windows_thread = None;
+        self.windows_thread_selection = None;
+    }
+
+    pub fn thread_process_dtb(&self, thread: &ThreadInfo) -> Option<Dtb> {
+        let processes = self
+            .guest
+            .as_ref()
+            .and_then(|guest| guest.enumerate_processes().ok())
+            .unwrap_or_default();
+        select_thread_process_dtb(
+            thread,
+            self.current_process_info.as_ref(),
+            &processes,
+            self.kernel_dtb(),
+        )
     }
 
     pub fn current_thread_pseudo_register(&self, name: &str) -> Option<u64> {
-        let thread = self.current_windows_thread.as_ref()?;
+        let thread = self.windows_thread_selection.as_ref()?;
         thread.pseudo_register_value(name)
     }
 
@@ -922,7 +1328,7 @@ impl Target {
             ]);
             // pid/eprocess fall back to the attached process when no thread
             // context shadows them; keep the listing in sync with evaluation
-            if self.current_windows_thread.is_none() {
+            if self.windows_thread_selection.is_none() {
                 vars.extend([
                     BuiltinVar {
                         name: "eprocess",
@@ -938,7 +1344,7 @@ impl Target {
             }
         }
 
-        if let Some(thread) = &self.current_windows_thread {
+        if let Some(thread) = &self.windows_thread_selection {
             let mut push = |name, value: Option<u64>, source| {
                 if let Some(value) = value {
                     vars.push(BuiltinVar {
@@ -1004,10 +1410,54 @@ impl Target {
         self.results_origin = Some(origin.into());
     }
 
+    pub fn debugger_data(&self) -> Option<&DebuggerDataBlock> {
+        self.debugger_data.as_ref()
+    }
+
+    /// Refresh the validated kernel debugger-data snapshot from transport,
+    /// symbols, or dump metadata, in that order.
+    pub fn refresh_debugger_data(&mut self, transport_hint: Option<DebuggerDataCandidate>) {
+        let mut candidates = Vec::with_capacity(4);
+        if let Some(candidate) = transport_hint {
+            candidates.push(candidate);
+        }
+        if let Some(guest) = &self.guest {
+            for symbol in ["KdDebuggerDataBlock", "KdDebuggerDataListHead"] {
+                if let Ok(Some(address)) = self
+                    .symbols
+                    .find_symbol_across_modules(guest.ntoskrnl.dtb(), &format!("nt!{symbol}"))
+                {
+                    candidates.push(DebuggerDataCandidate {
+                        address,
+                        source: MetadataSource::KernelSymbol,
+                    });
+                }
+            }
+        }
+        if let Some(address) = self
+            .phys
+            .dmp_info()
+            .and_then(|info| info.debugger_data_block)
+        {
+            candidates.push(DebuggerDataCandidate {
+                address: VirtAddr(address),
+                source: MetadataSource::DumpHeader,
+            });
+        }
+
+        let expected_kernel_base = self.kernel_base();
+        let debugger_data = {
+            let memory = self.context_memory();
+            locate_debugger_data_block(&memory, candidates, expected_kernel_base)
+        };
+        self.debugger_data = debugger_data;
+    }
+
     pub fn reload_guest_with_kernel_base_hint(
         &mut self,
         kernel_base_hint: Option<VirtAddr>,
     ) -> Result<ReloadReport> {
+        self.debugger_data = None;
         let previous_base_address = self
             .guest
             .as_ref()
@@ -1087,16 +1537,48 @@ impl Target {
             .load_missing_kernel_module_symbols(&self.phys, &self.symbols)
     }
 
+    /// Re-run source selection and symbol indexing for all modules in the
+    /// current inspection scope, or for one exact module/short name.
+    pub fn reload_module_symbols(
+        &self,
+        module_name: Option<&str>,
+    ) -> Result<ModuleSymbolLoadReport> {
+        let mut modules = self.modules()?;
+        if let Some(name) = module_name {
+            modules.retain(|module| {
+                module.short_name.eq_ignore_ascii_case(name)
+                    || module
+                        .name
+                        .rsplit(['\\', '/'])
+                        .next()
+                        .is_some_and(|image| image.eq_ignore_ascii_case(name))
+            });
+            if modules.is_empty() {
+                return Err(Error::DebugInfo(format!("module not found: {name}")));
+            }
+        }
+
+        let dtb = self
+            .current_process_info
+            .as_ref()
+            .map(|process| process.dtb)
+            .unwrap_or_else(|| self.kernel_dtb());
+        let bases = modules
+            .iter()
+            .map(|module| module.base_address)
+            .collect::<Vec<_>>();
+        self.symbols.invalidate_modules(dtb, &bases);
+
+        match self.guest.as_ref() {
+            Some(guest) => guest.load_symbols_for_modules(&self.phys, &self.symbols, modules, dtb),
+            None => Guest::load_module_symbols(&self.phys, &self.symbols, modules, dtb, false),
+        }
+    }
+
     pub fn current_dtb(&self) -> Dtb {
-        // An explicit process attach is authoritative for the inspection address
-        // space: a user who attached to `mspaint` wants its DTB even while the VM
-        // is halted on some other (e.g. kernel/idle) thread. `context_dtb_override`
-        // is the "follow the focused thread" mechanism for the UN-attached case;
-        // it is set from the halted thread's CR3 on every stop, so letting it win
-        // while attached clobbered the attach with whatever thread we happened to
-        // stop on (the kernel DTB for an idle thread), which made user-space symbol
-        // lookups and breakpoint validation run against the wrong page tables and
-        // fail with "symbol not found" / "bad virtual address".
+        // An explicit process attach is authoritative for the live inspection
+        // address space. `context_dtb_override` follows the halted vCPU's CR3
+        // only in the unattached case.
         match &self.current_process {
             Some(p) => p.dtb(),
             None => self
@@ -1111,19 +1593,177 @@ impl Target {
         AddressSpace::new(&self.phys, self.current_dtb())
     }
 
-    pub fn closest_symbol_current_context(&self, address: VirtAddr) -> Option<String> {
+    /// Symbol address space for an address in the active inspection context.
+    /// Kernel addresses fall back to the kernel DTB when a user process is
+    /// selected and owns no module covering the address.
+    pub fn symbol_dtb_for_address(&self, address: VirtAddr) -> Dtb {
+        let current_dtb = self.current_dtb();
+        let kernel_dtb = self.kernel_dtb();
+        if !looks_like_kernel_pointer(address.0) || current_dtb == kernel_dtb {
+            return current_dtb;
+        }
+        self.symbols
+            .find_module_for_address_in_context(current_dtb, kernel_dtb, address)
+            .map(|module| module.dtb)
+            .unwrap_or(current_dtb)
+    }
+
+    /// Return all matching symbol identities in the active address space,
+    /// adding the kernel address space when a user process is selected.
+    pub fn symbol_candidates(&self, name: &str) -> Vec<SymbolCandidate> {
+        let current_dtb = self.current_dtb();
+        let kernel_dtb = self.kernel_dtb();
+        let mut candidates = self.symbols.find_symbol_candidates(current_dtb, name);
+        if current_dtb != kernel_dtb {
+            candidates.extend(self.symbols.find_symbol_candidates(kernel_dtb, name));
+        }
+        candidates.sort_by(|left, right| {
+            left.module
+                .to_ascii_lowercase()
+                .cmp(&right.module.to_ascii_lowercase())
+                .then_with(|| left.address.0.cmp(&right.address.0))
+                .then_with(|| left.compiland.cmp(&right.compiland))
+        });
+        candidates.dedup_by(|left, right| {
+            left.module.eq_ignore_ascii_case(&right.module)
+                && left.address == right.address
+                && left.visibility == right.visibility
+                && left.compiland == right.compiland
+        });
+        candidates
+    }
+
+    /// Fuzzy-search the active symbol index and resolve only unambiguous
+    /// module/address identities. `module!query` restricts the search.
+    pub fn search_symbols(&self, query: &str, limit: usize) -> Vec<SymbolSearchMatch> {
+        let dtb = self.current_dtb();
+        let (module, names) = match query.split_once('!') {
+            Some((module, query)) => (
+                Some(module),
+                self.symbols
+                    .search_symbols_in_module(dtb, module, query, limit),
+            ),
+            None => (None, self.current_symbol_index().search(query, limit)),
+        };
+        names
+            .into_iter()
+            .map(|name| {
+                let lookup = module
+                    .map(|module| format!("{module}!{name}"))
+                    .unwrap_or_else(|| name.clone());
+                let locations: HashSet<(String, u64)> = self
+                    .symbol_candidates(&lookup)
+                    .into_iter()
+                    .map(|candidate| (candidate.module, candidate.address.0))
+                    .collect();
+                let (resolved_module, address) = if locations.len() == 1 {
+                    let (module, address) = locations.into_iter().next().unwrap();
+                    (Some(module), Some(VirtAddr(address)))
+                } else {
+                    (None, None)
+                };
+                SymbolSearchMatch {
+                    name,
+                    address,
+                    module: resolved_module,
+                }
+            })
+            .collect()
+    }
+    /// Structured nearest-symbol lookup with kernel-address fallback.
+    pub fn nearest_symbol_current_context(
+        &self,
+        address: VirtAddr,
+    ) -> Option<(String, String, u32)> {
         let current_dtb = self.current_dtb();
         self.symbols
-            .format_closest_symbol_for_address(current_dtb, address)
+            .find_closest_symbol_for_address(current_dtb, address)
             .or_else(|| {
                 let kernel_dtb = self.kernel_dtb();
                 (looks_like_kernel_pointer(address.0) && current_dtb != kernel_dtb)
                     .then(|| {
                         self.symbols
-                            .format_closest_symbol_for_address(kernel_dtb, address)
+                            .find_closest_symbol_for_address(kernel_dtb, address)
                     })
                     .flatten()
             })
+    }
+
+    pub fn closest_symbol_current_context(&self, address: VirtAddr) -> Option<String> {
+        self.nearest_symbol_current_context(address)
+            .map(|(module, name, offset)| {
+                crate::symbols::format_symbol_with_offset(&module, &name, offset)
+            })
+    }
+
+    /// Resolve cached source information using the active address space with the
+    /// same kernel-address fallback as symbol rendering.
+    pub fn source_location(&self, address: VirtAddr) -> Option<SourceLocation> {
+        let dtb = self.symbol_dtb_for_address(address);
+        self.symbols.source_location(dtb, address)
+    }
+
+    /// Resolve `file:line` across the active and kernel address spaces.
+    pub fn source_addresses(&self, file: &str, line: u32) -> Vec<VirtAddr> {
+        let current_dtb = self.current_dtb();
+        let kernel_dtb = self.kernel_dtb();
+        let mut addresses = self.symbols.source_addresses(current_dtb, file, line);
+        if current_dtb != kernel_dtb {
+            addresses.extend(self.symbols.source_addresses(kernel_dtb, file, line));
+        }
+        addresses.sort_by_key(|address| address.0);
+        addresses.dedup();
+        addresses
+    }
+    /// Return private procedure locals in scope at `address`.
+    pub fn procedure_locals(&self, address: VirtAddr) -> Result<Option<Vec<ProcedureLocal>>> {
+        let dtb = self.symbol_dtb_for_address(address);
+        self.symbols.procedure_locals(dtb, address)
+    }
+
+    /// Resolve a scalar local from the current halted register/memory context.
+    /// Returns `None` when the PDB recipe is unavailable, the register context
+    /// does not correspond to the requested procedure, or the value is wider
+    /// than a scalar u64.
+    pub fn resolve_procedure_local_value(
+        &self,
+        address: VirtAddr,
+        local: &ProcedureLocal,
+    ) -> Option<u64> {
+        if self
+            .registers
+            .as_ref()
+            .and_then(|registers| registers.get("rip"))
+            .is_none_or(|rip| *rip != address.0)
+        {
+            return None;
+        }
+        let size = usize::try_from(local.byte_size?).ok()?;
+        if size == 0 || size > 8 {
+            return None;
+        }
+        let registers = self.registers.as_ref()?;
+        match &local.location {
+            LocalVariableLocation::Register { register } => {
+                let value = *registers.get(register)?;
+                Some(if size == 8 {
+                    value
+                } else {
+                    value & ((1u64 << (size * 8)) - 1)
+                })
+            }
+            LocalVariableLocation::RegisterRelative { register, offset } => {
+                let base = *registers.get(register)?;
+                let address = VirtAddr(base.wrapping_add_signed(i64::from(*offset)));
+                let mut bytes = [0u8; 8];
+                self.context_memory()
+                    .read_bytes(address, &mut bytes[..size])
+                    .ok()?;
+                Some(u64::from_le_bytes(bytes))
+            }
+            LocalVariableLocation::FrameRelative { .. }
+            | LocalVariableLocation::Unavailable { .. } => None,
+        }
     }
 
     /// Open a fluent cursor over a kernel struct (ntoskrnl's layout, read
@@ -1143,6 +1783,10 @@ impl Target {
             .symbols
             .find_type_across_modules(dtb, "_OBJECT_HEADER")
             .ok_or_else(|| Error::StructNotFound("_OBJECT_HEADER".to_string()))?;
+        let creator_info_size = self
+            .symbols
+            .find_type_across_modules(dtb, "_OBJECT_HEADER_CREATOR_INFO")
+            .map(|ty| ty.size as u64);
         let name_info_type = self
             .symbols
             .find_type_across_modules(dtb, "_OBJECT_HEADER_NAME_INFO")
@@ -1150,6 +1794,7 @@ impl Target {
         Ok(ObjectNameLayout {
             body_offset: header_type.field_offset("Body")?,
             info_mask_offset: header_type.field_offset("InfoMask")?,
+            creator_info_size,
             name_info_size: name_info_type.size as u64,
             name_offset: name_info_type.field_offset("Name")?,
         })
@@ -1163,10 +1808,9 @@ impl Target {
         let memory = self.guest()?.ntoskrnl.memory();
         let header = object - object_name.body_offset;
         let info_mask: u8 = memory.read(header + object_name.info_mask_offset)?;
-        if (info_mask & 0x02) == 0 {
+        let Some(name_info) = object_name.name_info_address(header, info_mask)? else {
             return Ok(None);
-        }
-        let name_info = header - object_name.name_info_size;
+        };
         Ok(Some(self.read_kernel_unicode_string(
             name_info + object_name.name_offset,
         )?))
@@ -1573,6 +2217,804 @@ impl Target {
         })
     }
 
+    fn selected_process_info(&self) -> Result<ProcessInfo> {
+        if let Some(process) = self.current_process_info.as_ref() {
+            return Ok(process.clone());
+        }
+
+        let processes = self.matching_processes(None)?;
+        if let Some(thread) = self.windows_thread_selection.as_ref()
+            && let Some(process) = processes
+                .iter()
+                .find(|process| thread_owner_matches(thread, process))
+        {
+            return Ok(process.clone());
+        }
+        let dtb = self.current_dtb();
+        processes
+            .into_iter()
+            .find(|process| process.dtb == dtb)
+            .ok_or_else(|| {
+                Error::DebugInfo(
+                    "current process unavailable: select a process or halted Windows thread"
+                        .to_string(),
+                )
+            })
+    }
+
+    fn read_layout_field<T>(&self, layout: &TypeInfo, base: VirtAddr, name: &str) -> Result<T>
+    where
+        T: Copy + zerocopy::FromZeros + zerocopy::FromBytes + zerocopy::IntoBytes,
+    {
+        self.context_memory()
+            .read(base + layout.field_offset(name)?)
+    }
+
+    fn read_luid(&self, layout: &TypeInfo, base: VirtAddr) -> Result<u64> {
+        let low: u32 = self.read_layout_field(layout, base, "LowPart")?;
+        let high: i32 = self.read_layout_field(layout, base, "HighPart")?;
+        Ok(((high as u32 as u64) << 32) | u64::from(low))
+    }
+
+    fn extract_layout_bits(&self, layout: &TypeInfo, base: VirtAddr, name: &str) -> Result<u64> {
+        let field = layout
+            .fields
+            .get(name)
+            .ok_or_else(|| Error::FieldNotFound(name.to_string()))?;
+        let raw: u64 = self.context_memory().read(base + field.offset as u64)?;
+        if let ParsedType::Bitfield { pos, len, .. } = &field.type_data {
+            let mask = if *len == 64 {
+                u64::MAX
+            } else {
+                (1u64 << *len) - 1
+            };
+            Ok((raw >> *pos) & mask)
+        } else {
+            Ok(raw)
+        }
+    }
+
+    fn handle_entry_address(
+        &self,
+        table_base: VirtAddr,
+        level: u8,
+        index: usize,
+        entry_size: usize,
+    ) -> Result<VirtAddr> {
+        let memory = self.context_memory();
+        let leaf_entries = PAGE_SIZE / entry_size;
+        match level {
+            0 => Ok(table_base + (index * entry_size) as u64),
+            1 => {
+                let leaf: VirtAddr =
+                    memory.read(table_base + ((index / leaf_entries) * 8) as u64)?;
+                if leaf.is_zero() {
+                    return Err(Error::DebugInfo(format!(
+                        "handle leaf {} is null",
+                        index / leaf_entries
+                    )));
+                }
+                Ok(leaf + ((index % leaf_entries) * entry_size) as u64)
+            }
+            2 => {
+                let middle_index = index / (leaf_entries * 512);
+                let leaf_index = (index / leaf_entries) % 512;
+                let middle: VirtAddr = memory.read(table_base + (middle_index * 8) as u64)?;
+                if middle.is_zero() {
+                    return Err(Error::DebugInfo(format!(
+                        "handle middle table {middle_index} is null"
+                    )));
+                }
+                let leaf: VirtAddr = memory.read(middle + (leaf_index * 8) as u64)?;
+                if leaf.is_zero() {
+                    return Err(Error::DebugInfo(format!(
+                        "handle leaf {middle_index}:{leaf_index} is null"
+                    )));
+                }
+                Ok(leaf + ((index % leaf_entries) * entry_size) as u64)
+            }
+            _ => Err(Error::DebugInfo(format!(
+                "unsupported HANDLE_TABLE level {level}"
+            ))),
+        }
+    }
+
+    fn decode_handle_entry(
+        &self,
+        entry_layout: &TypeInfo,
+        entry: VirtAddr,
+        handle: u64,
+    ) -> HandleEntryDetail {
+        let object = (|| -> Result<VirtAddr> {
+            if entry_layout.fields.contains_key("ObjectPointerBits") {
+                let bits = self.extract_layout_bits(entry_layout, entry, "ObjectPointerBits")?;
+                let mut pointer = bits << 4;
+                if pointer & (1 << 47) != 0 {
+                    pointer |= 0xffff_0000_0000_0000;
+                }
+                return Ok(VirtAddr(pointer));
+            }
+            let raw = self.extract_layout_bits(entry_layout, entry, "Object")?;
+            Ok(VirtAddr(raw & !0xf))
+        })();
+
+        let granted_access = ["GrantedAccessBits", "GrantedAccess"]
+            .into_iter()
+            .find_map(|name| {
+                entry_layout
+                    .fields
+                    .contains_key(name)
+                    .then(|| self.extract_layout_bits(entry_layout, entry, name))
+            })
+            .unwrap_or_else(|| Err(Error::FieldNotFound("GrantedAccessBits".to_string())))
+            .map(|value| value as u32);
+        let attributes = ["ObAttributes", "Attributes"]
+            .into_iter()
+            .find_map(|name| {
+                entry_layout
+                    .fields
+                    .contains_key(name)
+                    .then(|| self.extract_layout_bits(entry_layout, entry, name))
+            })
+            .unwrap_or_else(|| Err(Error::FieldNotFound("ObAttributes".to_string())))
+            .map(|value| value as u32);
+
+        let header = object
+            .as_ref()
+            .map_err(|error| Error::DebugInfo(error.to_string()))
+            .and_then(|object| {
+                if object.is_zero() {
+                    Err(Error::DebugInfo("handle entry is free".to_string()))
+                } else {
+                    self.inspect_object_header(*object)
+                }
+            });
+        let type_name = match &header {
+            Ok(header) => DiagnosticValue::Available(header.type_name.clone()),
+            Err(error) => DiagnosticValue::Unavailable(error.to_string()),
+        };
+        let name = match &header {
+            Ok(header) => DiagnosticValue::Available(header.name.clone()),
+            Err(error) => DiagnosticValue::Unavailable(error.to_string()),
+        };
+
+        HandleEntryDetail {
+            handle,
+            entry,
+            object: DiagnosticValue::from_result(object),
+            type_name,
+            name,
+            granted_access: DiagnosticValue::from_result(granted_access),
+            attributes: DiagnosticValue::from_result(attributes),
+        }
+    }
+
+    fn handle_table_context(
+        &self,
+    ) -> Result<(ProcessInfo, VirtAddr, VirtAddr, u8, usize, TypeInfo)> {
+        let process = self.selected_process_info()?;
+        let types = self.guest()?.ntoskrnl.types_in(process.dtb);
+        let eprocess = types.struct_at("_EPROCESS", process.eprocess_va)?;
+        let table: VirtAddr = eprocess.read_field("ObjectTable")?;
+        if table.is_zero() {
+            return Err(Error::DebugInfo(
+                "_EPROCESS.ObjectTable is null".to_string(),
+            ));
+        }
+        let table_layout = types.layout("_HANDLE_TABLE")?;
+        let table_code: u64 = self.read_layout_field(&table_layout, table, "TableCode")?;
+        let level = (table_code & 3) as u8;
+        if level > 2 {
+            return Err(Error::DebugInfo(format!(
+                "unsupported HANDLE_TABLE level {level}"
+            )));
+        }
+        let next_handle: u64 =
+            self.read_layout_field(&table_layout, table, "NextHandleNeedingPool")?;
+        let entry_layout = types.layout("_HANDLE_TABLE_ENTRY")?;
+        Ok((
+            process,
+            table,
+            VirtAddr(table_code & !3),
+            level,
+            (next_handle / 4) as usize,
+            entry_layout,
+        ))
+    }
+
+    /// List non-free handles in the selected/current process.  Both page-table
+    /// traversal and slot count are bounded by `limit`.
+    pub fn enumerate_handles(&self, limit: usize) -> Result<HandleTableSummary> {
+        let limit = limit.clamp(1, 4096);
+        let (process, table, table_base, level, advertised, entry_layout) =
+            self.handle_table_context()?;
+        let scanned = advertised.min(limit);
+        let mut entries = Vec::new();
+        let mut skipped_entries = 0usize;
+        for index in 0..scanned {
+            let entry = match self.handle_entry_address(table_base, level, index, entry_layout.size)
+            {
+                Ok(entry) => entry,
+                Err(_) => {
+                    skipped_entries += 1;
+                    continue;
+                }
+            };
+            let decoded = self.decode_handle_entry(&entry_layout, entry, (index as u64) * 4);
+            if !matches!(
+                decoded.object,
+                DiagnosticValue::Available(address) if address.is_zero()
+            ) {
+                entries.push(decoded);
+            }
+        }
+        Ok(HandleTableSummary {
+            process,
+            table,
+            table_level: level,
+            advertised_handles: advertised,
+            scanned_handles: scanned,
+            skipped_entries,
+            truncated: advertised > scanned,
+            entries,
+        })
+    }
+
+    /// Decode one handle from the same selected/current process handle table.
+    pub fn inspect_handle(&self, handle: u64) -> Result<HandleEntryDetail> {
+        if handle & 3 != 0 {
+            return Err(Error::DebugInfo(format!(
+                "handle {handle:#x} is not 4-byte aligned"
+            )));
+        }
+        let (_, _, table_base, level, advertised, entry_layout) = self.handle_table_context()?;
+        let index = (handle / 4) as usize;
+        if index >= advertised {
+            return Err(Error::DebugInfo(format!(
+                "handle {handle:#x} is beyond NextHandleNeedingPool ({:#x})",
+                advertised * 4
+            )));
+        }
+        let entry = self.handle_entry_address(table_base, level, index, entry_layout.size)?;
+        Ok(self.decode_handle_entry(&entry_layout, entry, handle))
+    }
+
+    fn read_sid(&self, address: VirtAddr) -> Result<String> {
+        if address.is_zero() {
+            return Err(Error::DebugInfo("SID pointer is null".to_string()));
+        }
+        let memory = self.context_memory();
+        let revision: u8 = memory.read(address)?;
+        let count: u8 = memory.read(address + 1u64)?;
+        if count > 15 {
+            return Err(Error::DebugInfo(format!(
+                "SID subauthority count {count} exceeds 15"
+            )));
+        }
+        let mut authority = [0u8; 6];
+        memory.read_bytes(address + 2u64, &mut authority)?;
+        let authority = authority
+            .into_iter()
+            .fold(0u64, |value, byte| (value << 8) | u64::from(byte));
+        let mut sid = format!("S-{revision}-{authority}");
+        for index in 0..count {
+            let sub: u32 = memory.read(address + 8u64 + u64::from(index) * 4)?;
+            sid.push_str(&format!("-{sub}"));
+        }
+        Ok(sid)
+    }
+
+    fn read_token_id_field(
+        &self,
+        token_layout: &TypeInfo,
+        luid_layout: &TypeInfo,
+        token: VirtAddr,
+        name: &str,
+    ) -> Result<u64> {
+        self.read_luid(luid_layout, token + token_layout.field_offset(name)?)
+    }
+
+    /// Decode the selected/current process primary token.  Independently
+    /// unavailable optional fields retain their exact layout/read error.
+    pub fn inspect_process_token(&self) -> Result<TokenDetail> {
+        const MAX_TOKEN_ITEMS: usize = 256;
+        let process = self.selected_process_info()?;
+        let types = self.guest()?.ntoskrnl.types_in(process.dtb);
+        let eprocess_layout = types.layout("_EPROCESS")?;
+        let raw_token: u64 =
+            self.read_layout_field(&eprocess_layout, process.eprocess_va, "Token")?;
+        let token = VirtAddr(raw_token & !0xf);
+        if token.is_zero() {
+            return Err(Error::DebugInfo("_EPROCESS.Token is null".to_string()));
+        }
+        let token_layout = types.layout("_TOKEN")?;
+        let luid_layout = types.layout("_LUID")?;
+
+        let token_id = DiagnosticValue::from_result(self.read_token_id_field(
+            &token_layout,
+            &luid_layout,
+            token,
+            "TokenId",
+        ));
+        let authentication_id = DiagnosticValue::from_result(self.read_token_id_field(
+            &token_layout,
+            &luid_layout,
+            token,
+            "AuthenticationId",
+        ));
+        let token_type =
+            DiagnosticValue::from_result(self.read_layout_field(&token_layout, token, "TokenType"));
+        let impersonation_level = DiagnosticValue::from_result(self.read_layout_field(
+            &token_layout,
+            token,
+            "ImpersonationLevel",
+        ));
+        let flags = DiagnosticValue::from_result(self.read_layout_field(
+            &token_layout,
+            token,
+            "TokenFlags",
+        ));
+
+        let sid_items = (|| -> Result<Vec<SidAndAttributes>> {
+            let count: u32 = self.read_layout_field(&token_layout, token, "UserAndGroupCount")?;
+            if count as usize > MAX_TOKEN_ITEMS {
+                return Err(Error::DebugInfo(format!(
+                    "_TOKEN.UserAndGroupCount {count} exceeds bound {MAX_TOKEN_ITEMS}"
+                )));
+            }
+            let array: VirtAddr = self.read_layout_field(&token_layout, token, "UserAndGroups")?;
+            if count != 0 && array.is_zero() {
+                return Err(Error::DebugInfo(
+                    "_TOKEN.UserAndGroups is null with nonzero count".to_string(),
+                ));
+            }
+            let item_layout = types.layout("_SID_AND_ATTRIBUTES")?;
+            let mut items = Vec::with_capacity(count as usize);
+            for index in 0..count as usize {
+                let base = array + (index * item_layout.size) as u64;
+                let sid: VirtAddr = self.read_layout_field(&item_layout, base, "Sid")?;
+                let attributes: u32 = self.read_layout_field(&item_layout, base, "Attributes")?;
+                items.push(SidAndAttributes {
+                    sid: self.read_sid(sid)?,
+                    attributes,
+                });
+            }
+            Ok(items)
+        })();
+        let (user, groups) = match sid_items {
+            Ok(items) => (
+                DiagnosticValue::Available(items.first().cloned()),
+                DiagnosticValue::Available(items.into_iter().skip(1).collect()),
+            ),
+            Err(error) => (
+                DiagnosticValue::Unavailable(error.to_string()),
+                DiagnosticValue::Unavailable(error.to_string()),
+            ),
+        };
+
+        let privileges = DiagnosticValue::from_result((|| -> Result<Vec<PrivilegeInfo>> {
+            let privileges = token + token_layout.field_offset("Privileges")?;
+            let privileges_layout = types.layout("_SEP_TOKEN_PRIVILEGES")?;
+            let present: u64 = self.read_layout_field(&privileges_layout, privileges, "Present")?;
+            let enabled: u64 = self.read_layout_field(&privileges_layout, privileges, "Enabled")?;
+            let enabled_by_default: u64 =
+                self.read_layout_field(&privileges_layout, privileges, "EnabledByDefault")?;
+            Ok(decode_token_privilege_bitmaps(
+                present,
+                enabled,
+                enabled_by_default,
+            ))
+        })());
+
+        Ok(TokenDetail {
+            process,
+            token,
+            token_id,
+            authentication_id,
+            token_type,
+            impersonation_level,
+            flags,
+            user,
+            groups,
+            privileges,
+        })
+    }
+
+    /// Decode a `_FILE_OBJECT` strictly from the loaded kernel PDB layout.
+    pub fn inspect_file_object(&self, address: VirtAddr) -> Result<FileObjectDetail> {
+        let types = self.guest()?.ntoskrnl.types_in(self.current_dtb());
+        let layout = types.layout("_FILE_OBJECT")?;
+        let read_ptr =
+            |name| DiagnosticValue::from_result(self.read_layout_field(&layout, address, name));
+        let read_bool = |name| {
+            DiagnosticValue::from_result(
+                self.read_layout_field::<u8>(&layout, address, name)
+                    .map(|value| value != 0),
+            )
+        };
+        let device_object: Result<VirtAddr> =
+            self.read_layout_field(&layout, address, "DeviceObject");
+        let device_type = match &device_object {
+            Ok(device) if !device.is_zero() => DiagnosticValue::from_result(
+                self.inspect_device_object(*device)
+                    .map(|detail| detail.device_type),
+            ),
+            Ok(_) => DiagnosticValue::Unavailable("_FILE_OBJECT.DeviceObject is null".to_string()),
+            Err(error) => DiagnosticValue::Unavailable(error.to_string()),
+        };
+        let device_name = match &device_object {
+            Ok(device) if !device.is_zero() => DiagnosticValue::from_result(
+                self.inspect_object_header(*device)
+                    .map(|detail| detail.name),
+            ),
+            Ok(_) => DiagnosticValue::Unavailable("_FILE_OBJECT.DeviceObject is null".to_string()),
+            Err(error) => DiagnosticValue::Unavailable(error.to_string()),
+        };
+
+        Ok(FileObjectDetail {
+            address,
+            file_type: DiagnosticValue::from_result(
+                self.read_layout_field(&layout, address, "Type"),
+            ),
+            size: DiagnosticValue::from_result(self.read_layout_field(&layout, address, "Size")),
+            device_object: DiagnosticValue::from_result(device_object),
+            device_type,
+            device_name,
+            file_name: DiagnosticValue::from_result(
+                types
+                    .struct_at("_FILE_OBJECT", address)?
+                    .unicode_string("FileName"),
+            ),
+            related_file_object: read_ptr("RelatedFileObject"),
+            flags: DiagnosticValue::from_result(self.read_layout_field(&layout, address, "Flags")),
+            current_byte_offset: DiagnosticValue::from_result(self.read_layout_field(
+                &layout,
+                address,
+                "CurrentByteOffset",
+            )),
+            fs_context: read_ptr("FsContext"),
+            fs_context2: read_ptr("FsContext2"),
+            section_object_pointer: read_ptr("SectionObjectPointer"),
+            private_cache_map: read_ptr("PrivateCacheMap"),
+            final_status: DiagnosticValue::from_result(self.read_layout_field(
+                &layout,
+                address,
+                "FinalStatus",
+            )),
+            lock_operation: read_bool("LockOperation"),
+            delete_pending: read_bool("DeletePending"),
+            read_access: read_bool("ReadAccess"),
+            write_access: read_bool("WriteAccess"),
+            delete_access: read_bool("DeleteAccess"),
+            shared_read: read_bool("SharedRead"),
+            shared_write: read_bool("SharedWrite"),
+            shared_delete: read_bool("SharedDelete"),
+        })
+    }
+
+    /// Decode one executive resource at an explicit address.
+    pub fn inspect_resource(&self, address: VirtAddr) -> Result<ResourceDetail> {
+        const MAX_RESOURCE_OWNERS: usize = 64;
+        let types = self.guest()?.ntoskrnl.types_in(self.current_dtb());
+        let layout = types.layout("_ERESOURCE")?;
+        let owner_layout = types.layout("_OWNER_ENTRY")?;
+        let owners = DiagnosticValue::from_result((|| -> Result<Vec<ResourceOwner>> {
+            let mut owners = Vec::new();
+            let owner_entry = address + layout.field_offset("OwnerEntry")?;
+            let thread: u64 = self.read_layout_field(&owner_layout, owner_entry, "OwnerThread")?;
+            let count: i32 = self.read_layout_field(&owner_layout, owner_entry, "OwnerCount")?;
+            if thread & !3 != 0 && count != 0 {
+                owners.push(ResourceOwner {
+                    thread: VirtAddr(thread & !3),
+                    count,
+                });
+            }
+
+            let table: VirtAddr = self.read_layout_field(&layout, address, "OwnerTable")?;
+            if table.is_zero() {
+                return Ok(owners);
+            }
+            let table_size: u32 = self.read_layout_field(&owner_layout, table, "TableSize")?;
+            if table_size as usize > MAX_RESOURCE_OWNERS {
+                return Err(Error::DebugInfo(format!(
+                    "_OWNER_ENTRY.TableSize {table_size} exceeds bound {MAX_RESOURCE_OWNERS}"
+                )));
+            }
+            for index in 1..table_size as usize {
+                let entry = table + (index * owner_layout.size) as u64;
+                let thread: u64 = self.read_layout_field(&owner_layout, entry, "OwnerThread")?;
+                let count: i32 = self.read_layout_field(&owner_layout, entry, "OwnerCount")?;
+                if thread & !3 != 0 && count != 0 {
+                    owners.push(ResourceOwner {
+                        thread: VirtAddr(thread & !3),
+                        count,
+                    });
+                }
+            }
+            Ok(owners)
+        })());
+
+        Ok(ResourceDetail {
+            address,
+            active_count: DiagnosticValue::from_result(self.read_layout_field(
+                &layout,
+                address,
+                "ActiveCount",
+            )),
+            flags: DiagnosticValue::from_result(self.read_layout_field(&layout, address, "Flag")),
+            contention_count: DiagnosticValue::from_result(self.read_layout_field(
+                &layout,
+                address,
+                "ContentionCount",
+            )),
+            shared_waiters: DiagnosticValue::from_result(self.read_layout_field(
+                &layout,
+                address,
+                "NumberOfSharedWaiters",
+            )),
+            exclusive_waiters: DiagnosticValue::from_result(self.read_layout_field(
+                &layout,
+                address,
+                "NumberOfExclusiveWaiters",
+            )),
+            owners,
+        })
+    }
+
+    /// Enumerate the kernel-maintained executive-resource list when the private
+    /// list-head symbol and `_ERESOURCE.SystemResourcesList` metadata exist.
+    /// There is deliberately no memory-scan fallback.
+    pub fn enumerate_resources(&self, limit: usize) -> Result<ResourceListSummary> {
+        let limit = limit.clamp(1, 1024);
+        let guest = self.guest()?;
+        let head = guest.ntoskrnl.symbol("ExpSystemResourcesList")?.address();
+        let layout = guest.ntoskrnl.types().layout("_ERESOURCE")?;
+        let link_offset = layout.field_offset("SystemResourcesList")?;
+        let memory = self.context_memory();
+        let (links, termination) =
+            bounded_list_walk(head, limit, |link| memory.read::<VirtAddr>(link));
+        let resources = links
+            .into_iter()
+            .map(|link| self.inspect_resource(link - link_offset))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(ResourceListSummary {
+            head,
+            resources,
+            termination,
+        })
+    }
+
+    fn process_memory_counter(
+        &self,
+        eprocess_layout: &TypeInfo,
+        vm_layout: &TypeInfo,
+        eprocess: VirtAddr,
+        field: &str,
+    ) -> DiagnosticValue<u64> {
+        DiagnosticValue::from_result((|| -> Result<u64> {
+            let vm = eprocess + eprocess_layout.field_offset("Vm")?;
+
+            if let Ok(value) = self.read_layout_field(vm_layout, vm, field) {
+                return Ok(value);
+            }
+            if let Ok(value) = self.read_layout_field(eprocess_layout, eprocess, field) {
+                return Ok(value);
+            }
+
+            let types = self.guest()?.ntoskrnl.types();
+            for container in ["Instance", "Shared"] {
+                let Some(container_field) = vm_layout.fields.get(container) else {
+                    continue;
+                };
+                let (ParsedType::Struct(layout_name) | ParsedType::Union(layout_name)) =
+                    &container_field.type_data
+                else {
+                    continue;
+                };
+                let Ok(layout) = types.layout(layout_name) else {
+                    continue;
+                };
+                if let Ok(value) =
+                    self.read_layout_field(&layout, vm + u64::from(container_field.offset), field)
+                {
+                    return Ok(value);
+                }
+            }
+
+            let page_field = match field {
+                "PagefileUsage" => Some("CommitCharge"),
+                "PeakPagefileUsage" => Some("CommitChargePeak"),
+                "PrivateUsage" => Some("NumberOfPrivatePages"),
+                _ => None,
+            };
+            if let Some(page_field) = page_field {
+                let pages: u64 = self.read_layout_field(eprocess_layout, eprocess, page_field)?;
+                return pages.checked_mul(PAGE_SIZE as u64).ok_or_else(|| {
+                    Error::DebugInfo(format!("_EPROCESS.{page_field} overflows a byte count"))
+                });
+            }
+
+            Err(Error::FieldNotFound(field.to_string()))
+        })())
+    }
+
+    fn debugger_data_counter(
+        &self,
+        address: Option<MetadataValue<VirtAddr>>,
+    ) -> Option<Result<MetadataValue<u64>>> {
+        address.map(|address| {
+            self.context_memory()
+                .read::<u64>(address.value)
+                .map(|value| MetadataValue {
+                    value,
+                    source: address.source,
+                })
+        })
+    }
+
+    fn global_memory_counter(
+        &self,
+        symbol_name: &str,
+        debugger_data_value: Option<Result<MetadataValue<u64>>>,
+        getter_name: Option<&str>,
+    ) -> DiagnosticMetric<u64> {
+        let mut errors = Vec::new();
+        match self
+            .guest()
+            .and_then(|guest| guest.ntoskrnl.symbol(symbol_name))
+            .and_then(|symbol| symbol.read())
+        {
+            Ok(value) => {
+                return DiagnosticMetric::available(MetadataValue {
+                    value,
+                    source: MetadataSource::KernelSymbol,
+                });
+            }
+            Err(error) => errors.push(error.to_string()),
+        }
+
+        if let Some(value) = debugger_data_value {
+            match value {
+                Ok(value) if value.value != 0 => return DiagnosticMetric::available(value),
+                Ok(_) => {}
+                Err(error) => errors.push(error.to_string()),
+            }
+        }
+
+        if let Some(getter_name) = getter_name {
+            match (|| -> Result<MetadataValue<u64>> {
+                let guest = self.guest()?;
+                let getter = guest.ntoskrnl.symbol(getter_name)?.address();
+                let system_partition = guest.ntoskrnl.symbol("MiSystemPartition")?.address();
+                read_counter_from_getter(&self.context_memory(), getter, system_partition)
+            })() {
+                Ok(value) => return DiagnosticMetric::available(value),
+                Err(error) => errors.push(error.to_string()),
+            }
+        }
+
+        DiagnosticMetric::unavailable(errors)
+    }
+
+    /// Build a bounded memory-use summary from exported memory-manager counters
+    /// and per-process `_EPROCESS.Vm` fields.  It never scans physical memory or
+    /// walks every VAD.
+    pub fn memory_use_summary(&self, process_limit: usize) -> Result<SystemMemorySummary> {
+        let process_limit = process_limit.clamp(1, 256);
+        let all_processes = self.matching_processes(None)?;
+        let process_count = all_processes.len();
+        let guest = self.guest()?;
+        let types = guest.ntoskrnl.types();
+        let eprocess_layout = types.layout("_EPROCESS")?;
+        let vm_field = eprocess_layout
+            .fields
+            .get("Vm")
+            .ok_or_else(|| Error::FieldNotFound("Vm".to_string()))?;
+        let vm_name = match &vm_field.type_data {
+            ParsedType::Struct(name) | ParsedType::Union(name) => name,
+            _ => {
+                return Err(Error::FieldTypeMismatch(
+                    "Vm".to_string(),
+                    "embedded struct".to_string(),
+                ));
+            }
+        };
+        let vm_layout = types.layout(vm_name)?;
+        let processes = all_processes
+            .into_iter()
+            .take(process_limit)
+            .map(|process| ProcessMemoryUsage {
+                virtual_size: self.process_memory_counter(
+                    &eprocess_layout,
+                    &vm_layout,
+                    process.eprocess_va,
+                    "VirtualSize",
+                ),
+                peak_virtual_size: self.process_memory_counter(
+                    &eprocess_layout,
+                    &vm_layout,
+                    process.eprocess_va,
+                    "PeakVirtualSize",
+                ),
+                working_set_size: self.process_memory_counter(
+                    &eprocess_layout,
+                    &vm_layout,
+                    process.eprocess_va,
+                    "WorkingSetSize",
+                ),
+                peak_working_set_size: self.process_memory_counter(
+                    &eprocess_layout,
+                    &vm_layout,
+                    process.eprocess_va,
+                    "PeakWorkingSetSize",
+                ),
+                pagefile_usage: self.process_memory_counter(
+                    &eprocess_layout,
+                    &vm_layout,
+                    process.eprocess_va,
+                    "PagefileUsage",
+                ),
+                peak_pagefile_usage: self.process_memory_counter(
+                    &eprocess_layout,
+                    &vm_layout,
+                    process.eprocess_va,
+                    "PeakPagefileUsage",
+                ),
+                private_usage: self.process_memory_counter(
+                    &eprocess_layout,
+                    &vm_layout,
+                    process.eprocess_va,
+                    "PrivateUsage",
+                ),
+                process,
+            })
+            .collect();
+        let debugger_data = self.debugger_data();
+        Ok(SystemMemorySummary {
+            physical_pages: self.global_memory_counter(
+                "MmNumberOfPhysicalPages",
+                self.debugger_data_counter(
+                    debugger_data.and_then(DebuggerDataBlock::mm_number_of_physical_pages_address),
+                ),
+                Some("MmGetNumberOfPhysicalPages"),
+            ),
+            available_pages: self.global_memory_counter(
+                "MmAvailablePages",
+                self.debugger_data_counter(
+                    debugger_data.and_then(DebuggerDataBlock::mm_available_pages_address),
+                ),
+                Some("MmGetAvailablePages"),
+            ),
+            committed_pages: self.global_memory_counter(
+                "MmTotalCommittedPages",
+                self.debugger_data_counter(
+                    debugger_data.and_then(DebuggerDataBlock::mm_total_committed_pages_address),
+                ),
+                Some("MmGetTotalCommittedPages"),
+            ),
+            commit_limit_pages: self.global_memory_counter(
+                "MmTotalCommitLimit",
+                self.debugger_data_counter(
+                    debugger_data.and_then(DebuggerDataBlock::mm_total_commit_limit_address),
+                ),
+                Some("MmGetTotalCommitLimit"),
+            ),
+            // KDBG exposes the configured paged-pool virtual range, not current
+            // usage, so it is intentionally not substituted here.
+            paged_pool_pages: self.global_memory_counter("MmSizeOfPagedPoolInPages", None, None),
+            // KDBG exposes the configured maximum nonpaged-pool size, not the
+            // current usage requested here, so it is intentionally not substituted.
+            nonpaged_pool_bytes: self.global_memory_counter(
+                "MmSizeOfNonPagedPoolInBytes",
+                None,
+                None,
+            ),
+            processes,
+            process_count,
+            truncated: process_count > process_limit,
+        })
+    }
+
     /// Decode the executive `_OBJECT_HEADER` for `addr`, accepting either the
     /// object body or the header itself, and resolve its type and name.
     pub fn inspect_object_header(&self, addr: VirtAddr) -> Result<ObjectHeaderDetail> {
@@ -1581,30 +3023,56 @@ impl Target {
         let layout = guest.ntoskrnl.types().layout("_OBJECT_HEADER")?;
         let header_size = layout.size as u64;
         let body_off = layout.field_offset("Body")?;
-        let name_info_size = guest
+        let type_index_off = layout.field_offset("TypeIndex")?;
+        let object_name = self.object_name_layout().ok();
+        let cookie = match guest.ntoskrnl.symbol("ObHeaderCookie") {
+            Ok(symbol) => symbol.read::<u8>()?,
+            Err(Error::SymbolNotFound(_)) => 0,
+            Err(error) => return Err(error),
+        };
+        let type_table = guest
             .ntoskrnl
-            .types()
-            .layout("_OBJECT_HEADER_NAME_INFO")
+            .symbol("ObTypeIndexTable")
             .ok()
-            .map(|l| l.size as u64);
+            .map(|symbol| symbol.address());
 
-        let header_ok = |a: VirtAddr| -> bool {
-            let mut buf = vec![0u8; header_size as usize];
-            mem.read_bytes(a, &mut buf).is_ok()
+        let header_ok = |header: VirtAddr| -> bool {
+            header_size
+                .checked_sub(1)
+                .and_then(|last| header.0.checked_add(last))
+                .map(VirtAddr)
+                .is_some_and(|end| mem.read::<u8>(header).is_ok() && mem.read::<u8>(end).is_ok())
+        };
+        let candidate_type_object = |header: VirtAddr| -> Option<VirtAddr> {
+            let raw: u8 = mem.read(header + type_index_off).ok()?;
+            let index = u64::from(raw ^ ((header.0 >> 8) as u8) ^ cookie);
+            mem.read::<VirtAddr>(type_table? + index * 8)
+                .ok()
+                .filter(|object| looks_like_kernel_pointer(object.0))
         };
 
-        // The input is usually the object body; the header sits `body_off`
-        // before it. Fall back to treating the input as the header.
-        let (header, body, mode) = if header_ok(addr - body_off) {
-            (addr - body_off, addr, "body")
-        } else if header_ok(addr) {
-            (addr, addr + body_off, "header")
-        } else {
-            return Err(Error::DebugInfo(format!(
-                "no plausible _OBJECT_HEADER for {:#x}",
-                addr.0
-            )));
-        };
+        // The input is usually the object body. If both possible headers are
+        // readable, use the decoded type table to distinguish a real header
+        // from unrelated readable pool bytes before it.
+        let body_candidate = addr
+            .0
+            .checked_sub(body_off)
+            .map(VirtAddr)
+            .filter(|header| header_ok(*header));
+        let direct_candidate = header_ok(addr).then_some(addr);
+        let body_type = body_candidate.and_then(candidate_type_object);
+        let direct_type = direct_candidate.and_then(candidate_type_object);
+        let (header, body, mode) = select_object_header_candidate(
+            addr,
+            body_off,
+            body_candidate,
+            direct_candidate,
+            body_type.is_some(),
+            direct_type.is_some(),
+        )
+        .ok_or_else(|| {
+            Error::DebugInfo(format!("no plausible _OBJECT_HEADER for {:#x}", addr.0))
+        })?;
 
         let h = self.kernel_struct("_OBJECT_HEADER", header)?;
         let info_mask: Option<u8> = h.read_field("InfoMask").ok();
@@ -1612,25 +3080,19 @@ impl Target {
         // On Win10+ the stored TypeIndex is obfuscated; the real index is
         // raw ^ (second byte of the header address) ^ nt!ObHeaderCookie. The
         // cookie symbol is absent on older builds (treat as 0 -> raw index).
-        let type_index: Option<u64> = h.read_field::<u8>("TypeIndex").ok().map(|raw| {
-            let cookie = guest
-                .ntoskrnl
-                .symbol("ObHeaderCookie")
-                .and_then(|s| s.read::<u8>())
-                .unwrap_or(0);
-            let addr_byte = (header.0 >> 8) as u8;
-            (raw ^ addr_byte ^ cookie) as u64
-        });
+        let type_index: Option<u64> = h
+            .read_field::<u8>("TypeIndex")
+            .ok()
+            .map(|raw| (raw ^ ((header.0 >> 8) as u8) ^ cookie) as u64);
 
         // Resolve the type object via ObTypeIndexTable[index] and read its name.
         // ObTypeIndexTable is the array itself, so index it directly.
-        let (type_object, type_name) = match (guest.ntoskrnl.symbol("ObTypeIndexTable"), type_index)
-        {
-            (Ok(sym), Some(index)) => {
+        let (type_object, type_name) = match (type_table, type_index) {
+            (Some(table), Some(index)) => {
                 let resolved = mem
-                    .read::<VirtAddr>(sym.address() + index * 8)
+                    .read::<VirtAddr>(table + index * 8)
                     .ok()
-                    .filter(|t| !t.is_zero());
+                    .filter(|object| looks_like_kernel_pointer(object.0));
                 let name = resolved.and_then(|t| {
                     let off = guest
                         .ntoskrnl
@@ -1648,34 +3110,26 @@ impl Target {
             _ => (None, None),
         };
 
-        // Object name lives in _OBJECT_HEADER_NAME_INFO just before the header
-        // when the InfoMask name bit (0x02) is set.
-        let (name_info, name) = match (info_mask, name_info_size) {
-            (Some(mask), Some(size)) if mask & 0x02 != 0 => {
-                let info = header - size;
-                let name = guest
-                    .ntoskrnl
-                    .types()
-                    .layout("_OBJECT_HEADER_NAME_INFO")
+        let name_info = info_mask.and_then(|mask| {
+            object_name
+                .as_ref()
+                .and_then(|layout| layout.name_info_address(header, mask).ok().flatten())
+        });
+        let name = name_info.and_then(|info| {
+            object_name.as_ref().and_then(|layout| {
+                self.read_kernel_unicode_string(info + layout.name_offset)
                     .ok()
-                    .and_then(|l| l.field_offset("Name").ok())
-                    .and_then(|off| {
-                        self.read_kernel_unicode_string(info + off)
-                            .ok()
-                            .filter(|s| !s.is_empty())
-                    });
-                (Some(info), name)
-            }
-            _ => (None, None),
-        };
+                    .filter(|name| !name.is_empty())
+            })
+        });
 
         Ok(ObjectHeaderDetail {
             input: addr,
             mode,
             header,
             body,
-            pointer_count: h.read_field("PointerCount").unwrap_or(0),
-            handle_count: h.read_field("HandleCount").unwrap_or(0),
+            pointer_count: h.read_field("PointerCount")?,
+            handle_count: h.read_field("HandleCount")?,
             type_index,
             type_object,
             type_name,
@@ -2670,7 +4124,12 @@ impl fmt::Display for PteLevel {
 
 #[cfg(test)]
 mod tests {
-    use super::ThreadInfo;
+    use super::{
+        ListTermination, ObjectNameLayout, ThreadInfo, bounded_list_walk,
+        decode_token_privilege_bitmaps, select_object_header_candidate, select_thread_process_dtb,
+        thread_owner_matches,
+    };
+    use crate::guest::ProcessInfo;
     use crate::types::VirtAddr;
 
     fn sample_thread() -> ThreadInfo {
@@ -2760,5 +4219,164 @@ mod tests {
             super::Target::normalize_cr3(0xffff_8123_4567_8abc),
             0x000f_8123_4567_8000
         );
+    }
+
+    #[test]
+    fn owning_process_selection_prefers_eprocess_identity() {
+        let thread = sample_thread();
+        let same_pid_wrong_process = ProcessInfo {
+            pid: thread.pid.unwrap(),
+            name: "reused.exe".into(),
+            dtb: 0x1111_0000,
+            eprocess_va: VirtAddr(0xffff_8000_0000_9999),
+        };
+        let owner = ProcessInfo {
+            pid: 0x99,
+            name: "sample.exe".into(),
+            dtb: 0x2222_0000,
+            eprocess_va: thread.eprocess.unwrap(),
+        };
+        assert!(!thread_owner_matches(&thread, &same_pid_wrong_process));
+        assert!(thread_owner_matches(&thread, &owner));
+        assert_eq!(owner.dtb, 0x2222_0000);
+        assert_eq!(
+            select_thread_process_dtb(
+                &thread,
+                Some(&same_pid_wrong_process),
+                &[same_pid_wrong_process.clone(), owner.clone()],
+                0x3333_0000,
+            ),
+            Some(0x2222_0000)
+        );
+    }
+
+    #[test]
+    fn diagnostic_list_walk_honors_bound() {
+        let (links, termination) =
+            bounded_list_walk(VirtAddr(0), 2, |address| Ok(VirtAddr(address.0 + 1)));
+        assert_eq!(links, vec![VirtAddr(1), VirtAddr(2)]);
+        assert_eq!(termination, ListTermination::Bound);
+    }
+
+    #[test]
+    fn diagnostic_list_walk_flags_non_head_cycle() {
+        let (links, termination) = bounded_list_walk(VirtAddr(0), 8, |address| {
+            Ok(match address.0 {
+                0 => VirtAddr(1),
+                1 => VirtAddr(2),
+                _ => VirtAddr(1),
+            })
+        });
+        assert_eq!(links, vec![VirtAddr(1), VirtAddr(2)]);
+        assert_eq!(termination, ListTermination::Cycle(VirtAddr(1)));
+    }
+
+    #[test]
+    fn diagnostic_list_walk_preserves_corrupt_read_error() {
+        let (links, termination) = bounded_list_walk(VirtAddr(0), 8, |address| match address.0 {
+            0 => Ok(VirtAddr(1)),
+            1 => Ok(VirtAddr(2)),
+            _ => Err(crate::error::Error::DebugInfo("synthetic bad flink".into())),
+        });
+        assert_eq!(links, vec![VirtAddr(1), VirtAddr(2)]);
+        assert_eq!(
+            termination,
+            ListTermination::Corrupt("synthetic bad flink".into())
+        );
+    }
+    #[test]
+    fn token_privilege_bitmaps_preserve_ids_and_attributes() {
+        let privileges =
+            decode_token_privilege_bitmaps((1 << 2) | (1 << 20), 1 << 20, (1 << 2) | (1 << 20));
+        assert_eq!(
+            privileges,
+            vec![
+                super::PrivilegeInfo {
+                    luid: 2,
+                    attributes: super::SE_PRIVILEGE_ENABLED_BY_DEFAULT,
+                },
+                super::PrivilegeInfo {
+                    luid: 20,
+                    attributes: super::SE_PRIVILEGE_ENABLED_BY_DEFAULT
+                        | super::SE_PRIVILEGE_ENABLED,
+                },
+            ]
+        );
+    }
+    #[test]
+    fn direct_object_header_wins_when_only_it_has_a_valid_type() {
+        let input = VirtAddr(0x1000);
+        assert_eq!(
+            select_object_header_candidate(
+                input,
+                0x30,
+                Some(VirtAddr(0x0fd0)),
+                Some(input),
+                false,
+                true,
+            ),
+            Some((input, VirtAddr(0x1030), "header"))
+        );
+    }
+
+    #[test]
+    fn ambiguous_readable_object_headers_are_rejected() {
+        assert_eq!(
+            select_object_header_candidate(
+                VirtAddr(0x1000),
+                0x30,
+                Some(VirtAddr(0x0fd0)),
+                Some(VirtAddr(0x1000)),
+                false,
+                false,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn object_name_info_address_accounts_for_creator_info_only() {
+        let layout = ObjectNameLayout {
+            body_offset: 0x30,
+            info_mask_offset: 0x1a,
+            creator_info_size: Some(0x20),
+            name_info_size: 0x20,
+            name_offset: 0x08,
+        };
+        let header = VirtAddr(0x1000);
+
+        assert_eq!(layout.name_info_address(header, 0x00).unwrap(), None);
+        assert_eq!(
+            layout.name_info_address(header, 0x02).unwrap(),
+            Some(VirtAddr(0x0fe0))
+        );
+        assert_eq!(
+            layout.name_info_address(header, 0x03).unwrap(),
+            Some(VirtAddr(0x0fc0))
+        );
+        assert_eq!(
+            layout.name_info_address(header, 0x7e).unwrap(),
+            Some(VirtAddr(0x0fe0))
+        );
+    }
+
+    #[test]
+    fn object_name_info_address_requires_present_creator_layout() {
+        let layout = ObjectNameLayout {
+            body_offset: 0x30,
+            info_mask_offset: 0x1a,
+            creator_info_size: None,
+            name_info_size: 0x20,
+            name_offset: 0x08,
+        };
+
+        let error = layout
+            .name_info_address(VirtAddr(0x1000), 0x03)
+            .unwrap_err();
+        assert!(matches!(
+            &error,
+            crate::error::Error::StructNotFound(name)
+                if name == "_OBJECT_HEADER_CREATOR_INFO"
+        ));
     }
 }

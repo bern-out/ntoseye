@@ -56,6 +56,15 @@ pub enum Error {
     #[error("Not supported")]
     NotSupported,
 
+    #[error("target must be halted to write registers")]
+    TargetRunning,
+
+    #[error("the current backend does not support register writes")]
+    RegisterWriteUnsupported,
+
+    #[error("the current backend cannot continue an exception as not handled")]
+    ExceptionDispositionUnsupported,
+
     #[error("{0}")]
     DebugInfo(String),
 
@@ -74,6 +83,15 @@ pub enum Error {
 
     #[error("Symbol '{0}' not found")]
     SymbolNotFound(String),
+
+    #[error("Symbol '{name}' is ambiguous: {candidates}", candidates = .candidates.join(", "))]
+    AmbiguousSymbol {
+        name: String,
+        candidates: Vec<String>,
+    },
+
+    #[error("Unsupported target architecture: {0}; ntoseye supports AMD64 targets only")]
+    UnsupportedArchitecture(String),
 
     #[error("No symbol found near {0:x}")]
     UnknownAddress(VirtAddr),

@@ -7,36 +7,38 @@ use crate::guest::ModuleInfo;
 use crate::kd::context;
 use crate::kd::wire::{read_u16, read_u32, read_u64};
 use crate::types::VirtAddr;
-use kdmp_parser::structs::KdDebuggerData64;
+use kdmp_parser::structs::{ExceptionRecord64, Header64, KdDebuggerData64};
+use std::mem::{offset_of, size_of};
 
-const DUMP_HEADER64_SIZE: usize = 0x2000;
+const DUMP_HEADER64_SIZE: usize = size_of::<Header64>();
 const SIGNATURE_PAGEDU64: &[u8; 8] = b"PAGEDU64";
 const DUMP_TYPE_TRIAGE: u32 = 0x4;
 
-// DUMP_HEADER64 field offsets
-const OFF_MAJOR_VERSION: usize = 0x08;
-const OFF_MINOR_VERSION: usize = 0x0C;
-const OFF_DIRECTORY_TABLE_BASE: usize = 0x10;
-const OFF_PS_LOADED_MODULE_LIST: usize = 0x20;
-const OFF_PS_ACTIVE_PROCESS_HEAD: usize = 0x28;
-const OFF_MACHINE_IMAGE_TYPE: usize = 0x30;
-const OFF_NUMBER_PROCESSORS: usize = 0x34;
-const OFF_BUG_CHECK_CODE: usize = 0x38;
-const OFF_BUG_CHECK_PARAMETERS: usize = 0x40;
-const OFF_CONTEXT_RECORD: usize = 0x88 + 700 + 4; // after physical_memory_block_buffer + padding2
-const OFF_EXCEPTION_RECORD: usize = OFF_CONTEXT_RECORD + 3000; // after context_record_buffer
-const OFF_DUMP_TYPE: usize = 0xF98;
-const OFF_SYSTEM_TIME: usize = 0xFA8;
-const OFF_SYSTEM_UP_TIME: usize = 0x1030;
-const OFF_PRODUCT_TYPE: usize = 0x1040;
-const OFF_SUITE_MASK: usize = 0x1044;
+// DUMP_HEADER64 is a stable dump-container ABI. Derive its offsets from
+// kdmp-parser's SDK-sourced `#[repr(C)]` definition.
+const OFF_MAJOR_VERSION: usize = offset_of!(Header64, major_version);
+const OFF_MINOR_VERSION: usize = offset_of!(Header64, minor_version);
+const OFF_DIRECTORY_TABLE_BASE: usize = offset_of!(Header64, directory_table_base);
+const OFF_PS_LOADED_MODULE_LIST: usize = offset_of!(Header64, ps_loaded_module_list);
+const OFF_PS_ACTIVE_PROCESS_HEAD: usize = offset_of!(Header64, ps_active_process_head);
+const OFF_MACHINE_IMAGE_TYPE: usize = offset_of!(Header64, machine_image_type);
+const OFF_NUMBER_PROCESSORS: usize = offset_of!(Header64, number_processors);
+const OFF_BUG_CHECK_CODE: usize = offset_of!(Header64, bug_check_code);
+const OFF_BUG_CHECK_PARAMETERS: usize = offset_of!(Header64, bug_check_code_parameters);
+const OFF_KD_DEBUGGER_DATA_BLOCK: usize = offset_of!(Header64, kd_debugger_data_block);
+const OFF_CONTEXT_RECORD: usize = offset_of!(Header64, context_record_buffer);
+const OFF_EXCEPTION_RECORD: usize = offset_of!(Header64, exception);
+const OFF_DUMP_TYPE: usize = offset_of!(Header64, dump_type);
+const OFF_SYSTEM_TIME: usize = offset_of!(Header64, system_time);
+const OFF_SYSTEM_UP_TIME: usize = offset_of!(Header64, system_up_time);
+const OFF_PRODUCT_TYPE: usize = offset_of!(Header64, product_type);
+const OFF_SUITE_MASK: usize = offset_of!(Header64, suite_mask);
 
-// ExceptionRecord64 layout (136 bytes)
-const EXCEPTION_CODE: usize = 0x00;
-const EXCEPTION_FLAGS: usize = 0x04;
-const EXCEPTION_ADDRESS: usize = 0x10;
-const EXCEPTION_NUM_PARAMS: usize = 0x18;
-const EXCEPTION_INFORMATION: usize = 0x20;
+const EXCEPTION_CODE: usize = offset_of!(ExceptionRecord64, exception_code);
+const EXCEPTION_FLAGS: usize = offset_of!(ExceptionRecord64, exception_flags);
+const EXCEPTION_ADDRESS: usize = offset_of!(ExceptionRecord64, exception_address);
+const EXCEPTION_NUM_PARAMS: usize = offset_of!(ExceptionRecord64, number_parameters);
+const EXCEPTION_INFORMATION: usize = offset_of!(ExceptionRecord64, exception_information);
 
 // TRIAGE_DUMP64 field offsets (within the triage header, relative to 0x2000).
 // Layout confirmed against Singularity RDK Dump.h and nforest/dumplib.
@@ -306,10 +308,15 @@ pub fn parse_triage(mmap: &[u8]) -> Result<(DmpInfo, Vec<TriageBlock>)> {
         is_triage: true,
         ps_loaded_module_list: read_u64(mmap, OFF_PS_LOADED_MODULE_LIST),
         ps_active_process_head: read_u64(mmap, OFF_PS_ACTIVE_PROCESS_HEAD),
+        debugger_data_block: match read_u64(mmap, OFF_KD_DEBUGGER_DATA_BLOCK) {
+            0 => None,
+            address => Some(address),
+        },
         triage_drivers: Vec::new(),
         exception,
         system_info,
         unloaded_drivers,
+        blackbox_streams: Vec::new(),
         triage_process_snapshot,
         triage_thread_snapshot,
         triage_prcb_info: debugger_data
@@ -488,7 +495,7 @@ fn extract_snapshot(mmap: &[u8], offset: usize, size: usize) -> Option<Vec<u8>> 
 fn parse_debugger_data(mmap: &[u8], triage_hdr: &[u8]) -> Option<DebuggerDataFields> {
     let offset = read_u32(triage_hdr, TRIAGE_DEBUGGER_DATA_OFFSET) as usize;
     let size = read_u32(triage_hdr, TRIAGE_DEBUGGER_DATA_SIZE) as usize;
-    let min_size = std::mem::offset_of!(KdDebuggerData64, offset_prcb_context) + 2;
+    let min_size = offset_of!(KdDebuggerData64, offset_prcb_context) + 2;
     if offset == 0 || size < min_size {
         return None;
     }

@@ -10,12 +10,12 @@ Windows kernel debugger for Linux hosts running Windows under KVM/QEMU. Essentia
 ## Features
 
 - Command line interface
-- WinDbg style commands
+- WinDbg-compatible REPL commands and hexadecimal expression radix
 - Kernel debugging
-- PDB fetching & parsing for offsets
-- Breakpointing and watchpoints (kernel and user mode)
-- Bugcheck analysis
-- Crash dump analysis (`--dump` opens a Windows kernel `.dmp` file for offline inspection)
+- Public/private PDB symbols, source lines, and scoped local-variable metadata
+- Deferred, conditional, pass-count, one-shot, and command-action breakpoints
+- Hardware watchpoints (kernel and user mode)
+- Integrated bugcheck, exception, verifier, WHEA, and crash-dump analysis
 - Three backends: Windows KD over a serial pipe (KDCOM, default), QEMU's `gdbstub`, and passive memory introspection (see [Choosing a backend](#choosing-a-backend))
 - [Python SDK](#python-sdk)
 - [Custom commands](#custom-commands)
@@ -23,11 +23,14 @@ Windows kernel debugger for Linux hosts running Windows under KVM/QEMU. Essentia
 
 ### Supported Windows
 
-`ntoseye` currently only supports Windows 10 and 11 guests.
+`ntoseye` supports 64-bit AMD64 Windows 10 and 11 guests.
 
 ### Disclaimer
 
-`ntoseye` needs to download symbols and images to initialize required offsets, it will only download symbols from Microsoft's official symbol server. Config, cache, and REPL state live under `~/.ntoseye`. If a legacy `~/.config/ntoseye` directory exists and `~/.ntoseye` does not, ntoseye moves it to `~/.ntoseye` automatically and prints a note. Notable paths:
+`ntoseye` uses Microsoft's public symbol server by default. Private PDBs can be loaded from ordered local directories, caches, or configured HTTP symbol servers with `.sympath`; GUID and age are validated before use. Config, cache, and REPL state live under `~/.ntoseye`. If a legacy `~/.config/ntoseye` directory exists and `~/.ntoseye` does not, ntoseye moves it to `~/.ntoseye` automatically and prints a note. Notable paths:
+
+Add startup-wide HTTP symbol servers with repeatable `--pdb-server <url>` options or the semicolon-separated `NTOSEYE_PDB_SERVERS` environment variable. Configured servers are tried in order before Microsoft's default; `.sympath` can still replace or extend the active source list within a session.
+
 - `~/.ntoseye/commands/` for custom scripted commands
 - `~/.ntoseye/images/` for binaries downloaded from the VM
 - `~/.ntoseye/symbols/` for PDBs
@@ -99,13 +102,15 @@ ev poi(nt!PsInitialSystemProcess)
 ev (_EPROCESS)poi(nt!PsInitialSystemProcess)->UniqueProcessId
 ```
 
+The REPL follows WinDbg's hexadecimal default radix: a bare `1000` is `0x1000`. Use the `0n` prefix for an explicit decimal value (`0n10`), or `n 10` to switch the session default to decimal. `n 8` and `n 16` select octal and hexadecimal. Bare hexadecimal tokens containing `a`-`f` are resolved as symbols first and fall back to hexadecimal only when no symbol matches. Use `0x...` when an address must be unambiguously numeric.
+
 Field access in `ev` needs an explicit cast so ntoseye knows the layout. The `dt` command gets the type from its first argument, so the address expression does not need a cast:
 
 ```text
 dt _EPROCESS poi(nt!PsInitialSystemProcess) UniqueProcessId
 ```
 
-Breakpoints and data watchpoints accept conditions written directly after the address expression. Conditions use the normal expression grammar: comparisons, bitwise operations, and short-circuiting `!`, `&&`, and `||` can be combined with parentheses. Write ranges explicitly (`0 < @rax && @rax < 10`) rather than as chained comparisons.
+Breakpoints and data watchpoints accept conditions written directly after the address expression. Conditions use the normal expression grammar: comparisons, bitwise operations, and short-circuiting `!`, `&&`, and `||` can be combined with parentheses. Write ranges explicitly (`0 < @rax && @rax < 0n10`) rather than as chained comparisons.
 
 ```text
 bp nt!KeBugCheckEx @rcx == 0x50 && (@rdx & 0xff) != 0
@@ -117,6 +122,69 @@ Data watchpoints use `ba <access><size> <address>` (`w` = write, `r` = read/writ
 ba w8 nt!KiBalanceSetManagerLastCheckTick
 ```
 
+Deferred breakpoints preserve their symbolic or `file.c:line` specification across module unload/reload. `/1` makes a one-shot breakpoint, `/p <pid>` sets an explicit process scope, a pass count delays surfacing, and `do` attaches a bounded REPL action:
+
+```text
+bu /1 /p 1234 mydriver!DriverEntry
+bu mydriver.c:42 10 if @rcx != 0 do r; gc
+bm mydriver!Dispatch*
+```
+
+### Private PDBs and local source
+
+Symbol and source paths are configured independently. The Linux host needs the private PDB and, for source display, a copy of the source tree. Use the full linker PDB (`/DEBUG:FULL`, not a stripped/public PDB) when procedure locals are needed. ntoseye validates the selected PDB's GUID and age against the CodeView identity in the loaded guest image and rejects a mismatch.
+
+Append the directory containing the PDB with `.sympath+`. The `+` preserves the managed cache and Microsoft's public symbol server; bare `.sympath` replaces the entire active list:
+
+```text
+.sympath+ <directory-containing-the-pdb>
+```
+
+`.srcpath` maps a source-path prefix recorded in the PDB to the corresponding source directory on the Linux host:
+
+```text
+.srcpath <source-prefix-recorded-in-pdb>=<local-source-root>
+```
+
+For example:
+
+```text
+.sympath+ /home/me/symbols/mydriver
+.srcpath C:\Users\me\source\repos\MyDriver=/home/me/src/MyDriver
+```
+
+The left side of `.srcpath` is a build-time source path such as the prefix shown in an unmapped source location; it is not the PDB path embedded in the image. The right side is the local directory containing the same source files.
+
+If the driver is already loaded, force source selection and indexing once after changing the path, inspect the accepted identity, and set the source breakpoint:
+
+```text
+ld mydriver
+lmv mydriver
+bu MyDriver.c:42
+bl
+g
+```
+
+`lmv` reports the loaded image range, symbol status, where the image was read from (for example, guest memory), and the accepted PDB GUID and age. `.reload mydriver` is equivalent to `ld mydriver`; `.reload` without a module reloads every module in the current inspection scope.
+
+The paths and breakpoint can also be configured before loading the driver. In that case, omit `ld`: `bu MyDriver.c:42` creates a deferred breakpoint, and `bl` shows `deferred` with no address. Load and trigger the driver in Windows after `g`. At the next debugger stop, ntoseye refreshes the module list, loads the matching PDB, and enables the same breakpoint ID with its existing settings.
+
+At the source hit, these commands verify the complete private-symbol workflow:
+
+```text
+lmv mydriver
+ln @rip
+uf mydriver!Transform
+k
+dv
+```
+
+The stack and disassembly include mapped source locations. `dv` displays the current procedure's private parameters and locals, including register- or stack-relative locations and live values when the current register context matches the procedure.
+
+Keep a `bu` breakpoint installed if the driver will be cycled. Once ntoseye observes the unload, `bl` changes it from `enabled` to `deferred` without losing its ID, source specification, conditions, pass count, hit count, or action. After the module reload is observed at a later stop, the same breakpoint becomes `enabled` at the new address.
+
+`.reload` is reserved for Rust-owned symbol reload behavior; `reload-scripts` reloads custom commands and aliases.
+
 Aliases use `alias <name> <expansion>`. `${1}` is the first argument passed to the alias, `${2}` is the second, and `${*}` expands to all alias arguments separated by spaces. Alias expansions can contain command lists separated by semicolons.
 
 ```text
@@ -125,7 +193,7 @@ alias pe dt _EPROCESS poi(nt!PsInitialSystemProcess) ${1}
 unalias ubp
 ```
 
-Aliases are saved in `~/.ntoseye/aliases`; `reload` reloads aliases and custom Python commands.
+Aliases are saved in `~/.ntoseye/aliases`; `reload-scripts` reloads aliases and custom Python commands.
 
 ## Choosing a backend
 
@@ -320,7 +388,7 @@ The module is a native extension built with [maturin](https://www.maturin.rs/); 
 
 In addition to the standalone [Python SDK](#python-sdk), `ntoseye` can run Python commands inside the live REPL; the same SDK, but bound to the session you're already debugging rather than a separate attach. This requires a build with the embedded interpreter (which is enabled by default).
 
-Drop any `*.py` file in `~/.ntoseye/commands/`; they're auto-loaded at REPL startup. Run `reload` in the REPL to pick up edits without restarting.
+Drop any `*.py` file in `~/.ntoseye/commands/`; they're auto-loaded at REPL startup. Run `reload-scripts` in the REPL to pick up edits without restarting.
 
 Custom commands need no `pip install ntoseye` as the module is served by the embedded interpreter. However, it may be worth installing to get LSP completions and type diagnostics while you write them.
 

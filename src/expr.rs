@@ -9,7 +9,7 @@ use std::ops::Range;
 use winnow::Parser;
 use winnow::combinator::{alt, not, peek};
 use winnow::error::{ErrMode, ModalResult, ParserError};
-use winnow::stream::{LocatingSlice, Location, Stream};
+use winnow::stream::{LocatingSlice, Location, Stateful, Stream};
 use winnow::token::{literal, one_of, take_till, take_while};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -46,6 +46,23 @@ pub enum ExprBinaryOp {
     BitwiseOr,
     ShiftLeft,
     ShiftRight,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NumberRadix {
+    Octal,
+    Decimal,
+    Hexadecimal,
+}
+
+impl NumberRadix {
+    pub const fn value(self) -> u32 {
+        match self {
+            Self::Octal => 8,
+            Self::Decimal => 10,
+            Self::Hexadecimal => 16,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -98,15 +115,34 @@ impl ExprParseError {
 
 impl Expr {
     pub fn eval(input: &str, context: &Target) -> Result<VirtAddr> {
-        Self::parse(input)?.resolve(context)
+        Self::eval_with_radix(input, context, NumberRadix::Decimal)
+    }
+
+    pub fn eval_with_radix(input: &str, context: &Target, radix: NumberRadix) -> Result<VirtAddr> {
+        Self::parse_with_radix(input, radix)?.resolve(context)
     }
 
     pub fn parse(input: &str) -> Result<Self> {
-        Self::parse_detailed(input).map_err(|err| Error::InvalidExpression(err.render(input)))
+        Self::parse_with_radix(input, NumberRadix::Decimal)
+    }
+
+    pub fn parse_with_radix(input: &str, radix: NumberRadix) -> Result<Self> {
+        Self::parse_detailed_with_radix(input, radix)
+            .map_err(|err| Error::InvalidExpression(err.render(input)))
     }
 
     pub fn parse_detailed(input: &str) -> std::result::Result<Self, ExprParseError> {
-        let mut input = LocatingSlice::new(input);
+        Self::parse_detailed_with_radix(input, NumberRadix::Decimal)
+    }
+
+    pub fn parse_detailed_with_radix(
+        input: &str,
+        radix: NumberRadix,
+    ) -> std::result::Result<Self, ExprParseError> {
+        let mut input = Stateful {
+            input: LocatingSlice::new(input),
+            state: radix,
+        };
         let expr = parse_logical_or
             .parse_next(&mut input)
             .map_err(unwrap_parse_error)?;
@@ -155,7 +191,7 @@ impl Expr {
             Expr::Symbol(name) => {
                 if let Some(addr) = context
                     .symbols
-                    .find_symbol_across_modules(context.current_dtb(), name)
+                    .find_symbol_across_modules(context.current_dtb(), name)?
                 {
                     return Ok(addr);
                 }
@@ -411,7 +447,7 @@ impl Expr {
     }
 }
 
-type ExprInput<'a> = LocatingSlice<&'a str>;
+type ExprInput<'a> = Stateful<LocatingSlice<&'a str>, NumberRadix>;
 type ParseResult<T> = ModalResult<T, ExprParseError>;
 
 impl<'a> ParserError<ExprInput<'a>> for ExprParseError {
@@ -815,8 +851,12 @@ fn parse_number_literal(input: &mut ExprInput<'_>, label: &'static str) -> Parse
         return u64::from_str_radix(&token[2..], 2)
             .map_err(|_| ErrMode::Cut(ExprParseError::new(span, "invalid binary literal")));
     }
-    token
-        .parse::<u64>()
+    if token.starts_with("0n") || token.starts_with("0N") {
+        return token[2..]
+            .parse::<u64>()
+            .map_err(|_| ErrMode::Cut(ExprParseError::new(span, "invalid decimal literal")));
+    }
+    u64::from_str_radix(token, input.state.value())
         .map_err(|_| ErrMode::Cut(ExprParseError::new(span, "invalid numeric literal")))
 }
 
