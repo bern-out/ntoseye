@@ -5,7 +5,7 @@
 
 # ntoseye ![license](https://img.shields.io/badge/license-MIT-blue) [![crates.io](https://img.shields.io/crates/v/ntoseye.svg)](https://crates.io/crates/ntoseye)
 
-Windows kernel debugger for Linux hosts running Windows under KVM/QEMU/VMWARE. Essentially, WinDbg for Linux.
+Windows kernel debugger for Linux hosts running Windows under KVM/QEMU or VMware. Essentially, WinDbg for Linux.
 
 ## Features
 
@@ -16,7 +16,7 @@ Windows kernel debugger for Linux hosts running Windows under KVM/QEMU/VMWARE. E
 - Deferred, conditional, pass-count, one-shot, and command-action breakpoints
 - Hardware watchpoints (kernel and user mode)
 - Integrated bugcheck, exception, verifier, WHEA, and crash-dump analysis
-- Three backends: Windows KD over a serial pipe (KDCOM, default), QEMU's `gdbstub`, and passive memory introspection (see [Choosing a backend](#choosing-a-backend))
+- Three backends: Windows KD over a serial pipe (KDCOM, default), a hypervisor `gdbstub`, and passive memory introspection (see [Choosing a backend](#choosing-a-backend))
 - [Python SDK](#python-sdk)
 - [Custom commands](#custom-commands)
 - [MCP integration](#mcp-integration)
@@ -197,11 +197,11 @@ Aliases are saved in `~/.ntoseye/aliases`; `reload-scripts` reloads aliases and 
 
 `ntoseye` can talk to the guest three ways. Pick with `--backend kd` (default), `--backend gdb`, or `--backend memory`.
 
-|                                 | `kd` (default)                                                                                         | `gdb`                                     | `memory`                                   |
-| ------------------------------- | ------------------------------------------------------------------------------------------------------ | ----------------------------------------- | ------------------------------------------ |
-| Transport                       | Windows KD over a serial pipe (KDCOM)                                                                  | QEMU's `gdbstub`                          | None; `/dev/kvm` memory introspection only |
-| Requires in-guest configuration | Yes (`bcdedit /debug on`; anti-debug code, PatchGuard, and some Windows behaviour change once enabled) | No (guest is unaware it's being debugged) | No                                         |
-| Requires host VM configuration  | Yes (serial socket)                                                                                    | Yes (`-s -S`)                             | No                                         |
+|                                 | `kd` (default)                                                                                         | `gdb`                                     | `memory`                                      |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------ | ----------------------------------------- | --------------------------------------------- |
+| Transport                       | Windows KD over a serial pipe (KDCOM)                                                                  | Hypervisor `gdbstub`                      | None; hypervisor-process memory introspection |
+| Requires in-guest configuration | Yes (`bcdedit /debug on`; anti-debug code, PatchGuard, and some Windows behaviour change once enabled) | No (guest is unaware it's being debugged) | No                                            |
+| Requires host VM configuration  | Yes (serial socket)                                                                                    | Yes (a listening `gdbstub`)               | No                                            |
 | Execution control               | Yes                                                                                                    | Yes                                       | No                                         |
 | Kernel breakpoints              | Yes                                                                                                    | Yes                                       | No                                         |
 | Usermode breakpoints            | Yes                                                                                                    | No                                        | No                                         |
@@ -212,6 +212,8 @@ See [VM configuration](#vm-configuration) for the host-side setup of each backen
 ## VM configuration
 
 Manual host-side setup for each backend. libvirt/virt-manager users can do most of this automatically with `ntoseye virsh` (see [Quickstart](#quickstart)); `ntoseye virsh` can also remove ntoseye-managed debug transports later.
+
+For VMware Workstation, power the VM off before editing its `.vmx` file. `ntoseye virsh` only configures libvirt/QEMU guests. VMware VM discovery currently selects the first running `vmware-vmx` process, so only the target VMware VM should be powered on while using `ntoseye`.
 
 ### GDBSTUB
 
@@ -237,6 +239,17 @@ Add the following to the XML configuration:
   </qemu:commandline>
 </domain>
 ```
+
+#### VMware
+
+VMware Workstation provides its own GDB remote stub. Add the following to the VM's `.vmx` file:
+
+```ini
+debugStub.listen.guest64 = "TRUE"
+debugStub.port.guest64 = "1234"
+```
+
+Legacy VMware stubs that do not expose an AMD64 XML target description are unsupported; use KDCOM or the `memory` backend instead.
 
 ### KDCOM
 
@@ -292,9 +305,24 @@ The initial KD handshake timeout is 8 seconds by default. For unusually slow gue
 </domain>
 ```
 
+#### VMware
+
+Configure the first virtual serial port (guest COM1) as a server-side pipe:
+
+```ini
+serial0.present = "TRUE"
+serial0.fileType = "pipe"
+serial0.fileName = "/tmp/ntoseye-kd.sock"
+serial0.pipe.endPoint = "server"
+serial0.startConnected = "TRUE"
+serial0.yieldOnMsrRead = "TRUE"
+```
+
+If another virtual serial device already occupies COM1, configure the next `serialN` entry and use the corresponding `debugport:N+1`.
+
 ### Memory
 
-Passive backend for guests where you only want `/dev/kvm` memory introspection. It requires no guest or VM debug transport configuration:
+Passive backend for KVM/QEMU and VMware guests where you only want memory introspection. It reads the VM process directly and requires no guest or VM debug transport configuration:
 
 ```bash
 ntoseye --backend memory
