@@ -123,11 +123,19 @@ pub enum Error {
     #[error("Process image not found")]
     MissingImage,
 
-    #[error("No memory regions found in VM process (QEMU/KVM or vmware-vmx)")]
-    NoKvmRegions,
+    #[error("No readable guest-memory mapping found in {hypervisor} VM process (PID {pid})")]
+    VmMemoryRegionNotFound { pid: i32, hypervisor: &'static str },
 
-    #[error("VM process not found\n  KVM (QEMU): no process has /dev/kvm open\n  VMware: no vmware-vmx process found with /dev/vmmon open — is the VM powered on?")]
-    KvmNotFound,
+    #[error(
+        "VM process not found\n  KVM (QEMU): no process has /dev/kvm open\n  VMware: no vmware-vmx process found — is the VM powered on?"
+    )]
+    VmNotFound,
+
+    #[error("Multiple live VM processes found ({0}); leave only the target VM running")]
+    MultipleVmProcesses(String),
+
+    #[error("Multiple VMware guest-memory mappings found in PID {pid} ({count} candidates)")]
+    MultipleVmMemoryRegions { pid: i32, count: usize },
 
     #[error(
         "permission denied reading from VM process (PID {pid}).\n\

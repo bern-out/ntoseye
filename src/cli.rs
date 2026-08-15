@@ -40,7 +40,7 @@ impl FromArgValue for BackendKind {
 }
 
 #[derive(FromArgs)]
-/// Windows kernel debugger for Linux hosts running Windows under KVM/QEMU
+/// Windows kernel debugger for Linux hosts running Windows under KVM/QEMU or VMware
 struct Args {
     /// print version information
     #[argh(switch, short = 'v', long = "version")]
@@ -309,7 +309,7 @@ fn run() -> Result<()> {
         BackendKind::Memory => "memory",
     };
     let target = resolve_target(backend_str, args.connect.as_deref());
-    let phys = Arc::new(PhysMem::kvm()?);
+    let phys = Arc::new(PhysMem::live()?);
     let mut ctx = session::Session::connect(
         phys,
         target.as_deref(),

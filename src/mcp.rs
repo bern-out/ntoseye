@@ -114,7 +114,7 @@ fn spawn_session(
                 })
             } else {
                 let target = resolve_target(backend.as_str(), connect.as_deref());
-                let phys = Arc::new(PhysMem::kvm()?);
+                let phys = Arc::new(PhysMem::live()?);
                 Session::connect(phys, target.as_deref(), || {
                     let backend: Box<dyn DebugBackend> = match backend.as_str() {
                         "gdb" => Box::new(GdbClient::connect(target.as_deref().unwrap())?),
@@ -3117,7 +3117,7 @@ impl rmcp::ServerHandler for NtoseyeMcp {
             ))
             .with_instructions(
                 "ntoseye: introspect and control a live Windows kernel running under \
-                 KVM/QEMU. Read-only tools for process/thread/module/driver \
+                 KVM/QEMU or VMware. Read-only tools for process/thread/module/driver \
                  enumeration, memory and struct reads, disassembly, backtraces, \
                  trap-frame decoding, page-table walks, and symbol/type lookup. \
                  State-changing tools: attach_process/detach (scope the context \

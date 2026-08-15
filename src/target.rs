@@ -898,7 +898,7 @@ impl Target {
     }
 
     pub fn new() -> Result<Self> {
-        Self::with_phys(Arc::new(PhysMem::kvm()?))
+        Self::with_phys(Arc::new(PhysMem::live()?))
     }
 
     pub fn with_phys(phys: Arc<PhysMem>) -> Result<Self> {

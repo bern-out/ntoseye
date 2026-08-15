@@ -3163,7 +3163,7 @@ fn attach(backend: &str, connect: Option<&str>) -> PyResult<Debugger> {
         .map_err(err)?
     } else {
         let target = resolve_target(backend, connect);
-        let phys = Arc::new(PhysMem::kvm().map_err(err)?);
+        let phys = Arc::new(PhysMem::live().map_err(err)?);
         Session::connect(phys, target.as_deref(), || {
             let be: Box<dyn DebugBackend> = match backend {
                 "gdb" => Box::new(GdbClient::connect(target.as_deref().unwrap())?),

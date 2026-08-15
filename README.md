@@ -213,7 +213,7 @@ See [VM configuration](#vm-configuration) for the host-side setup of each backen
 
 Manual host-side setup for each backend. libvirt/virt-manager users can do most of this automatically with `ntoseye virsh` (see [Quickstart](#quickstart)); `ntoseye virsh` can also remove ntoseye-managed debug transports later.
 
-For VMware Workstation, power the VM off before editing its `.vmx` file. `ntoseye virsh` only configures libvirt/QEMU guests. VMware VM discovery currently selects the first running `vmware-vmx` process, so only the target VMware VM should be powered on while using `ntoseye`.
+For VMware Workstation, power the VM off before editing its `.vmx` file. `ntoseye virsh` only configures libvirt/QEMU guests. `ntoseye` requires exactly one live VM process, so leave only the target QEMU or VMware VM running while attaching.
 
 ### GDBSTUB
 

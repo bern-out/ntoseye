@@ -3,21 +3,21 @@ use std::path::Path;
 use crate::backend::MemoryOps;
 use crate::dmp::{DmpInfo, DmpMem};
 use crate::error::Result;
-use crate::host::KvmHandle;
+use crate::host::LiveVmHandle;
 use crate::types::PhysAddr;
 
-/// Guest physical memory, backed either by a live VM (via /dev/kvm) or by a
+/// Guest physical memory, backed either by a live VM process or by a
 /// crash dump file. Built once at attach and shared via `Arc`; everything above
 /// (address spaces, symbol loading, unwinding) reads through it. `Dmp` is boxed
 /// for the variant size imbalance, not that it matters for a one-off.
 pub enum PhysMem {
-    Kvm(KvmHandle),
+    Live(LiveVmHandle),
     Dmp(Box<DmpMem>),
 }
 
 impl PhysMem {
-    pub fn kvm() -> Result<Self> {
-        Ok(Self::Kvm(KvmHandle::new()?))
+    pub fn live() -> Result<Self> {
+        Ok(Self::Live(LiveVmHandle::new()?))
     }
 
     pub fn dmp(path: &Path) -> Result<Self> {
@@ -35,14 +35,14 @@ impl PhysMem {
 impl MemoryOps<PhysAddr> for PhysMem {
     fn read_bytes(&self, addr: PhysAddr, buf: &mut [u8]) -> Result<()> {
         match self {
-            Self::Kvm(h) => h.read_bytes(addr, buf),
+            Self::Live(h) => h.read_bytes(addr, buf),
             Self::Dmp(d) => d.read_bytes(addr, buf),
         }
     }
 
     fn write_bytes(&self, addr: PhysAddr, buf: &[u8]) -> Result<()> {
         match self {
-            Self::Kvm(h) => h.write_bytes(addr, buf),
+            Self::Live(h) => h.write_bytes(addr, buf),
             Self::Dmp(d) => d.write_bytes(addr, buf),
         }
     }
