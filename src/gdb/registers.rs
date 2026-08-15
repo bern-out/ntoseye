@@ -88,6 +88,25 @@ impl RegisterMap {
         self.ordered.iter().map(|reg| reg.name.clone()).collect()
     }
 
+    pub fn require_amd64_target(&self) -> Result<()> {
+        let amd64 = ["rax", "rip", "rsp"].iter().all(|name| {
+            self.by_name
+                .get(*name)
+                .is_some_and(|register| register.size == 8)
+        });
+        if amd64 {
+            return Ok(());
+        }
+        let detected = if self.by_name.contains_key("eip") {
+            "I386 register description"
+        } else if self.by_name.contains_key("pc") && self.by_name.contains_key("x0") {
+            "ARM64 register description"
+        } else {
+            "unrecognized GDB target register description"
+        };
+        Err(Error::UnsupportedArchitecture(detected.to_string()))
+    }
+
     pub fn parse_target_xml(xml: &str) -> Self {
         let mut map = RegisterMap::default();
         let mut current_offset: usize = 0;
@@ -172,6 +191,7 @@ impl RegisterMap {
 #[cfg(test)]
 mod tests {
     use super::RegisterMap;
+    use crate::error::Error;
 
     #[test]
     fn parses_target_xml_without_line_based_reg_tags() {
@@ -195,5 +215,52 @@ mod tests {
             0x0101_0101_0101_0101
         );
         assert_eq!(regs.get("rip"), Some(&0x0101_0101_0101_0101));
+    }
+
+    #[test]
+    fn writes_general_instruction_and_flags_registers_without_spilling() {
+        let xml = r#"
+            <target><feature name="core">
+              <reg name="rax" bitsize="64"/>
+              <reg name="rip" bitsize="64"/>
+              <reg name="eflags" bitsize="32"/>
+              <reg name="cs" bitsize="16"/>
+            </feature></target>
+        "#;
+        let map = RegisterMap::parse_target_xml(xml);
+        let mut regs = vec![0xa5; 22];
+
+        map.write_u64("rax", &mut regs, 1).unwrap();
+        map.write_u64("rip", &mut regs, 0xffff_f800_1234_5678)
+            .unwrap();
+        map.write_u64("eflags", &mut regs, 0x202).unwrap();
+
+        assert_eq!(map.read_u64("rax", &regs).unwrap(), 1);
+        assert_eq!(map.read_u64("rip", &regs).unwrap(), 0xffff_f800_1234_5678);
+        assert_eq!(map.read_u64("eflags", &regs).unwrap(), 0x202);
+        assert_eq!(&regs[20..22], &[0xa5, 0xa5]);
+        assert!(matches!(
+            map.write_u64("readonly_or_unknown", &mut regs, 0),
+            Err(Error::RegisterNotFound(name)) if name == "readonly_or_unknown"
+        ));
+    }
+
+    #[test]
+    fn rejects_non_amd64_register_descriptions() {
+        let amd64 = RegisterMap::parse_target_xml(
+            r#"<reg name="rax" bitsize="64"/>
+               <reg name="rip" bitsize="64"/>
+               <reg name="rsp" bitsize="64"/>"#,
+        );
+        assert!(amd64.require_amd64_target().is_ok());
+
+        let arm64 = RegisterMap::parse_target_xml(
+            r#"<reg name="x0" bitsize="64"/>
+               <reg name="pc" bitsize="64"/>
+               <reg name="sp" bitsize="64"/>"#,
+        );
+        let error = arm64.require_amd64_target().unwrap_err();
+        assert!(matches!(error, Error::UnsupportedArchitecture(_)));
+        assert!(error.to_string().contains("ARM64 register description"));
     }
 }

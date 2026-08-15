@@ -5,7 +5,8 @@ use crate::{
     phys::PhysMem,
     symbols::{
         DownloadJob, FieldInfo, ModuleSymbolDiscovery, ModuleSymbolLoad, ModuleSymbolSource,
-        ModuleSymbolStatus, ParsedType, SymbolStore, TypeInfo, download_jobs_parallel,
+        ModuleSymbolStatus, ParsedType, SymbolIndexDiagnostic, SymbolStore, TypeInfo,
+        download_jobs_parallel,
     },
     types::*,
 };
@@ -94,13 +95,25 @@ impl ModuleInfo {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleSymbolDiagnostic {
+    pub module: String,
+    pub phase: &'static str,
+    pub compiland: Option<String>,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ModuleSymbolLoadReport {
     pub total: usize,
     pub loaded: usize,
+    /// Symbol-bearing modules removed from this DTB since the previous refresh.
+    pub unloaded: usize,
     pub no_pdb: usize,
     pub skipped: usize,
     pub failed: usize,
+    pub diagnostic_count: usize,
+    pub diagnostics: Vec<ModuleSymbolDiagnostic>,
 }
 
 impl ModuleSymbolLoadReport {
@@ -126,6 +139,21 @@ impl ModuleSymbolLoadReport {
                 self.failed += 1;
             }
         }
+    }
+
+    fn record_diagnostics(&mut self, module: &str, diagnostics: Vec<SymbolIndexDiagnostic>) {
+        const REPORT_DIAGNOSTIC_LIMIT: usize = 64;
+        self.diagnostic_count += diagnostics.len();
+        let remaining = REPORT_DIAGNOSTIC_LIMIT.saturating_sub(self.diagnostics.len());
+        self.diagnostics
+            .extend(diagnostics.into_iter().take(remaining).map(|diagnostic| {
+                ModuleSymbolDiagnostic {
+                    module: module.to_string(),
+                    phase: diagnostic.phase,
+                    compiland: diagnostic.compiland,
+                    message: diagnostic.message,
+                }
+            }));
     }
 
     pub fn failed_count(&self) -> usize {
@@ -569,7 +597,7 @@ impl WinObject {
         let guid = self.guid.ok_or(Error::ExpectedSymbols)?;
         let rva = self
             .symbols
-            .symbol_rva(guid, &name)
+            .symbol_rva(guid, &name)?
             .ok_or(Error::SymbolNotFound(name))?;
         Ok(SymbolRef { obj: self, rva })
     }
@@ -1061,7 +1089,7 @@ impl Guest {
         ready: &mut Vec<ModuleSymbolLoad>,
         load: ModuleSymbolLoad,
     ) {
-        if symbols.has_guid(load.guid) {
+        if symbols.has_matching_pdb(&load.job) {
             ready.push(load);
         } else {
             downloads.push(load);
@@ -1370,11 +1398,7 @@ impl Guest {
         populate_module_versions(modules, &memory);
     }
 
-    pub fn populate_process_module_versions(
-        &self,
-        modules: &mut [ModuleInfo],
-        info: &ProcessInfo,
-    ) {
+    pub fn populate_process_module_versions(&self, modules: &mut [ModuleInfo], info: &ProcessInfo) {
         let process_mem = self.ntoskrnl.sibling(info.dtb, VirtAddr(0));
         let memory = process_mem.memory();
         populate_module_versions(modules, &memory);
@@ -1409,7 +1433,7 @@ impl Guest {
                 continue;
             }
 
-            match SymbolStore::extract_download_job(phys, dtb, &module.name, module.base_address) {
+            match symbols.extract_download_job(phys, dtb, &module.name, module.base_address) {
                 Ok(ModuleSymbolDiscovery::Ready { job, guid, source }) => {
                     Self::queue_module_symbol_load(
                         symbols,
@@ -1451,7 +1475,7 @@ impl Guest {
 
         for ((image_job, module), result) in image_jobs.into_iter().zip(image_results) {
             match result {
-                Ok(_) => match SymbolStore::extract_download_job_from_image_file(&image_job.path) {
+                Ok(_) => match symbols.extract_download_job_from_image_file(&image_job.path) {
                     Ok(Some((job, guid))) => {
                         Self::queue_module_symbol_load(
                             symbols,
@@ -1527,18 +1551,20 @@ impl Guest {
                 .into_par_iter()
                 .map(|load| {
                     let module = load.module.clone();
+                    let guid = load.guid;
                     let result = symbols.load_downloaded_pdb(&load);
                     pb.inc(1);
-                    (module, result)
+                    (module, guid, result)
                 })
                 .collect::<Vec<_>>();
 
             pb.finish_and_clear();
 
-            for (module, result) in results {
+            for (module, guid, result) in results {
                 match result {
                     Ok(_) => {
                         report.record_status(&ModuleSymbolStatus::Loaded);
+                        report.record_diagnostics(&module.name, symbols.index_diagnostics(guid));
                     }
                     Err(e) => {
                         Self::apply_module_symbol_status(
@@ -1589,7 +1615,7 @@ impl Guest {
             return Ok(ModuleSymbolLoadReport::new(0));
         }
 
-        symbols.retain_modules_for_dtb(dtb, &modules);
+        let unloaded = symbols.retain_modules_for_dtb(dtb, &modules);
         let missing = modules
             .into_iter()
             .filter(|module| {
@@ -1599,7 +1625,9 @@ impl Guest {
             })
             .collect::<Vec<_>>();
 
-        Self::load_module_symbols(phys, symbols, missing, dtb, true)
+        let mut report = Self::load_module_symbols(phys, symbols, missing, dtb, true)?;
+        report.unloaded = unloaded;
+        Ok(report)
     }
 
     pub fn load_all_process_module_symbols(
@@ -1630,7 +1658,8 @@ impl Guest {
 
 #[cfg(test)]
 mod tests {
-    use super::PeImage;
+    use super::{ModuleSymbolLoadReport, PeImage};
+    use crate::symbols::SymbolIndexDiagnostic;
 
     #[test]
     fn pe_image_present_respects_holes_and_bounds() {
@@ -1655,5 +1684,23 @@ mod tests {
         // out of bounds -> absent, and overflow doesn't panic
         assert!(!image.is_present(0xf0, 0x20));
         assert!(!image.is_present(usize::MAX, 1));
+    }
+
+    #[test]
+    fn symbol_report_preserves_index_diagnostics_and_total_count() {
+        let mut report = ModuleSymbolLoadReport::new(1);
+        let diagnostics = (0..70)
+            .map(|index| SymbolIndexDiagnostic {
+                phase: "line iteration",
+                compiland: Some(format!("{index}.obj")),
+                message: "malformed line record".to_string(),
+            })
+            .collect();
+        report.record_diagnostics("driver.sys", diagnostics);
+
+        assert_eq!(report.diagnostic_count, 70);
+        assert_eq!(report.diagnostics.len(), 64);
+        assert_eq!(report.diagnostics[0].module, "driver.sys");
+        assert_eq!(report.diagnostics[0].compiland.as_deref(), Some("0.obj"));
     }
 }

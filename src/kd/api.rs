@@ -5,6 +5,7 @@
 
 use std::io::{Read, Write};
 
+use crate::dbg_backend::ContinueDisposition;
 use crate::error::{Error, Result};
 use crate::kd::context;
 use crate::kd::{
@@ -27,6 +28,7 @@ pub const DBGKD_WRITE_CONTROL_SPACE: u32 = 0x0000_3138;
 pub const DBGKD_CONTINUE_API2: u32 = 0x0000_313C;
 pub const DBGKD_GET_VERSION: u32 = 0x0000_3146;
 pub const DBGKD_SWITCH_PROCESSOR: u32 = 0x0000_3150;
+pub const DBGKD_VERS_FLAG_DATA: u16 = 0x0002;
 
 /// `DBGKD_MANIPULATE_STATE64` wire size
 pub const MANIPULATE_HEADER_SIZE: usize = 56;
@@ -35,6 +37,14 @@ pub const MANIPULATE_HEADER_SIZE: usize = 56;
 const UNION_OFFSET: usize = 16;
 
 pub const DBG_CONTINUE: u32 = 0x0001_0002;
+pub const DBG_EXCEPTION_NOT_HANDLED: u32 = 0x8001_0001;
+
+pub fn status_for_disposition(disposition: ContinueDisposition) -> u32 {
+    match disposition {
+        ContinueDisposition::Handled => DBG_CONTINUE,
+        ContinueDisposition::NotHandled => DBG_EXCEPTION_NOT_HANDLED,
+    }
+}
 pub const STATUS_SUCCESS: u32 = 0x0000_0000;
 
 /// Build a zeroed manipulate-state request header
@@ -350,6 +360,36 @@ mod tests {
     use crate::kd::framing::{
         KdFraming, PACKET_TYPE_KD_ACKNOWLEDGE, PACKET_TYPE_KD_STATE_MANIPULATE,
     };
+
+    #[test]
+    fn continuation_disposition_selects_distinct_kd_wire_status() {
+        for (disposition, expected_status) in [
+            (ContinueDisposition::Handled, DBG_CONTINUE),
+            (ContinueDisposition::NotHandled, DBG_EXCEPTION_NOT_HANDLED),
+        ] {
+            let ack = {
+                let outbound_id = (INITIAL_PACKET_ID | SYNC_PACKET_ID) & !SYNC_PACKET_ID;
+                let mut header = [0u8; 16];
+                header[0..4].copy_from_slice(&0x6969_6969u32.to_le_bytes());
+                header[4..6].copy_from_slice(&PACKET_TYPE_KD_ACKNOWLEDGE.to_le_bytes());
+                header[8..12].copy_from_slice(&outbound_id.to_le_bytes());
+                header.to_vec()
+            };
+            let mut framing = KdFraming::new(Loopback::new(ack));
+            continue_api2(
+                &mut framing,
+                0,
+                status_for_disposition(disposition),
+                false,
+                0,
+            )
+            .unwrap();
+
+            let outbound = &framing.transport_ref().outbound;
+            let request = &outbound[16..16 + MANIPULATE_HEADER_SIZE];
+            assert_eq!(read_u32(request, UNION_OFFSET), expected_status);
+        }
+    }
 
     struct Loopback {
         inbound: Cursor<Vec<u8>>,

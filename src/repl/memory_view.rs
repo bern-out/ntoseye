@@ -1,7 +1,7 @@
 use owo_colors::OwoColorize;
 
 use crate::error::{Error, Result};
-use crate::expr::Expr;
+use crate::expr::{Expr, NumberRadix};
 use crate::repl::CommandInvocation;
 use crate::target::Target;
 use crate::types::VirtAddr;
@@ -12,30 +12,82 @@ pub struct AddressRange {
     pub end: VirtAddr,
 }
 
+/// WinDbg range arguments use `L<count>` (case-insensitive) to distinguish an
+/// element count from an end address. Keep ordinary identifiers beginning with
+/// `l` available as expressions unless the suffix has count-like syntax.
+fn windbg_count_expression(argument: &str) -> Option<&str> {
+    let count = argument
+        .strip_prefix('L')
+        .or_else(|| argument.strip_prefix('l'))?;
+    let Some(first) = count.chars().next() else {
+        return Some(count);
+    };
+
+    if first.is_ascii_digit() || matches!(first, '(' | '@' | '$' | '+' | '-') {
+        return Some(count);
+    }
+    if first.is_ascii_hexdigit() && count.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Some(count);
+    }
+    None
+}
+
+fn range_length_from_value(
+    start: VirtAddr,
+    value: VirtAddr,
+    explicit_count: bool,
+    item_size: u64,
+) -> Result<usize> {
+    let length = if explicit_count {
+        value.0.checked_mul(item_size).ok_or(Error::InvalidRange)?
+    } else {
+        resolve_length_or_end(start, value).ok_or(Error::InvalidRange)? as u64
+    };
+    usize::try_from(length).map_err(|_| Error::InvalidRange)
+}
+
+pub fn eval_range_length(
+    argument: &str,
+    debugger: &Target,
+    radix: NumberRadix,
+    start: VirtAddr,
+    item_size: u64,
+) -> Result<usize> {
+    let (expression, explicit_count) = match windbg_count_expression(argument) {
+        Some("") => return Err(Error::InvalidRange),
+        Some(count) => (count, true),
+        None => (argument, false),
+    };
+    let value = Expr::eval_with_radix(expression, debugger, radix)?;
+    range_length_from_value(start, value, explicit_count, item_size)
+}
+
 impl AddressRange {
     pub fn parse(
         invocation: &CommandInvocation<'_>,
         debugger: &Target,
+        radix: NumberRadix,
         default_count: u64,
         item_size: u64,
     ) -> Result<Self> {
         let start_arg = invocation.arg(0).ok_or(Error::InvalidRange)?;
-        let start = Expr::eval(start_arg, debugger)?;
+        let start = Expr::eval_with_radix(start_arg, debugger, radix)?;
 
-        let end = if let Some(end_arg) = invocation.arg(1) {
-            let end = Expr::eval(end_arg, debugger)?;
-            if end.0 < start.0 {
-                start + end.0 * item_size
-            } else {
-                end
-            }
+        let length = if let Some(range_arg) = invocation.arg(1) {
+            eval_range_length(range_arg, debugger, radix, start, item_size)?
         } else {
-            start + default_count * item_size
+            usize::try_from(
+                default_count
+                    .checked_mul(item_size)
+                    .ok_or(Error::InvalidRange)?,
+            )
+            .map_err(|_| Error::InvalidRange)?
         };
-
-        if end.0 < start.0 {
-            return Err(Error::InvalidRange);
-        }
+        let end = start
+            .0
+            .checked_add(u64::try_from(length).map_err(|_| Error::InvalidRange)?)
+            .map(VirtAddr)
+            .ok_or(Error::InvalidRange)?;
 
         Ok(AddressRange { start, end })
     }
@@ -239,7 +291,38 @@ pub fn display_memory(start_address: VirtAddr, data: &[u8], mode: &MemoryDisplay
 
 #[cfg(test)]
 mod tests {
-    use super::push_string_units;
+    use crate::types::VirtAddr;
+
+    use super::{push_string_units, range_length_from_value, windbg_count_expression};
+
+    #[test]
+    fn windbg_count_prefix_accepts_numeric_counts_case_insensitively() {
+        assert_eq!(windbg_count_expression("L1"), Some("1"));
+        assert_eq!(windbg_count_expression("l10"), Some("10"));
+        assert_eq!(windbg_count_expression("Lff"), Some("ff"));
+        assert_eq!(windbg_count_expression("L(1+2)"), Some("(1+2)"));
+        assert_eq!(windbg_count_expression("L"), Some(""));
+    }
+
+    #[test]
+    fn windbg_count_prefix_does_not_consume_ordinary_identifiers() {
+        assert_eq!(windbg_count_expression("limit"), None);
+        assert_eq!(windbg_count_expression("LdrpThing"), None);
+    }
+
+    #[test]
+    fn explicit_count_scales_by_the_commands_element_size() {
+        let start = VirtAddr(0xffff_f800_0000_1000);
+        assert_eq!(
+            range_length_from_value(start, VirtAddr(0x10), true, 4).unwrap(),
+            0x40
+        );
+        assert_eq!(
+            range_length_from_value(start, start + 0x40u64, false, 4).unwrap(),
+            0x40
+        );
+        assert!(range_length_from_value(start, VirtAddr(u64::MAX), true, 8).is_err());
+    }
 
     #[test]
     fn ascii_stops_at_nul_without_pushing_it() {

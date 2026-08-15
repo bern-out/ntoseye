@@ -3,11 +3,13 @@ use owo_colors::OwoColorize;
 use crate::backend::MemoryOps;
 use crate::gdb::{BreakpointManager, RegisterMap};
 use crate::memory::AddressSpace;
+use crate::symbols::SourceLocation;
 use crate::target::Target;
 use crate::types::VirtAddr;
 use crate::ui;
 use crate::unwind::{
-    FrameSource, ThreadTraceContext, build_stacktrace, format_symbol, preferred_code_dtb,
+    FrameSource, StackTrace, ThreadTraceContext, build_stacktrace, format_symbol,
+    preferred_code_dtb,
 };
 
 pub fn print_section(title: &str) {
@@ -271,31 +273,87 @@ pub fn print_stacktrace(
     display_limit: usize,
     embedded: bool,
 ) {
+    let stacktrace = build_stacktrace(debugger, register_map, regs, build_limit);
+    print_stacktrace_data(&stacktrace, display_limit, embedded);
+}
+
+pub fn print_stacktrace_verbose(
+    debugger: &Target,
+    register_map: &RegisterMap,
+    regs: &[u8],
+    build_limit: usize,
+    display_limit: usize,
+) {
+    let stacktrace = build_stacktrace(debugger, register_map, regs, build_limit);
+    print_stacktrace_data_with_provenance(&stacktrace, display_limit, false);
+}
+
+/// Render an already-collected stack trace in the same layout as [`print_stacktrace`].
+pub fn print_stacktrace_data(stacktrace: &StackTrace, display_limit: usize, embedded: bool) {
+    print_stacktrace_data_impl(stacktrace, display_limit, embedded, false);
+}
+
+pub fn print_stacktrace_data_with_provenance(
+    stacktrace: &StackTrace,
+    display_limit: usize,
+    embedded: bool,
+) {
+    print_stacktrace_data_impl(stacktrace, display_limit, embedded, true);
+}
+
+fn format_source_location(location: &SourceLocation) -> String {
+    let (label, path) = match location.local_path.as_ref() {
+        Some(path) if location.local_exists => ("local", path.display().to_string()),
+        Some(path) => ("mapped", path.display().to_string()),
+        None => ("recorded", location.file.clone()),
+    };
+    match location.column {
+        Some(column) => format!("[{label} {path}:{}:{column}]", location.line),
+        None => format!("[{label} {path}:{}]", location.line),
+    }
+}
+
+fn print_stacktrace_data_impl(
+    stacktrace: &StackTrace,
+    display_limit: usize,
+    embedded: bool,
+    show_provenance: bool,
+) {
     let indent = if embedded { "  " } else { "" };
     if embedded {
         print_section("stack");
     }
 
-    let stacktrace = build_stacktrace(debugger, register_map, regs, build_limit);
     let shown = stacktrace.frames.len().min(display_limit);
 
     for (num, frame) in stacktrace.frames.iter().take(shown).enumerate() {
-        let suffix = if frame.source == FrameSource::Scan {
-            format!(" {}", "[scan]".bright_black())
-        } else {
+        let mut annotations = Vec::new();
+        if !frame.symbol.starts_with("0x") {
+            annotations.push(ui::symbol(&frame.symbol));
+        }
+        if show_provenance {
+            annotations.push(
+                format!("[{}]", frame.source.as_str())
+                    .bright_black()
+                    .to_string(),
+            );
+        } else if frame.source == FrameSource::Scan {
+            annotations.push("[scan]".bright_black().to_string());
+        }
+        if let Some(location) = frame.source_location.as_ref() {
+            annotations.push(format_source_location(location).bright_black().to_string());
+        }
+        let annotation = if annotations.is_empty() {
             String::new()
-        };
-        let symbol = if frame.symbol.starts_with("0x") {
-            String::new()
         } else {
-            format!("  {}{}", ui::symbol(&frame.symbol), suffix)
+            format!("  {}", annotations.join(" "))
         };
         if embedded {
             println!(
                 "{indent}{} {}{}",
                 ui::muted(&format!("#{num:<2}")),
                 ui::addr(frame.ip),
-                symbol
+                annotation
             );
         } else {
             println!(
@@ -303,7 +361,7 @@ pub fn print_stacktrace(
                 ui::muted(&format!("#{num:<2}")),
                 ui::addr(frame.sp),
                 ui::addr(frame.ip),
-                symbol
+                annotation
             );
         }
     }
@@ -328,5 +386,30 @@ mod tests {
         let ips = rows.iter().map(|row| row.ip).collect::<Vec<_>>();
 
         assert_eq!(ips, (rip..rip + 7).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn source_location_labels_recorded_and_local_paths() {
+        let recorded = SourceLocation {
+            file: r"C:\build\driver.c".into(),
+            line: 42,
+            column: Some(7),
+            local_path: None,
+            local_exists: false,
+        };
+        assert_eq!(
+            format_source_location(&recorded),
+            r"[recorded C:\build\driver.c:42:7]"
+        );
+
+        let local = SourceLocation {
+            local_path: Some("/checkout/driver.c".into()),
+            local_exists: true,
+            ..recorded
+        };
+        assert_eq!(
+            format_source_location(&local),
+            "[local /checkout/driver.c:42:7]"
+        );
     }
 }

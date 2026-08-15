@@ -9,7 +9,10 @@ use crate::error::{Error, Result};
 pub mod breakpoints;
 pub mod registers;
 
-pub use breakpoints::{BreakpointHitResult, BreakpointManager};
+pub use breakpoints::{
+    BreakpointConfig, BreakpointHitDisposition, BreakpointHitResult, BreakpointManager,
+    BreakpointSpec,
+};
 pub use registers::{RegisterInfo, RegisterMap};
 
 #[derive(Debug, Default, Clone)]
@@ -114,6 +117,7 @@ impl GdbClient {
         let _ = client.send_packet("?")?;
 
         client.register_map = client.fetch_register_map()?;
+        client.register_map.require_amd64_target()?;
 
         Ok(client)
     }
@@ -707,6 +711,8 @@ impl DebugBackend for GdbClient {
         Ok(StopEvent {
             thread_id: Self::parse_stop_reply_thread_id(&response),
             exception_code: None,
+            first_chance: None,
+            exception_address: None,
             program_counter: None,
             is_bugcheck: false,
             bugcheck: None,
@@ -721,6 +727,8 @@ impl DebugBackend for GdbClient {
         Ok(StopEvent {
             thread_id: Self::parse_stop_reply_thread_id(&response),
             exception_code: None,
+            first_chance: None,
+            exception_address: None,
             program_counter: None,
             is_bugcheck: false,
             bugcheck: None,
@@ -738,6 +746,8 @@ impl DebugBackend for GdbClient {
         Ok(result?.map(|response| StopEvent {
             thread_id: Self::parse_stop_reply_thread_id(&response),
             exception_code: None,
+            first_chance: None,
+            exception_address: None,
             program_counter: None,
             is_bugcheck: false,
             bugcheck: None,

@@ -2,11 +2,10 @@ use std::sync::atomic::Ordering;
 
 use owo_colors::OwoColorize;
 
+use crate::dbg_backend::ContinueDisposition;
 use crate::error::Result;
 use crate::gdb::breakpoints::Breakpoint;
-use crate::session::{
-    BreakpointStopAction, StepKind, WatchpointStopAction, resolve_watchpoint_stop,
-};
+use crate::session::{StepKind, StopResolution};
 use crate::types::VirtAddr;
 use crate::ui;
 
@@ -17,6 +16,20 @@ repl_command! {
     names: ["continue", "g"],
     usage: "continue",
     summary: "Resume VM execution.",
+}
+
+repl_command! {
+    continue_handled();
+    names: ["gh"],
+    usage: "gh",
+    summary: "Resume and mark the current exception handled.",
+}
+
+repl_command! {
+    continue_not_handled();
+    names: ["gn"],
+    usage: "gn",
+    summary: "Resume and pass the current exception to Windows (KD only).",
 }
 
 repl_command! {
@@ -53,16 +66,13 @@ repl_command! {
 
 impl ReplState<'_> {
     pub fn interrupt_running_vm(&mut self) -> Result<()> {
-        match surface_pending_stop(
-            &mut *self.ctx.backend,
-            &self.ctx.register_map,
-            &mut self.ctx.target,
-            &mut self.ctx.breakpoints,
-            &self.caches,
-            &mut self.ctx.current_thread,
-            &mut self.ctx.reload_module_list_pending,
-        ) {
-            Ok(true) => return Ok(()),
+        match surface_pending_stop(self.ctx, &self.caches, &self.exception_policies) {
+            Ok(true) => {
+                if let Err(error) = self.apply_buffered_exception_policy() {
+                    error!("failed to apply exception policy: {error}");
+                }
+                return Ok(());
+            }
             Ok(false) => {}
             Err(e) => {
                 error!("error checking running VM: {:?}", e);
@@ -70,15 +80,7 @@ impl ReplState<'_> {
             }
         }
 
-        if let Err(e) = surface_interrupt_stop(
-            &mut *self.ctx.backend,
-            &self.ctx.register_map,
-            &mut self.ctx.target,
-            &mut self.ctx.breakpoints,
-            &self.caches,
-            &mut self.ctx.current_thread,
-            &mut self.ctx.reload_module_list_pending,
-        ) {
+        if let Err(e) = surface_interrupt_stop(self.ctx, &self.caches) {
             error!("failed to interrupt: {:?}", e);
         }
 
@@ -86,17 +88,67 @@ impl ReplState<'_> {
     }
 
     fn continue_vm(&mut self) -> Result<()> {
+        self.continue_vm_with_disposition(ContinueDisposition::Handled)
+    }
+
+    fn continue_handled(&mut self) -> Result<()> {
+        self.continue_vm_with_disposition(ContinueDisposition::Handled)
+    }
+
+    fn continue_not_handled(&mut self) -> Result<()> {
+        self.continue_vm_with_disposition(ContinueDisposition::NotHandled)
+    }
+
+    fn run_exception_policy_command(&mut self, command: Option<&str>) -> Result<()> {
+        if let Some(command) = command {
+            self.dispatch_exception_command(command)?;
+        }
+        Ok(())
+    }
+
+    /// A pending stop is rendered by the asynchronous stop helper before it can
+    /// hand control back here. Commands still run, and an explicit continue
+    /// outcome is applied afterward; command-free auto-continues were already
+    /// completed by the helper.
+    fn apply_buffered_exception_policy(&mut self) -> Result<()> {
+        let Some(event) = self.ctx.last_event.as_ref().map(|last| last.stop.clone()) else {
+            return Ok(());
+        };
+        match self.exception_policies.action_for(&event) {
+            ExceptionPolicyAction::Surface {
+                command: Some(command),
+            } => self.run_exception_policy_command(Some(&command)),
+            ExceptionPolicyAction::Continue {
+                notify,
+                disposition,
+                command: Some(command),
+            } => {
+                self.run_exception_policy_command(Some(&command))?;
+                if notify {
+                    println!(
+                        "Exception {:#010x}; continuing",
+                        event.exception_code.unwrap_or_default()
+                    );
+                }
+                self.ctx
+                    .backend
+                    .continue_execution_with_disposition(disposition)?;
+                self.ctx.record_continuation_disposition(disposition);
+                Ok(())
+            }
+            ExceptionPolicyAction::Surface { command: None }
+            | ExceptionPolicyAction::Continue { command: None, .. } => Ok(()),
+        }
+    }
+
+    fn continue_vm_with_disposition(&mut self, disposition: ContinueDisposition) -> Result<()> {
         if self.ctx.backend.is_running() {
-            match surface_pending_stop(
-                &mut *self.ctx.backend,
-                &self.ctx.register_map,
-                &mut self.ctx.target,
-                &mut self.ctx.breakpoints,
-                &self.caches,
-                &mut self.ctx.current_thread,
-                &mut self.ctx.reload_module_list_pending,
-            ) {
-                Ok(true) => {}
+            match surface_pending_stop(self.ctx, &self.caches, &self.exception_policies) {
+                Ok(true) => {
+                    if let Err(error) = self.apply_buffered_exception_policy() {
+                        error!("failed to apply exception policy: {error}");
+                    }
+                }
                 Ok(false) => error!("VM is running"),
                 Err(e) => error!("error checking running VM: {:?}", e),
             }
@@ -105,7 +157,7 @@ impl ReplState<'_> {
 
         // Step past a breakpoint at RIP, re-arm breakpoints, continue, and drop
         // stale inspection caches; the canonical resume prologue lives in core.
-        if let Err(e) = self.ctx.resume() {
+        if let Err(e) = self.ctx.resume_with_disposition(disposition) {
             error!("failed to continue: {:?}", e);
             return Ok(());
         }
@@ -131,240 +183,69 @@ impl ReplState<'_> {
             };
 
             match stop_result {
-                Ok(Some(mut event)) => {
-                    let reload_status = apply_target_reload_if_needed(
-                        &mut *self.ctx.backend,
-                        &mut self.ctx.target,
-                        &mut self.ctx.breakpoints,
-                        &self.caches,
-                        &mut event,
-                    );
-                    update_reload_module_list_pending(
-                        &mut self.ctx.reload_module_list_pending,
-                        reload_status,
-                    );
-                    if reload_status.pending_rediscovery() {
-                        print_pending_rediscovery_stop_context(
-                            &mut *self.ctx.backend,
-                            &self.ctx.register_map,
-                            &self.ctx.target,
-                            &mut self.ctx.current_thread,
-                            &event,
-                            reload_status,
-                        );
-                        break;
-                    }
-                    let _ = try_complete_pending_module_list_reload(
-                        &mut *self.ctx.backend,
-                        &mut self.ctx.target,
-                        &self.caches,
-                        &mut self.ctx.reload_module_list_pending,
-                    );
-                    if !interrupt_requested
-                        && !self.ctx.reload_module_list_pending
-                        && should_resume_assisted_refresh_stop(
-                            &self.ctx.target,
-                            &self.ctx.breakpoints,
-                            &event,
-                            reload_status,
-                        )
-                    {
-                        if let Err(e) = resume_assisted_refresh_stop(&mut *self.ctx.backend) {
-                            error!("failed to resume after assisted refresh break: {:?}", e);
-                            break;
-                        }
-                        continue;
-                    }
-                    // Claim watchpoint stops before the stray-single-step
-                    // absorber. Core owns backend acknowledgement, context
-                    // refresh, condition evaluation, and false-hit resume.
-                    let watchpoint_action = match resolve_watchpoint_stop(
-                        &mut *self.ctx.backend,
-                        &self.ctx.register_map,
-                        &self.ctx.breakpoints,
-                        &mut self.ctx.target,
-                        &mut self.ctx.current_thread,
-                        &event,
-                    ) {
-                        Ok(action) => action,
-                        Err(e) => {
-                            error!("failed to handle watchpoint hit: {e}");
+                Ok(Some(event)) => {
+                    let resolution = match self.ctx.classify_stop_event(event) {
+                        Ok(StopResolution::Resumed) => continue,
+                        Ok(resolution) => resolution,
+                        Err(error) => {
+                            error!("failed to classify stop: {error}");
                             break;
                         }
                     };
-                    match watchpoint_action {
-                        WatchpointStopAction::Hit {
-                            breakpoint: bp,
-                            condition_error,
-                        } => {
-                            self.caches.refresh_symbol_context(&self.ctx.target);
-                            refresh_windows_thread_context_for_backend_thread(
-                                &mut self.ctx.target,
-                                &self.ctx.current_thread,
-                            );
-                            if let Some(error) = condition_error {
-                                error!("watchpoint condition failed: {error}");
-                            }
-                            self.surface_hardware_breakpoint_hit(&bp);
-                            break;
-                        }
-                        WatchpointStopAction::Resumed => continue,
-                        WatchpointStopAction::NotBreakpoint => {}
-                    }
-                    // A stray single-step (STATUS_SINGLE_STEP, not at a user
-                    // breakpoint) is a debugger artifact from a managed step-over
-                    // on SMP KD, not a stop to surface; clear TF on its processor
-                    // and resume. Shared classification with continue_until_break.
-                    if stop_is_stray_single_step(&event, &self.ctx.breakpoints) {
-                        set_current_thread_from_stop(
-                            &mut *self.ctx.backend,
-                            &event,
-                            &mut self.ctx.current_thread,
-                        );
-                        let _ = clear_trap_flag(&mut *self.ctx.backend, &self.ctx.register_map);
-                        if let Err(e) = self.ctx.backend.continue_execution() {
-                            error!("failed to resume after stray single-step: {:?}", e);
-                            break;
-                        }
-                        continue;
-                    }
-                    let target_reloaded = reload_status.target_reloaded();
-                    let reload_load_symbols_stop =
-                        is_target_reload_load_symbols_stop(&event, reload_status);
-                    let is_bugcheck = event.is_bugcheck && !target_reloaded;
-                    set_current_thread_from_stop(
-                        &mut *self.ctx.backend,
-                        &event,
-                        &mut self.ctx.current_thread,
-                    );
+
+                    let target_reloaded =
+                        matches!(&resolution, StopResolution::TargetReloaded { .. });
                     let modules_changed = refresh_stop_caches_pre(
                         &mut *self.ctx.backend,
                         &self.ctx.target,
+                        &mut self.ctx.breakpoints,
                         &self.caches,
                     );
-                    if is_bugcheck {
-                        print_stop_separator();
-                        print_bugcheck_summary(&self.ctx.target, event.bugcheck.as_ref());
-                        println!();
-                    }
-                    let stop_exception_code = event.exception_code;
-                    let stop_pc = event.program_counter;
-                    let early_non_breakpoint_stop = !target_reloaded
-                        && !is_bugcheck
-                        && stop_exception_code.zip(stop_pc).is_some_and(|(_, pc)| {
-                            self.ctx.breakpoints.breakpoint_id_at_address(pc).is_none()
-                        });
-
                     refresh_stop_caches_post(
                         &self.ctx.target,
                         &self.caches,
                         target_reloaded,
                         modules_changed,
                     );
+                    refresh_windows_thread_context_for_backend_thread(
+                        &mut self.ctx.target,
+                        &self.ctx.current_thread,
+                    );
 
-                    if self.ctx.breakpoints.has_enabled_breakpoints() && !is_bugcheck {
-                        // Done before reading the current thread's regs so
-                        // the BP-hit check below sees the post-rewind RIP
-                        rewind_threads_off_breakpoints(
-                            &mut *self.ctx.backend,
-                            &self.ctx.register_map,
-                            &self.ctx.breakpoints,
-                            &self.ctx.current_thread,
-                        );
-                    }
-
-                    let hit_result =
-                        if early_non_breakpoint_stop || is_bugcheck || reload_load_symbols_stop {
-                            BreakpointStopAction::NotBreakpoint
-                        } else {
-                            let regs = match self.ctx.backend.read_registers() {
-                                Ok(r) => r,
-                                Err(e) => {
-                                    error!("failed to read registers: {:?}", e);
-                                    break;
-                                }
-                            };
-
-                            self.ctx.target.registers =
-                                Some(self.ctx.register_map.to_hashmap(&regs));
-                            let rip = self.ctx.register_map.read_u64("rip", &regs).unwrap_or(0);
-                            let cr3 = self.ctx.register_map.read_u64("cr3", &regs).unwrap_or(0);
-                            if cr3 != 0 {
-                                self.ctx.target.set_context_dtb_override(cr3);
-                                self.caches.refresh_symbol_context(&self.ctx.target);
-                            }
-                            refresh_windows_thread_context_for_backend_thread(
-                                &mut self.ctx.target,
-                                &self.ctx.current_thread,
-                            );
-
-                            // Shared core resolver so the REPL and `continue_until_break`
-                            // can't drift on breakpoint-hit disposition; absorbed cases
-                            // (Resumed) step over and resume internally, so we keep waiting.
-                            match self.ctx.resolve_breakpoint_stop(rip, cr3) {
-                                Ok(BreakpointStopAction::Resumed) => continue,
-                                Ok(action) => action,
-                                Err(e) => {
-                                    error!("failed to handle breakpoint stop: {:?}", e);
-                                    break;
-                                }
-                            }
-                        };
-
-                    match hit_result {
-                        BreakpointStopAction::Hit {
-                            id,
-                            temporary,
+                    match resolution {
+                        StopResolution::Resumed => unreachable!("handled above"),
+                        StopResolution::Breakpoint {
+                            breakpoint,
                             condition_error,
                             ..
                         } => {
                             if let Some(error) = condition_error {
                                 error!("breakpoint condition failed: {error}");
                             }
-                            print_stop_separator();
-                            // Banner names the hit symbol already; temporary
-                            // (run-to) breakpoints stay silent.
-                            let cause = (!temporary)
-                                .then(|| format!("{} {}", ui::muted("breakpoint"), ui::bp_id(id)));
-                            print_break_context_at(
-                                &mut *self.ctx.backend,
-                                &self.ctx.register_map,
-                                &mut self.ctx.target,
-                                &self.ctx.breakpoints,
-                                &self.ctx.current_thread,
-                                None,
-                                cause,
-                            );
-
-                            break;
-                        }
-                        // Absorbed inline in the resolver above; defensively keep
-                        // waiting if one ever reaches here.
-                        BreakpointStopAction::Resumed => continue,
-                        BreakpointStopAction::NotBreakpoint => {
-                            if !is_bugcheck {
-                                print_stop_separator();
+                            if let Some(action) = breakpoint.action.as_deref()
+                                && self.dispatch_breakpoint_action(action)?
+                            {
+                                if let Err(error) = self
+                                    .ctx
+                                    .resume_with_disposition(ContinueDisposition::Handled)
+                                {
+                                    error!("failed to continue after breakpoint action: {error}");
+                                    break;
+                                }
+                                continue;
                             }
-                            if reload_load_symbols_stop {
-                                print_target_reload_notification_context(
-                                    &self.ctx.target,
-                                    &self.ctx.current_thread,
-                                    &event,
-                                    reload_status,
-                                );
-                            } else if is_bugcheck {
-                                print_break_context_for_bugcheck(
-                                    &mut *self.ctx.backend,
-                                    &self.ctx.register_map,
-                                    &mut self.ctx.target,
-                                    &self.ctx.breakpoints,
-                                    &self.ctx.current_thread,
-                                    event.bugcheck.as_ref(),
-                                );
+
+                            if breakpoint.hardware.is_some() {
+                                self.surface_hardware_breakpoint_hit(&breakpoint);
                             } else {
-                                let cause = (!target_reloaded)
-                                    .then(|| stop_exception_cause(stop_exception_code, stop_pc))
-                                    .flatten();
+                                print_stop_separator();
+                                let cause = (!breakpoint.temporary).then(|| {
+                                    format!(
+                                        "{} {}",
+                                        ui::muted("breakpoint"),
+                                        ui::bp_id(breakpoint.id)
+                                    )
+                                });
                                 print_break_context_at(
                                     &mut *self.ctx.backend,
                                     &self.ctx.register_map,
@@ -375,6 +256,102 @@ impl ReplState<'_> {
                                     cause,
                                 );
                             }
+                            break;
+                        }
+                        StopResolution::Bugcheck { event } => {
+                            print_stop_separator();
+                            print_bugcheck_summary(&self.ctx.target, event.bugcheck.as_ref());
+                            println!();
+                            print_break_context_for_bugcheck(
+                                &mut *self.ctx.backend,
+                                &self.ctx.register_map,
+                                &mut self.ctx.target,
+                                &self.ctx.breakpoints,
+                                &self.ctx.current_thread,
+                                event.bugcheck.as_ref(),
+                            );
+                            break;
+                        }
+                        StopResolution::TargetReloaded { event, coherent } => {
+                            print_stop_separator();
+                            print_target_reload_notification_context(
+                                &self.ctx.target,
+                                &self.ctx.current_thread,
+                                &event,
+                                TargetReloadStatus::Reloaded {
+                                    loaded_module_list_available: coherent,
+                                },
+                            );
+                            break;
+                        }
+                        StopResolution::Stopped { event, .. } => {
+                            match self.exception_policies.action_for(&event) {
+                                ExceptionPolicyAction::Surface { command } => {
+                                    if let Err(error) =
+                                        self.run_exception_policy_command(command.as_deref())
+                                    {
+                                        error!("exception command failed: {error}");
+                                    }
+                                }
+                                ExceptionPolicyAction::Continue {
+                                    notify,
+                                    disposition,
+                                    command,
+                                } => {
+                                    if let Err(error) =
+                                        self.run_exception_policy_command(command.as_deref())
+                                    {
+                                        error!("exception command failed: {error}");
+                                    } else {
+                                        if notify {
+                                            let code = event.exception_code.unwrap_or_default();
+                                            let address =
+                                                event.exception_address.or(event.program_counter);
+                                            let chance = match event.first_chance {
+                                                Some(true) => "first chance",
+                                                Some(false) => "second chance",
+                                                None => "unknown chance",
+                                            };
+                                            let location = address
+                                                .map(|address| format!(" at {address:#x}"))
+                                                .unwrap_or_default();
+                                            println!(
+                                                "Exception {code:#010x} ({chance}){location}; continuing"
+                                            );
+                                        }
+                                        match self
+                                            .ctx
+                                            .backend
+                                            .continue_execution_with_disposition(disposition)
+                                        {
+                                            Ok(()) => {
+                                                self.ctx
+                                                    .record_continuation_disposition(disposition);
+                                                continue;
+                                            }
+                                            Err(error) => {
+                                                error!(
+                                                    "failed to continue after exception: {error}"
+                                                );
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            print_stop_separator();
+                            let cause =
+                                stop_exception_cause(event.exception_code, event.program_counter);
+                            print_break_context_at(
+                                &mut *self.ctx.backend,
+                                &self.ctx.register_map,
+                                &mut self.ctx.target,
+                                &self.ctx.breakpoints,
+                                &self.ctx.current_thread,
+                                None,
+                                cause,
+                            );
                             break;
                         }
                     }

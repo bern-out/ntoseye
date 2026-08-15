@@ -10,20 +10,22 @@ use std::sync::Arc;
 use crate::backend::MemoryOps;
 use crate::bugchecks::{CURRENT_KERNEL_RELOAD_WINDOW, looks_like_kernel_pointer};
 use crate::dbg_backend::{
-    BackendCapability, BugcheckInfo, DebugBackend, DebugCapability, DebugOutputPage,
-    HW_BREAKPOINT_SLOTS, HwBreakpointAccess, StopEvent, WatchpointAccess,
+    BackendCapability, BugcheckInfo, ContinueDisposition, DebugBackend, DebugCapability,
+    DebugOutputPage, HW_BREAKPOINT_SLOTS, HwBreakpointAccess, LastEvent, StopEvent,
+    WatchpointAccess,
 };
 use crate::disasm::{DisasmRow, decode_rows, disasm_formatter};
 use crate::error::{Error, Result};
-use crate::gdb::breakpoints::Breakpoint;
-use crate::gdb::{BreakpointHitResult, BreakpointManager, RegisterMap};
+use crate::gdb::breakpoints::{Breakpoint, BreakpointConfig};
+use crate::gdb::{BreakpointHitDisposition, BreakpointHitResult, BreakpointManager, RegisterMap};
 use crate::kd::trace_enabled;
 use crate::memory::{AddressSpace, DTB_IDENTITY};
 use crate::phys::PhysMem;
 use crate::target::{ReloadReport, Target, ThreadInfo};
 use crate::types::VirtAddr;
 use crate::unwind::{
-    StackTrace, build_stacktrace, preferred_code_dtb, resolve_thread_trace_context,
+    StackTrace, ThreadStackTrace, build_parked_thread_stack, build_stacktrace, preferred_code_dtb,
+    resolve_thread_trace_context,
 };
 
 /// Trace reload classification (lines prefixed `reload:`), gated on
@@ -47,6 +49,8 @@ pub enum ContinueOutcome {
         address: u64,
         symbol: Option<String>,
         temporary: bool,
+        /// Optional frontend command action attached to the breakpoint.
+        action: Option<String>,
         rip: u64,
         /// Runtime condition failure. The stop is surfaced rather than skipped.
         condition_error: Option<String>,
@@ -63,6 +67,8 @@ pub enum ContinueOutcome {
     Stopped {
         rip: u64,
         exception_code: Option<u32>,
+        first_chance: Option<bool>,
+        exception_address: Option<u64>,
     },
     /// A single-step / step-over / step-out completed and landed at `rip`
     /// (no user breakpoint was hit en route).
@@ -165,10 +171,7 @@ pub enum BreakpointStopAction {
     /// A breakpoint the caller should surface (its condition, if any, held).
     /// Enabled breakpoints have already been re-armed.
     Hit {
-        id: u32,
-        address: u64,
-        symbol: Option<String>,
-        temporary: bool,
+        breakpoint: Breakpoint,
         /// Runtime condition failure. The stop is surfaced rather than skipped.
         condition_error: Option<String>,
     },
@@ -193,6 +196,28 @@ pub enum WatchpointStopAction {
     Resumed,
     /// The stop was not raised by one of our watchpoints.
     NotBreakpoint,
+}
+
+/// Complete core classification of one raw backend stop. Frontends render
+/// surfaced stops and execute frontend-owned breakpoint/exception commands;
+/// they never repeat backend acknowledgement, reload, scope, or trap handling.
+#[derive(Debug, Clone)]
+pub enum StopResolution {
+    /// Debugger noise or a filtered breakpoint was handled and execution resumed.
+    Resumed,
+    /// A software or hardware breakpoint worth surfacing.
+    Breakpoint {
+        breakpoint: Breakpoint,
+        event: StopEvent,
+        rip: u64,
+        condition_error: Option<String>,
+    },
+    /// The guest entered a bugcheck.
+    Bugcheck { event: StopEvent },
+    /// The guest rebooted and target state was rebuilt.
+    TargetReloaded { event: StopEvent, coherent: bool },
+    /// A genuine non-breakpoint stop, including a user interrupt.
+    Stopped { event: StopEvent, rip: u64 },
 }
 
 fn update_target_context_from_registers(
@@ -274,6 +299,9 @@ pub struct Session {
     pub breakpoints: BreakpointManager,
     pub register_map: RegisterMap,
     pub current_thread: String,
+    /// ETHREAD selected for stack-only inspection while the backend remains on
+    /// `current_thread`. Its register file does not exist as a coherent snapshot.
+    parked_windows_thread: Option<VirtAddr>,
     /// Whether a guest reload is mid-flight with the loaded-module list not yet
     /// available (very early boot). Carried across `continue_until_break` calls
     /// so the post-reboot KD-reconnect dance runs to completion; when the list
@@ -294,11 +322,29 @@ pub struct Session {
     /// `wait_for_stop` returns this as the proper event instead of a bare
     /// "halted", and `resume` clears it. `None` whenever the host is up to date.
     parked_stop: Option<ContinueOutcome>,
+    /// Most recently observed backend stop and the disposition used when it was
+    /// subsequently continued.
+    pub last_event: Option<LastEvent>,
     /// Per-target single-instance lock, held for the session's lifetime so a
     /// second ntoseye can't attach to the same backend resource. `Some` via
     /// [`Self::connect`] (every host's attach path), `None` via the unguarded
     /// [`Self::new`].
     _instance_guard: Option<InstanceGuard>,
+}
+
+fn prepare_backend_after_cleanup(
+    backend: &mut dyn DebugBackend,
+    cleanup: Result<()>,
+) -> Result<()> {
+    match cleanup {
+        Ok(()) => backend.prepare_for_exit(true),
+        Err(cleanup_error) => match backend.prepare_for_exit(false) {
+            Ok(()) => Err(cleanup_error),
+            Err(teardown_error) => Err(Error::Rsp(format!(
+                "{cleanup_error}; backend teardown also failed: {teardown_error}"
+            ))),
+        },
+    }
 }
 
 impl Session {
@@ -329,7 +375,9 @@ impl Session {
     /// (tests / embedders that manage their own locking); hosts attach via
     /// [`Self::connect`], which takes the single-instance lock first.
     pub fn new(phys: Arc<PhysMem>, mut backend: Box<dyn DebugBackend>) -> Result<Self> {
-        let target = Target::with_phys(phys)?;
+        let mut target = Target::with_phys(phys)?;
+        let debugger_data_hint = backend.target_debugger_data_hint().ok().flatten();
+        target.refresh_debugger_data(debugger_data_hint);
         backend.initialize_from_target(&target);
         let register_map = backend.register_map().clone();
 
@@ -356,9 +404,11 @@ impl Session {
             breakpoints: BreakpointManager::new(),
             register_map,
             current_thread,
+            parked_windows_thread: None,
             reload_module_list_pending: false,
             reload_surface_pending: false,
             parked_stop: None,
+            last_event: None,
             _instance_guard: None,
         };
 
@@ -377,6 +427,7 @@ impl Session {
     /// stub can drop non-hit ones on a stop) and re-select the landed-on thread.
     /// The full "step one instruction", shared by the REPL (`si`) and the SDK.
     pub fn step(&mut self) -> Result<()> {
+        self.require_live_register_context()?;
         // Advancing the VM spends any stop `service_idle` parked, so drop it (the
         // other advance paths clear it via `resume`; a bare single-step doesn't).
         self.parked_stop = None;
@@ -388,6 +439,10 @@ impl Session {
             &mut self.breakpoints,
         )? {
             step_one_and_clear_tf(self.backend.as_mut(), &self.register_map)?;
+        }
+        for id in self.breakpoints.one_shot_hit_ids() {
+            self.breakpoints
+                .remove(self.backend.as_mut(), &self.target, id)?;
         }
 
         // Re-arm breakpoints the stub may have lost when the VM stopped, then
@@ -408,30 +463,66 @@ impl Session {
     pub fn set_current_thread(&mut self, id: &str) -> Result<()> {
         self.backend.set_current_thread(id)?;
         self.current_thread = id.to_string();
+        self.parked_windows_thread = None;
+        self.target.clear_current_windows_thread_context();
         self.refresh_context_for_current_thread();
         Ok(())
     }
 
-    /// Pause the running VM and adopt the stopped thread. Returns the raw stop
-    /// event. pyo3/MCP route here (rather than calling the backend raw) so the
-    /// selected thread tracks the halt; the REPL layers richer surfacing on top.
-    pub fn interrupt(&mut self) -> Result<StopEvent> {
-        let event = self.backend.interrupt()?;
-        // Interrupting can land on a freshly-rebooted guest (the pump surfaced a
-        // peer-reset stop that this break-in consumed). Rebuild kernel state now so
-        // inspection here isn't against the stale pre-reboot image, and flag the
-        // reload as not-yet-surfaced so the next wait_for_stop still reports it
-        // (interrupt's own result carries no reload notification). Without this,
-        // an interrupt that swallows the reboot stop leaves the session pointed at
-        // the old kernel base, with stale symbols and enumeration faults, until a wait
-        // happens to classify it.
-        if event.target_reloaded {
-            let _ = self.reload_with_hint(event.target_kernel_base_hint);
-            self.reload_surface_pending = true;
+    /// Select a non-running Windows thread for metadata and stack inspection
+    /// without changing the backend vCPU. This deliberately does not attempt to
+    /// manufacture a register context for the parked thread.
+    pub fn select_parked_windows_thread(&mut self, thread: &ThreadInfo) {
+        self.parked_windows_thread = Some(thread.ethread);
+        self.target.set_parked_windows_thread(thread.clone());
+    }
+
+    pub fn parked_windows_thread(&self) -> Option<&ThreadInfo> {
+        let ethread = self.parked_windows_thread?;
+        self.target
+            .windows_thread_selection
+            .as_ref()
+            .filter(|thread| thread.ethread == ethread)
+    }
+
+    fn require_live_register_context(&self) -> Result<()> {
+        if self.parked_windows_thread().is_some() {
+            return Err(Error::DebugInfo(
+                "selected Windows thread is parked; registers and execution control require a live vCPU context (use `vcpu <id>`)".into(),
+            ));
         }
-        set_current_thread_from_stop(self.backend.as_mut(), &event, &mut self.current_thread);
-        self.refresh_context_for_current_thread();
-        Ok(event)
+        Ok(())
+    }
+
+    /// Record a raw backend stop for `.lastevent` and typed hosts. REPL paths
+    /// that own their richer wait loop call this at the same boundary as the
+    /// session wait helpers.
+    pub fn record_stop_event(&mut self, event: &StopEvent) {
+        self.last_event = Some(LastEvent::new(event.clone()));
+    }
+
+    /// Attach the acknowledgement chosen for the current stop. A successful
+    /// continuation calls this after the backend accepts the request.
+    pub fn record_continuation_disposition(&mut self, disposition: ContinueDisposition) {
+        if let Some(last_event) = &mut self.last_event {
+            last_event.disposition = Some(disposition);
+        }
+    }
+
+    /// Pause the VM and return the first meaningful stop. Every raw event routes
+    /// through [`Self::classify_stop_event`], so an interrupt that races with a
+    /// filtered breakpoint or reconnect-assist stop cannot bypass core state.
+    pub fn interrupt(&mut self) -> Result<StopEvent> {
+        loop {
+            let event = self.backend.interrupt()?;
+            match self.classify_stop_event(event)? {
+                StopResolution::Resumed => continue,
+                StopResolution::Breakpoint { event, .. }
+                | StopResolution::Bugcheck { event }
+                | StopResolution::TargetReloaded { event, .. }
+                | StopResolution::Stopped { event, .. } => return Ok(event),
+            }
+        }
     }
 
     /// Align the inspection context to the currently selected thread's address
@@ -442,6 +533,7 @@ impl Session {
     /// points; `continue_until_break` establishes the same context inline. Best-
     /// effort and a no-op while the guest runs (no coherent register file).
     fn refresh_context_for_current_thread(&mut self) {
+        self.parked_windows_thread = None;
         if self.backend.is_running() {
             return;
         }
@@ -457,6 +549,7 @@ impl Session {
     /// DTB* (so a user-mode RIP decodes from the process address space, not the
     /// kernel's). Selects the current thread first; the VM must be halted.
     pub fn current_instruction(&mut self) -> Result<Instruction> {
+        self.require_live_register_context()?;
         self.backend.set_current_thread(&self.current_thread)?;
         let regs = self.backend.read_registers()?;
         let rip = self.register_map.read_u64("rip", &regs)?;
@@ -495,6 +588,7 @@ impl Session {
     /// few frames of the current thread's stack and returns the second frame's
     /// IP. Shared by the REPL `gu` and [`Self::step_out`].
     pub fn step_out_target(&mut self) -> Result<VirtAddr> {
+        self.require_live_register_context()?;
         self.backend.set_current_thread(&self.current_thread)?;
         let regs = self.backend.read_registers()?;
         let trace = build_stacktrace(&self.target, &self.register_map, &regs, 4);
@@ -537,7 +631,7 @@ impl Session {
         // left the VM running. A target reload already cleared the manager, so
         // the remove may be a no-op, ignore its error.
         if self.backend.is_running() {
-            let _ = self.backend.interrupt();
+            let _ = self.interrupt();
         }
         let _ = self
             .breakpoints
@@ -581,14 +675,38 @@ impl Session {
             .unwrap_or(0)
     }
 
+    /// Read the selected live vCPU register file. A parked Windows thread is a
+    /// stack-only inspection target and must never fall through to the backend's
+    /// unrelated live register context.
+    pub fn read_registers(&mut self) -> Result<Vec<u8>> {
+        self.require_live_register_context()?;
+        if self.backend.is_running() {
+            return Err(Error::TargetRunning);
+        }
+        self.backend.set_current_thread(&self.current_thread)?;
+        self.backend.read_registers()
+    }
+
     /// Set a single register on the current thread by name, as a read-modify-
-    /// write of the register file (read all, patch the one, write back). The
-    /// caller is responsible for halting the VM first; a running guest has no
-    /// coherent register file to patch.
+    /// write of the register file (read all, patch the one, write back).
     pub fn write_register(&mut self, name: &str, value: u64) -> Result<()> {
-        let mut regs = self.backend.read_registers()?;
+        self.require_live_register_context()?;
+        if self.backend.is_running() {
+            return Err(Error::TargetRunning);
+        }
+        if !self
+            .backend
+            .capabilities()
+            .iter()
+            .any(|entry| entry.capability == DebugCapability::WriteRegisters && entry.supported)
+        {
+            return Err(Error::RegisterWriteUnsupported);
+        }
+        let mut regs = self.read_registers()?;
         self.register_map.write_u64(name, &mut regs, value)?;
-        self.backend.write_registers(&regs)
+        self.backend.write_registers(&regs)?;
+        self.target.registers = Some(self.register_map.to_hashmap(&regs));
+        Ok(())
     }
 
     /// The backend's capability matrix (what the current transport supports), so
@@ -635,65 +753,14 @@ impl Session {
             return Ok(());
         }
         let event = self.backend.wait_for_stop()?;
-        set_current_thread_from_stop(self.backend.as_mut(), &event, &mut self.current_thread);
-
-        if !event.target_reloaded && !event.is_bugcheck {
-            let stray = stop_is_stray_single_step(&event, &self.breakpoints);
-            if stray || stop_is_assisted_refresh_breakin(&self.target, &self.breakpoints, &event) {
-                if stray {
-                    let _ = clear_trap_flag(self.backend.as_mut(), &self.register_map);
-                }
-                // These assist break-ins are the reconnect-assist poking the
-                // backend keeps up until rediscovery finishes. Finish it now from
-                // a live memory read (we are halted, so the next `continue` picks
-                // up the cleared assist), so the poking stops at the source rather
-                // than this absorb just feeding the next spurious break.
-                self.try_finish_rediscovery_from_memory();
-                self.backend.continue_execution()?;
-                return Ok(());
-            }
-
-            // A breakpoint int3 the servicer caught: rewind off it and classify
-            // via the shared resolver (same tail as `wait_for_stop_bounded`, so
-            // they can't drift). A wrong-process hit on a shared-page int3, e.g.
-            // one we patched into a shared DLL like user32, tripped by a process
-            // other than the one the breakpoint is scoped to, or a false
-            // conditional is stepped over and resumed here too, so a read/halt
-            // surface services that noise (and un-sticks a VM frozen on it) the
-            // same way `wait_for_stop` does, instead of surfacing a halt in another
-            // process's address space. A real hit falls through to surface in place.
-            if self.breakpoints.has_enabled_breakpoints() {
-                rewind_threads_off_breakpoints(
-                    self.backend.as_mut(),
-                    &self.register_map,
-                    &self.breakpoints,
-                    &self.current_thread,
-                );
-                if let Ok(regs) = self.backend.read_registers() {
-                    let rip = self.register_map.read_u64("rip", &regs).unwrap_or(0);
-                    let cr3 = self.register_map.read_u64("cr3", &regs).unwrap_or(0);
-                    self.target.registers = Some(self.register_map.to_hashmap(&regs));
-                    if cr3 != 0 {
-                        self.target.set_context_dtb_override(cr3);
-                    }
-                    if matches!(
-                        self.resolve_breakpoint_stop(rip, cr3),
-                        Ok(BreakpointStopAction::Resumed)
-                    ) {
-                        return Ok(());
-                    }
-                }
-            }
-        }
-
-        if event.target_reloaded {
-            // Mirror `interrupt`: rebuild against the new kernel now, and flag the
-            // reload as not-yet-surfaced so the next `wait_for_stop` still reports
-            // the one `target_reloaded` notification (settling carries none).
-            let _ = self.reload_with_hint(event.target_kernel_base_hint);
+        if matches!(
+            self.classify_stop_event(event)?,
+            StopResolution::TargetReloaded { .. }
+        ) {
+            // Settling is intentionally non-surfacing. Preserve the single
+            // reboot notification for the next explicit wait.
             self.reload_surface_pending = true;
         }
-        self.refresh_context_for_current_thread();
         Ok(())
     }
 
@@ -831,6 +898,42 @@ impl Session {
             .add(self.backend.as_mut(), &self.target, addr, symbol, condition)
     }
 
+    /// Set a symbol-identity breakpoint that survives module unload/reload and
+    /// may remain deferred until matching symbols are loaded.
+    pub fn add_symbol_breakpoint(
+        &mut self,
+        symbol: String,
+        condition: Option<String>,
+    ) -> Result<u32> {
+        self.breakpoints.add_symbolic(
+            self.backend.as_mut(),
+            &self.target,
+            symbol,
+            BreakpointConfig {
+                condition,
+                ..BreakpointConfig::default()
+            },
+        )
+    }
+
+    /// Set one source identity for every address matching `file:line`, or one
+    /// deferred identity when no matching module is currently loaded.
+    pub fn add_source_breakpoint(
+        &mut self,
+        source: String,
+        condition: Option<String>,
+    ) -> Result<Vec<u32>> {
+        self.breakpoints.add_source(
+            self.backend.as_mut(),
+            &self.target,
+            source,
+            BreakpointConfig {
+                condition,
+                ..BreakpointConfig::default()
+            },
+        )
+    }
+
     /// Watch data accesses at `addr`. Watches are global across guest address
     /// spaces. Returns the stop-point id.
     pub fn add_watchpoint(
@@ -866,6 +969,7 @@ impl Session {
     ) -> Result<u32> {
         self.breakpoints.add_hardware(
             self.backend.as_mut(),
+            &self.target,
             addr,
             access.into(),
             len,
@@ -1093,13 +1197,14 @@ impl Session {
         ))
     }
 
-    /// Walk the currently selected thread's call stack, returning up to `limit`
-    /// frames. Reads the live register context and unwinds via
-    /// [`build_stacktrace`], which resolves the per-frame DTB from CR3 and lazily
-    /// loads the modules each frame lands in. Each frame carries its stack
-    /// pointer, instruction pointer, resolved symbol, and how it was recovered
-    /// (current RIP, unwind data, or heuristic stack scan).
+    /// Walk the currently selected inspection context's call stack, returning
+    /// up to `limit` frames. A parked Windows thread uses stack-only recovery
+    /// without touching the backend vCPU; otherwise this reads live registers.
     pub fn backtrace(&mut self, limit: usize) -> Result<StackTrace> {
+        if let Some(thread) = self.parked_windows_thread() {
+            return Ok(build_parked_thread_stack(&self.target, thread, limit)?.stacktrace);
+        }
+
         self.backend.set_current_thread(&self.current_thread)?;
         let regs = self.backend.read_registers()?;
         Ok(build_stacktrace(
@@ -1110,26 +1215,36 @@ impl Session {
         ))
     }
 
-    /// Uninstall every breakpoint (e.g. on shutdown, so no `int3` is left in
-    /// the guest). Best-effort: removal errors are ignored.
-    pub fn remove_all_breakpoints(&mut self) {
-        let ids: Vec<u32> = self.breakpoints.list().iter().map(|b| b.id).collect();
-        for id in ids {
-            let _ = self
-                .breakpoints
-                .remove(self.backend.as_mut(), &self.target, id);
-        }
+    /// Unwind a specified non-running Windows thread in its owning process
+    /// address space without selecting it or mutating the backend vCPU.
+    pub fn backtrace_thread(&self, thread: &ThreadInfo, limit: usize) -> Result<ThreadStackTrace> {
+        build_parked_thread_stack(&self.target, thread, limit)
+    }
+
+    /// Uninstall every breakpoint. Successful removals are forgotten; failed
+    /// removals remain managed so callers can retry and must not resume the
+    /// target as if cleanup had succeeded.
+    pub fn remove_all_breakpoints(&mut self) -> Result<()> {
+        self.breakpoints
+            .remove_all(self.backend.as_mut(), &self.target)
     }
 
     /// Leave the target in a usable state when a frontend exits: halt first if
-    /// needed so breakpoint removal can safely restore guest memory, then ask
-    /// the backend to leave the VM running.
+    /// needed, restore every debugger-owned breakpoint site, and resume only
+    /// when both operations succeed. Any failure explicitly prepares the
+    /// backend to leave the target halted.
     pub fn cleanup_for_exit(&mut self) -> Result<()> {
-        if self.backend.is_running() {
-            let _ = self.backend.interrupt();
+        let halted = if self.backend.is_running() {
+            self.interrupt().map(|_| ())
+        } else {
+            Ok(())
+        };
+        if halted.is_err() {
+            return prepare_backend_after_cleanup(self.backend.as_mut(), halted);
         }
-        self.remove_all_breakpoints();
-        self.backend.prepare_for_exit(true)
+
+        let cleanup = self.remove_all_breakpoints();
+        prepare_backend_after_cleanup(self.backend.as_mut(), cleanup)
     }
 
     /// Resume the VM. If sitting on one of our breakpoints, step past it first
@@ -1140,6 +1255,17 @@ impl Session {
     /// Does not poll for Ctrl+C or handle KD target-reload/reconnect the way the
     /// REPL's continue loop does; those remain REPL concerns.
     pub fn resume(&mut self) -> Result<()> {
+        self.resume_with_disposition(ContinueDisposition::Handled)
+    }
+
+    /// Resume with an explicit exception acknowledgement while preserving the
+    /// same breakpoint step-over and cache invalidation prologue as [`Self::resume`].
+    pub fn resume_with_disposition(&mut self, disposition: ContinueDisposition) -> Result<()> {
+        if self.parked_windows_thread().is_some() {
+            self.parked_windows_thread = None;
+            self.target.clear_current_windows_thread_context();
+            self.refresh_context_for_current_thread();
+        }
         // The VM is moving on, so any stop `service_idle` parked for the host to
         // observe is now spent; drop it so a later `wait_for_stop` doesn't replay
         // a stale event.
@@ -1158,14 +1284,21 @@ impl Session {
                 &mut self.breakpoints,
             )?;
         }
+        for id in self.breakpoints.one_shot_hit_ids() {
+            self.breakpoints
+                .remove(self.backend.as_mut(), &self.target, id)?;
+        }
 
         self.breakpoints
             .refresh_enabled(self.backend.as_mut(), &self.target)?;
-        self.backend.continue_execution()?;
+        self.backend
+            .continue_execution_with_disposition(disposition)?;
+        self.record_continuation_disposition(disposition);
 
         self.target.registers = None;
         self.target.clear_context_dtb_override();
         self.target.clear_current_windows_thread_context();
+        self.parked_windows_thread = None;
         Ok(())
     }
 
@@ -1182,6 +1315,19 @@ impl Session {
     pub fn resolve_breakpoint_stop(&mut self, rip: u64, cr3: u64) -> Result<BreakpointStopAction> {
         match self.breakpoints.check_breakpoint_hit(rip, cr3) {
             BreakpointHitResult::Hit(bp) => {
+                // Count every scoped physical hit before pass-count and
+                // condition evaluation. A pass skip uses the same canonical
+                // step-over/resume path as a false condition.
+                if self.breakpoints.record_hit(bp.id)? == BreakpointHitDisposition::SkipPass {
+                    step_over_current_breakpoint(
+                        self.backend.as_mut(),
+                        &self.register_map,
+                        &self.target,
+                        &mut self.breakpoints,
+                    )?;
+                    self.backend.continue_execution()?;
+                    return Ok(BreakpointStopAction::Resumed);
+                }
                 // A false condition is absorbed. Evaluation errors fail safe:
                 // surface the stop and carry the error to every host.
                 let condition_error = match bp.evaluate_condition(&self.target) {
@@ -1205,11 +1351,9 @@ impl Session {
                     .breakpoints
                     .refresh_enabled(self.backend.as_mut(), &self.target);
 
+                self.breakpoints.mark_one_shot_hit(bp.id)?;
                 Ok(BreakpointStopAction::Hit {
-                    id: bp.id,
-                    address: bp.address.0,
-                    symbol: bp.symbol.clone(),
-                    temporary: bp.temporary,
+                    breakpoint: bp,
                     condition_error,
                 })
             }
@@ -1233,6 +1377,100 @@ impl Session {
         }
     }
 
+    /// Classify one raw backend stop and perform every core-owned transition.
+    ///
+    /// This is the only stop-ingestion state machine. REPL, MCP, Python, and
+    /// idle servicing may differ in polling and presentation, but must route
+    /// raw events here so reload handling, DR acknowledgement, scope checks,
+    /// `int3` rewind, conditions, and auto-resume behavior cannot drift.
+    pub fn classify_stop_event(&mut self, mut event: StopEvent) -> Result<StopResolution> {
+        self.record_stop_event(&event);
+        set_current_thread_from_stop(self.backend.as_mut(), &event, &mut self.current_thread);
+
+        if event.is_bugcheck && !event.target_reloaded {
+            self.target.registers = None;
+            return Ok(StopResolution::Bugcheck { event });
+        }
+
+        match self.classify_reload_stop(&mut event)? {
+            disposition @ (ReloadDisposition::Reloaded { .. }
+            | ReloadDisposition::ReloadCompleted) => {
+                let coherent =
+                    !matches!(disposition, ReloadDisposition::Reloaded { coherent: false });
+                self.refresh_context_for_current_thread();
+                return Ok(StopResolution::TargetReloaded { event, coherent });
+            }
+            ReloadDisposition::PendingRediscovery | ReloadDisposition::ResumePastAssist => {
+                self.backend.continue_execution()?;
+                return Ok(StopResolution::Resumed);
+            }
+            ReloadDisposition::Ordinary => {}
+        }
+
+        match resolve_watchpoint_stop(
+            self.backend.as_mut(),
+            &self.register_map,
+            &mut self.breakpoints,
+            &mut self.target,
+            &mut self.current_thread,
+            &event,
+        )? {
+            WatchpointStopAction::Hit {
+                breakpoint,
+                condition_error,
+            } => {
+                let rip = self
+                    .target
+                    .registers
+                    .as_ref()
+                    .and_then(|registers| registers.get("rip").copied())
+                    .unwrap_or(0);
+                return Ok(StopResolution::Breakpoint {
+                    breakpoint,
+                    event,
+                    rip,
+                    condition_error,
+                });
+            }
+            WatchpointStopAction::Resumed => return Ok(StopResolution::Resumed),
+            WatchpointStopAction::NotBreakpoint => {}
+        }
+
+        if stop_is_stray_single_step(&event, &self.breakpoints) {
+            let _ = clear_trap_flag(self.backend.as_mut(), &self.register_map);
+            self.backend.continue_execution()?;
+            return Ok(StopResolution::Resumed);
+        }
+
+        if self.breakpoints.has_enabled_breakpoints() {
+            rewind_threads_off_breakpoints(
+                self.backend.as_mut(),
+                &self.register_map,
+                &self.breakpoints,
+                &self.current_thread,
+            );
+        }
+
+        let registers = self.backend.read_registers()?;
+        let rip = self.register_map.read_u64("rip", &registers).unwrap_or(0);
+        let cr3 = self.register_map.read_u64("cr3", &registers).unwrap_or(0);
+        update_target_context_from_registers(&mut self.target, &self.register_map, Ok(registers));
+
+        match self.resolve_breakpoint_stop(rip, cr3)? {
+            BreakpointStopAction::Hit {
+                breakpoint,
+                condition_error,
+            } => Ok(StopResolution::Breakpoint {
+                breakpoint,
+                event,
+                rip,
+                condition_error,
+            }),
+            BreakpointStopAction::Resumed => Ok(StopResolution::Resumed),
+            BreakpointStopAction::NotBreakpoint => Ok(StopResolution::Stopped { event, rip }),
+        }
+    }
+
     /// Resume the VM and wait up to `timeout` for a *meaningful* stop, returning
     /// a [`ContinueOutcome`]. The scope-aware run-control loop shared by the REPL
     /// and the SDK/MCP: it silently steps over and resumes past wrong-process int3
@@ -1242,8 +1480,8 @@ impl Session {
     /// `timeout` bounds the wait: `Some(d)` returns [`ContinueOutcome::Running`]
     /// (VM left running) if `d` elapses with no stop (robust against transport
     /// timeouts); `None` waits indefinitely. If the VM is already running on entry
-    /// it keeps waiting without re-resuming; otherwise it resumes first via
-    /// [`Self::resume`]. `cancel` interrupts the wait between polls (returns
+    /// it keeps waiting without re-resuming; otherwise it resumes first with a
+    /// handled disposition. `cancel` interrupts the wait between polls (returns
     /// `Running`, VM left running); pass a never-set flag to disable.
     ///
     /// This is the shared resume-and-wait helper; surfaces that need non-resuming
@@ -1253,8 +1491,19 @@ impl Session {
         timeout: Option<Duration>,
         cancel: &AtomicBool,
     ) -> Result<ContinueOutcome> {
+        self.continue_until_break_with_disposition(timeout, cancel, ContinueDisposition::Handled)
+    }
+
+    /// Resume with an explicit exception acknowledgement, then wait for a
+    /// meaningful stop. When already running, no acknowledgement is sent.
+    pub fn continue_until_break_with_disposition(
+        &mut self,
+        timeout: Option<Duration>,
+        cancel: &AtomicBool,
+        disposition: ContinueDisposition,
+    ) -> Result<ContinueOutcome> {
         if !self.backend.is_running() {
-            self.resume()?;
+            self.resume_with_disposition(disposition)?;
         }
         self.wait_for_stop_bounded(timeout, cancel)
     }
@@ -1290,7 +1539,7 @@ impl Session {
                 None => CONTINUE_POLL_INTERVAL,
             };
 
-            let mut event = match self.backend.try_wait_for_stop(poll)? {
+            let event = match self.backend.try_wait_for_stop(poll)? {
                 Some(event) => event,
                 None => {
                     // The poll drained any pending stop; if it found nothing and
@@ -1322,182 +1571,74 @@ impl Session {
                     continue;
                 }
             };
-
-            set_current_thread_from_stop(self.backend.as_mut(), &event, &mut self.current_thread);
-
-            // A bugcheck surfaces immediately and must not be absorbed by the
-            // reload machine below, *unless* the same stop also carries a target
-            // reload. A post-bugcheck reboot latches the bugcheck flag while the
-            // new kernel's KD resync arrives, so the stop reports both; a reboot
-            // means the crash is over, so the reload takes priority and the
-            // early-boot stop surfaces instead of a phantom second bugcheck.
-            // Mirrors the REPL's `is_bugcheck = event.is_bugcheck && !target_reloaded`
-            // so the two continue loops can't drift.
-            if event.is_bugcheck && !event.target_reloaded {
-                self.target.registers = None;
-                return Ok(ContinueOutcome::Bugcheck {
-                    rip: event.program_counter,
-                    info: event.bugcheck.clone(),
-                });
-            }
-
-            // Drive the reboot / KD-reconnect state machine: one TargetReloaded
-            // per reboot, surfaced as early as possible: at detection when the
-            // rebuild succeeds (even with the module list not up yet, matching
-            // the REPL's early-boot break; the later completion is then silent),
-            // or at the rediscovery completion as the fallback when it didn't.
-            // Pending-rediscovery stops and assist break-ins are absorbed; real
-            // stops (early-boot breakpoint hits) fall through as Ordinary even
-            // mid-reload. Completing rediscovery is also what stops the backend's
-            // reconnect-assist poking; a missed completion here is what used to
-            // leave the VM resume-past-looping forever.
-            match self.classify_reload_stop(&mut event) {
-                disposition @ (ReloadDisposition::Reloaded { .. }
-                | ReloadDisposition::ReloadCompleted) => {
-                    let coherent =
-                        !matches!(disposition, ReloadDisposition::Reloaded { coherent: false });
+            match self.classify_stop_event(event)? {
+                StopResolution::Resumed => continue,
+                StopResolution::Breakpoint {
+                    breakpoint,
+                    rip,
+                    condition_error,
+                    ..
+                } => {
+                    return Ok(ContinueOutcome::Breakpoint {
+                        id: breakpoint.id,
+                        address: breakpoint.address.0,
+                        symbol: breakpoint.symbol,
+                        temporary: breakpoint.temporary,
+                        action: breakpoint.action,
+                        rip,
+                        condition_error,
+                    });
+                }
+                StopResolution::Bugcheck { event } => {
+                    return Ok(ContinueOutcome::Bugcheck {
+                        rip: event.program_counter,
+                        info: event.bugcheck,
+                    });
+                }
+                StopResolution::TargetReloaded { coherent, .. } => {
                     reload_trace!(
                         "continue: SURFACE target_reloaded base={} coherent={}",
-                        self.target
-                            .kernel_base()
-                            .map_or_else(|| "none".to_string(), |a| format!("{:#x}", a.0),),
+                        self.target.kernel_base().map_or_else(
+                            || "none".to_string(),
+                            |address| format!("{:#x}", address.0)
+                        ),
                         coherent,
                     );
-                    // Establish register/DTB context at the surfaced stop (or
-                    // drop the pre-reboot leftovers if the read fails) so
-                    // inspection here doesn't see the old kernel's state
-                    self.refresh_context_for_current_thread();
                     return Ok(ContinueOutcome::TargetReloaded {
-                        kernel_base: self.target.kernel_base().map(|a| a.0),
+                        kernel_base: self.target.kernel_base().map(|address| address.0),
                         coherent,
                     });
                 }
-                ReloadDisposition::PendingRediscovery | ReloadDisposition::ResumePastAssist => {
-                    reload_trace!("continue: absorb -> resume + keep waiting");
-                    self.backend.continue_execution()?;
-                    continue;
-                }
-                ReloadDisposition::Ordinary => {}
-            }
-
-            // Claim watchpoint stops before the stray-single-step absorber. The
-            // shared resolver refreshes target context, evaluates conditions,
-            // and resumes false hits so the REPL and SDK/MCP cannot drift.
-            match resolve_watchpoint_stop(
-                self.backend.as_mut(),
-                &self.register_map,
-                &self.breakpoints,
-                &mut self.target,
-                &mut self.current_thread,
-                &event,
-            )? {
-                WatchpointStopAction::Hit {
-                    breakpoint: bp,
-                    condition_error,
-                } => {
-                    // resolve_watchpoint_stop just refreshed target.registers;
-                    // read RIP from there instead of a second register round-trip.
-                    let rip = self
-                        .target
-                        .registers
-                        .as_ref()
-                        .and_then(|regs| regs.get("rip").copied())
-                        .unwrap_or(0);
-                    return Ok(ContinueOutcome::Breakpoint {
-                        id: bp.id,
-                        address: bp.address.0,
-                        symbol: bp.symbol,
-                        temporary: bp.temporary,
-                        rip,
-                        condition_error,
-                    });
-                }
-                WatchpointStopAction::Resumed => continue,
-                WatchpointStopAction::NotBreakpoint => {}
-            }
-
-            // A stray single-step (STATUS_SINGLE_STEP, not at a user breakpoint)
-            // is a debugger artifact, not a stop to surface: a managed step-over's
-            // single-step that leaked here because KD single-steps the whole
-            // machine and another processor's break was reported first, possibly
-            // leaving TF set on its processor. Clear TF and resume.
-            if stop_is_stray_single_step(&event, &self.breakpoints) {
-                let _ = clear_trap_flag(self.backend.as_mut(), &self.register_map);
-                self.backend.continue_execution()?;
-                continue;
-            }
-
-            // After an `int3` executes, RIP sits at the byte *after* the
-            // breakpoint; rewind any thread parked there so the hit check below
-            // sees the breakpoint address.
-            if self.breakpoints.has_enabled_breakpoints() {
-                rewind_threads_off_breakpoints(
-                    self.backend.as_mut(),
-                    &self.register_map,
-                    &self.breakpoints,
-                    &self.current_thread,
-                );
-            }
-
-            let regs = self.backend.read_registers()?;
-            self.target.registers = Some(self.register_map.to_hashmap(&regs));
-            let rip = self.register_map.read_u64("rip", &regs).unwrap_or(0);
-            let cr3 = self.register_map.read_u64("cr3", &regs).unwrap_or(0);
-            if cr3 != 0 {
-                self.target.set_context_dtb_override(cr3);
-            }
-
-            // The breakpoint-hit disposition (real hit, wrong-process shared-page
-            // int3, false conditional, or genuine non-breakpoint stop) is shared
-            // with the REPL's continue loop so they can't drift; the absorbed
-            // cases step over and resume inside the resolver.
-            match self.resolve_breakpoint_stop(rip, cr3)? {
-                BreakpointStopAction::Hit {
-                    id,
-                    address,
-                    symbol,
-                    temporary,
-                    condition_error,
-                } => {
-                    return Ok(ContinueOutcome::Breakpoint {
-                        id,
-                        address,
-                        symbol,
-                        temporary,
-                        rip,
-                        condition_error,
-                    });
-                }
-                BreakpointStopAction::Resumed => continue,
-                BreakpointStopAction::NotBreakpoint => {
+                StopResolution::Stopped { event, rip } => {
                     return Ok(ContinueOutcome::Stopped {
                         rip,
                         exception_code: event.exception_code,
+                        first_chance: event.first_chance,
+                        exception_address: event.exception_address,
                     });
                 }
             }
         }
     }
 
-    /// Block until the VM stops, then select the stopped thread. If the backend
-    /// reports the target was reloaded (e.g. a KD stream reset / guest reboot),
-    /// rebuild guest state before returning. Returns the raw stop event.
+    /// Block until the backend produces a meaningful stop, routing every raw
+    /// event through [`Self::classify_stop_event`]. Filtered breakpoint hits and
+    /// debugger noise are resumed internally.
     pub fn wait_for_stop(&mut self) -> Result<StopEvent> {
-        let event = self.backend.wait_for_stop()?;
-        if event.target_reloaded {
-            // Best-effort: the kernel may not be discoverable yet mid-reboot.
-            let _ = self.reload_with_hint(event.target_kernel_base_hint);
+        loop {
+            let event = self.backend.wait_for_stop()?;
+            match self.classify_stop_event(event)? {
+                StopResolution::Resumed => continue,
+                StopResolution::Breakpoint { event, .. }
+                | StopResolution::Bugcheck { event }
+                | StopResolution::TargetReloaded { event, .. }
+                | StopResolution::Stopped { event, .. } => return Ok(event),
+            }
         }
-        set_current_thread_from_stop(self.backend.as_mut(), &event, &mut self.current_thread);
-        self.refresh_context_for_current_thread();
-        Ok(event)
     }
 
-    /// Rebuild guest state after a target reload/reboot: drop stale breakpoints,
-    /// rediscover the kernel (optionally guided by `hint`), and tell the backend
-    /// whether to keep poking for it. Routes through the shared
-    /// [`perform_target_reload`] action so the sync path (pyo3 `wait_for_stop`),
-    /// the MCP/SDK classifier, and the REPL can't drift on reload behavior.
+    /// Rebuild guest state using an optional kernel-base hint through the shared
+    /// [`perform_target_reload`] action.
     pub fn reload_with_hint(&mut self, hint: Option<VirtAddr>) -> Result<()> {
         let outcome = perform_target_reload(
             self.backend.as_mut(),
@@ -1510,6 +1651,9 @@ impl Session {
             .as_ref()
             .map(reload_report_has_loaded_module_list)
             .unwrap_or(false);
+        if let Some(error) = outcome.breakpoint_error {
+            return Err(error);
+        }
         outcome.report.map(|_| ())
     }
 
@@ -1523,25 +1667,27 @@ impl Session {
     /// backend rediscovery completed (stopping its reconnect-assist poking), and
     /// clear the pending flag. Returns whether it completed on this call. The
     /// REPL layers cache refresh and progress printing on the same condition.
-    pub fn try_complete_pending_reload(&mut self) -> bool {
+    pub fn try_complete_pending_reload(&mut self) -> Result<bool> {
         if !self.reload_module_list_pending {
-            return false;
+            return Ok(false);
         }
         let startup = match self.target.startup_message_data() {
             Ok(startup) => startup,
-            Err(e) => {
-                reload_trace!("try_complete: startup read failed: {e}");
-                return false;
+            Err(error) => {
+                reload_trace!("try_complete: startup read failed: {error}");
+                return Ok(false);
             }
         };
         reload_trace!("try_complete: psmods={:#x}", startup.loaded_module_list.0);
         if startup.loaded_module_list.is_zero() {
-            return false;
+            return Ok(false);
         }
-        let _ = self.target.refresh_kernel_module_symbols();
+        self.target.refresh_kernel_module_symbols()?;
+        self.breakpoints
+            .resolve_symbolic(self.backend.as_mut(), &self.target)?;
         self.backend.note_target_rediscovery_complete();
         self.reload_module_list_pending = false;
-        true
+        Ok(true)
     }
 
     /// Try to finish module-list rediscovery by reading `PsLoadedModuleList` from
@@ -1571,7 +1717,7 @@ impl Session {
     /// a pending rediscovery; otherwise it recognizes transport assist break-ins.
     /// Mutates `event.target_reloaded` to match. `continue_until_break` consumes
     /// it; the REPL shares its predicates so they can't drift.
-    pub fn classify_reload_stop(&mut self, event: &mut StopEvent) -> ReloadDisposition {
+    pub fn classify_reload_stop(&mut self, event: &mut StopEvent) -> Result<ReloadDisposition> {
         reload_trace!(
             "classify: pc={} exc={} assisted={} reloaded={} bugcheck={} pending={}",
             event
@@ -1588,45 +1734,48 @@ impl Session {
 
         if stop_event_requires_target_reload(&self.target, event) {
             event.target_reloaded = true;
-            let outcome = perform_target_reload(
+            let TargetReloadOutcome {
+                report,
+                hint,
+                breakpoint_error,
+            } = perform_target_reload(
                 self.backend.as_mut(),
                 &mut self.target,
                 &mut self.breakpoints,
                 event.target_kernel_base_hint,
             );
-            return match outcome.report {
+            if let Some(error) = breakpoint_error {
+                return Err(error);
+            }
+            return Ok(match report {
                 Ok(report) => {
                     let coherent = reload_report_has_loaded_module_list(&report);
                     self.reload_module_list_pending = !coherent;
                     // The host surfaces this verdict, so the reboot has been
-                    // reported; the eventual completion stays silent
+                    // reported; the eventual completion stays silent.
                     self.reload_surface_pending = false;
                     reload_trace!(
                         "classify: reload ok hint={} new_base={} psmods={} coherent={}",
-                        outcome
-                            .hint
-                            .map_or_else(|| "none".to_string(), |h| format!("{:#x}", h.0)),
-                        self.target
-                            .kernel_base()
-                            .map_or_else(|| "none".to_string(), |a| format!("{:#x}", a.0),),
+                        hint.map_or_else(|| "none".to_string(), |value| format!("{:#x}", value.0)),
+                        self.target.kernel_base().map_or_else(
+                            || "none".to_string(),
+                            |address| format!("{:#x}", address.0)
+                        ),
                         report.startup.as_ref().map_or_else(
                             || "none".to_string(),
-                            |s| format!("{:#x}", s.loaded_module_list.0),
+                            |startup| format!("{:#x}", startup.loaded_module_list.0),
                         ),
                         coherent,
                     );
                     ReloadDisposition::Reloaded { coherent }
                 }
-                Err(ref e) => {
+                Err(error) => {
                     self.reload_module_list_pending = true;
-                    // Nothing surfaced for this reboot yet; the completion
-                    // must be surfaced in its place or the host never learns
-                    // the guest rebooted
                     self.reload_surface_pending = true;
-                    reload_trace!("classify: reload err={e} -> pending_rediscovery");
+                    reload_trace!("classify: reload err={error} -> pending_rediscovery");
                     ReloadDisposition::PendingRediscovery
                 }
-            };
+            });
         }
 
         // A pending reload whose module list just became available completes here
@@ -1635,33 +1784,33 @@ impl Session {
         // completion as the one reload notification for this reboot; otherwise
         // the completion is silent; absorb debugger noise, and let a real stop
         // (e.g. an early-boot breakpoint hit) be handled normally below.
-        if self.try_complete_pending_reload() {
+        if self.try_complete_pending_reload()? {
             if self.reload_surface_pending {
                 self.reload_surface_pending = false;
                 reload_trace!(
                     "classify: pending reload COMPLETED (unsurfaced) -> reload_completed"
                 );
-                return ReloadDisposition::ReloadCompleted;
+                return Ok(ReloadDisposition::ReloadCompleted);
             }
-            if stop_is_assisted_refresh_breakin(&self.target, &self.breakpoints, event) {
+            if stop_is_assisted_refresh_breakin(&self.breakpoints, event) {
                 reload_trace!("classify: pending reload COMPLETED silently -> resume_past_assist");
-                return ReloadDisposition::ResumePastAssist;
+                return Ok(ReloadDisposition::ResumePastAssist);
             }
             reload_trace!("classify: pending reload COMPLETED silently at a real stop");
-            return ReloadDisposition::Ordinary;
+            return Ok(ReloadDisposition::Ordinary);
         }
 
         // KD refresh/reconnect/debugger break-in (including the boot-time assist
         // pokes while a reload is still pending): resume past it. Real stops,
         // notably hits on breakpoints set at the early-boot reload stop, fall
         // through and surface even while the module list is still pending.
-        if stop_is_assisted_refresh_breakin(&self.target, &self.breakpoints, event) {
+        if stop_is_assisted_refresh_breakin(&self.breakpoints, event) {
             reload_trace!("classify: assisted refresh break-in -> resume_past_assist");
-            return ReloadDisposition::ResumePastAssist;
+            return Ok(ReloadDisposition::ResumePastAssist);
         }
 
         reload_trace!("classify: ordinary");
-        ReloadDisposition::Ordinary
+        Ok(ReloadDisposition::Ordinary)
     }
 }
 
@@ -1782,6 +1931,8 @@ pub fn reload_report_has_loaded_module_list(report: &ReloadReport) -> bool {
 pub struct TargetReloadOutcome {
     pub report: Result<ReloadReport>,
     pub hint: Option<VirtAddr>,
+    /// Symbolic breakpoint re-resolution failed after the target itself reloaded.
+    pub breakpoint_error: Option<Error>,
 }
 
 /// Rebuild guest state after a detected reboot: drop the now-stale breakpoints,
@@ -1797,11 +1948,18 @@ pub fn perform_target_reload(
     breakpoints: &mut BreakpointManager,
     event_hint: Option<VirtAddr>,
 ) -> TargetReloadOutcome {
-    // Release DR slots before dropping the manager; see BreakpointManager::clear_hardware_slots.
-    breakpoints.clear_hardware_slots(backend);
-    *breakpoints = BreakpointManager::new();
+    // Target-specific numeric breakpoints and hardware slots cannot survive a
+    // rebuild. Symbolic code breakpoints retain identity and become deferred.
+    breakpoints.prepare_target_reload(backend);
     let hint = event_hint.or_else(|| backend.target_kernel_base_hint().ok().flatten());
     let report = target.reload_guest_with_kernel_base_hint(hint);
+    let breakpoint_error = if report.is_ok() {
+        let debugger_data_hint = backend.target_debugger_data_hint().ok().flatten();
+        target.refresh_debugger_data(debugger_data_hint);
+        breakpoints.resolve_symbolic(backend, target).err()
+    } else {
+        None
+    };
     match &report {
         // Once the kernel image is rediscovered, stop reconnect-assist pokes. The
         // remaining module-list completion is polled from live memory; forced
@@ -1811,7 +1969,11 @@ pub fn perform_target_reload(
         // only way to force a stop where the rebuild can be retried, so keep it.
         Err(_) => backend.note_target_rediscovery_pending(),
     }
-    TargetReloadOutcome { report, hint }
+    TargetReloadOutcome {
+        report,
+        hint,
+        breakpoint_error,
+    }
 }
 
 /// Whether `event` reflects a guest reboot into a new kernel image (so debugger
@@ -1859,15 +2021,13 @@ pub fn stop_event_requires_target_reload(debugger: &Target, event: &StopEvent) -
         .unwrap_or(false)
 }
 
-/// Whether `event` is a debugger-generated KD refresh/reconnect/manual break-in
+/// Whether `event` is a debugger-generated KD refresh/reconnect break-in
 /// rather than a user break or genuine target exception, i.e. a stop to resume
-/// past, not surface. KD usually marks reconnect-assist break-ins explicitly,
-/// but queued break-in bytes can also surface later as an ordinary
-/// `nt!DbgBreakPointWithStatus` stop; those are transparent too unless the user
-/// owns a breakpoint at that address. Used by [`Session::classify_reload_stop`]
-/// and the REPL's `should_resume_assisted_refresh_stop`.
+/// past, not surface. KD marks reconnect-assist break-ins explicitly via the
+/// `assisted_breakin` flag; user-initiated break-ins (e.g. via Ctrl+C) always
+/// surface as real stops regardless of where the kernel hits. Used by
+/// [`Session::classify_reload_stop`].
 pub fn stop_is_assisted_refresh_breakin(
-    debugger: &Target,
     breakpoints: &BreakpointManager,
     event: &StopEvent,
 ) -> bool {
@@ -1882,21 +2042,7 @@ pub fn stop_is_assisted_refresh_breakin(
         return false;
     }
 
-    if event.assisted_breakin {
-        return true;
-    }
-
-    let Some(pc) = event.program_counter else {
-        return false;
-    };
-
-    debugger
-        .closest_symbol_current_context(VirtAddr(pc))
-        .as_deref()
-        .is_some_and(|symbol| {
-            symbol == "nt!DbgBreakPointWithStatus"
-                || symbol.starts_with("nt!DbgBreakPointWithStatus+")
-        })
+    event.assisted_breakin
 }
 
 /// Whether `event` is a *stray* single-step: a `STATUS_SINGLE_STEP` trap that
@@ -1979,12 +2125,12 @@ pub fn hardware_breakpoint_hit(
 /// Resolve one stop against the watchpoint manager. This owns the behavior
 /// common to every host: claim and acknowledge backend status, adopt the
 /// stopped thread, refresh register/CR3 context before condition evaluation,
-/// and resume a false conditional hit. Condition errors fail safe by surfacing
-/// the hit with error metadata.
+/// and resume a pass-count or false conditional hit. Condition errors fail
+/// safe by surfacing the hit with error metadata.
 pub fn resolve_watchpoint_stop(
     backend: &mut dyn DebugBackend,
     register_map: &RegisterMap,
-    breakpoints: &BreakpointManager,
+    breakpoints: &mut BreakpointManager,
     target: &mut Target,
     current_thread: &mut String,
     event: &StopEvent,
@@ -1995,8 +2141,17 @@ pub fn resolve_watchpoint_stop(
     };
 
     set_current_thread_from_stop(backend, event, current_thread);
-    let registers = backend.read_registers();
-    update_target_context_from_registers(target, register_map, registers);
+    let registers = backend.read_registers()?;
+    let cr3 = register_map.read_u64("cr3", &registers).unwrap_or(0);
+    update_target_context_from_registers(target, register_map, Ok(registers));
+    if !breakpoint.scope.matches_cr3(cr3) {
+        backend.continue_execution()?;
+        return Ok(WatchpointStopAction::Resumed);
+    }
+    if breakpoints.record_hit(breakpoint.id)? == BreakpointHitDisposition::SkipPass {
+        backend.continue_execution()?;
+        return Ok(WatchpointStopAction::Resumed);
+    }
 
     let condition_error = match breakpoint.evaluate_condition(target) {
         Ok(false) => {
@@ -2006,6 +2161,9 @@ pub fn resolve_watchpoint_stop(
         Ok(true) => None,
         Err(error) => Some(error.to_string()),
     };
+    if breakpoint.one_shot {
+        breakpoints.remove(backend, target, breakpoint.id)?;
+    }
 
     Ok(WatchpointStopAction::Hit {
         breakpoint,
@@ -2200,6 +2358,8 @@ mod tests {
         regs: Vec<u8>,
         writes: usize,
         fail_writes: bool,
+        exit_requests: Vec<bool>,
+        fail_exit: bool,
     }
 
     impl MockBackend {
@@ -2209,6 +2369,8 @@ mod tests {
                 regs: vec![0u8; REGISTER_BUFFER_SIZE],
                 writes: 0,
                 fail_writes: false,
+                exit_requests: Vec::new(),
+                fail_exit: false,
             }
         }
 
@@ -2271,12 +2433,22 @@ mod tests {
         fn is_running(&self) -> bool {
             false
         }
+        fn prepare_for_exit(&mut self, leave_running: bool) -> Result<()> {
+            self.exit_requests.push(leave_running);
+            if self.fail_exit {
+                Err(Error::Kd("injected backend teardown failure".into()))
+            } else {
+                Ok(())
+            }
+        }
     }
 
     fn single_step_event() -> StopEvent {
         StopEvent {
             thread_id: None,
             exception_code: Some(STATUS_SINGLE_STEP),
+            first_chance: Some(true),
+            exception_address: None,
             program_counter: None,
             is_bugcheck: false,
             bugcheck: None,
@@ -2299,6 +2471,55 @@ mod tests {
             Some(HardwareBreakpoint { access, len, slot }),
         );
         manager
+    }
+
+    #[test]
+    fn backend_default_rejects_not_handled_continuation() {
+        let mut backend = MockBackend::new();
+        assert!(matches!(
+            backend.continue_execution_with_disposition(ContinueDisposition::NotHandled),
+            Err(Error::ExceptionDispositionUnsupported)
+        ));
+    }
+
+    #[test]
+    fn successful_breakpoint_cleanup_requests_running_exit() {
+        let mut backend = MockBackend::new();
+
+        prepare_backend_after_cleanup(&mut backend, Ok(())).unwrap();
+
+        assert_eq!(backend.exit_requests, vec![true]);
+    }
+
+    #[test]
+    fn failed_breakpoint_cleanup_requests_halted_exit() {
+        let mut backend = MockBackend::new();
+
+        let error = prepare_backend_after_cleanup(
+            &mut backend,
+            Err(Error::Kd("injected breakpoint removal failure".into())),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("breakpoint removal failure"));
+        assert_eq!(backend.exit_requests, vec![false]);
+    }
+
+    #[test]
+    fn cleanup_reports_breakpoint_and_backend_teardown_failures() {
+        let mut backend = MockBackend::new();
+        backend.fail_exit = true;
+
+        let error = prepare_backend_after_cleanup(
+            &mut backend,
+            Err(Error::Kd("injected breakpoint removal failure".into())),
+        )
+        .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("breakpoint removal failure"));
+        assert!(message.contains("backend teardown failure"));
+        assert_eq!(backend.exit_requests, vec![false]);
     }
 
     #[test]

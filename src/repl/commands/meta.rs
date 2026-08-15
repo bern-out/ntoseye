@@ -1,14 +1,22 @@
 use crate::error::Result;
+use crate::expr::NumberRadix;
 #[cfg(feature = "python")]
 use crate::python::embed;
 
 use crate::repl::*;
 
 repl_command! {
-    cmd_reload();
-    names: ["reload"],
-    usage: "reload",
+    cmd_reload_scripts();
+    names: ["reload-scripts"],
+    usage: "reload-scripts",
     summary: "Reload custom commands and aliases.",
+}
+
+repl_command! {
+    cmd_radix;
+    names: ["n"],
+    usage: "n [8|10|16]",
+    summary: "Display or set the default numeric radix for REPL expressions.",
 }
 
 repl_command! {
@@ -19,7 +27,7 @@ repl_command! {
 }
 
 impl ReplState<'_> {
-    fn cmd_reload(&mut self) -> Result<()> {
+    fn cmd_reload_scripts(&mut self) -> Result<()> {
         #[cfg(feature = "python")]
         {
             let py_report = embed::load_commands_dir();
@@ -28,6 +36,28 @@ impl ReplState<'_> {
         }
         let alias_report = self.reload_aliases();
         print_alias_load_report(&alias_report);
+        Ok(())
+    }
+
+    fn cmd_radix(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
+        if let Some(value) = invocation.arg(0) {
+            self.radix = match value {
+                "8" => NumberRadix::Octal,
+                "10" => NumberRadix::Decimal,
+                "16" => NumberRadix::Hexadecimal,
+                _ => {
+                    error!("invalid radix '{value}' (use 8, 10, or 16)");
+                    return Ok(());
+                }
+            };
+        }
+
+        let name = match self.radix {
+            NumberRadix::Octal => "octal",
+            NumberRadix::Decimal => "decimal",
+            NumberRadix::Hexadecimal => "hexadecimal",
+        };
+        println!("radix {} ({name})\n", self.radix.value());
         Ok(())
     }
 

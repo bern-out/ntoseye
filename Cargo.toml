@@ -2,7 +2,7 @@
 members = ["ntoseye-py"]
 
 [workspace.package]
-version = "0.20.1"
+version = "0.21.0"
 
 [package]
 name = "ntoseye"
@@ -71,6 +71,12 @@ mcp = ["dep:rmcp", "dep:schemars", "dep:serde", "dep:serde_json", "dep:tokio", "
 python = ["dep:pyo3"]
 python-embed = ["python", "pyo3/auto-initialize"]
 python-extension = ["python", "pyo3/extension-module"]
+
+[profile.dev.package.pdb2]
+debug-assertions = false
+
+[profile.test.package.pdb2]
+debug-assertions = false
 
 [profile.dist]
 inherits = "release"

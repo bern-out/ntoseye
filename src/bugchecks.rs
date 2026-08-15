@@ -184,7 +184,22 @@ pub fn bugcheck_trap_frame_address(info: &BugcheckInfo) -> Option<u64> {
 /// [`BugcheckDescriptor::arguments`] stays a code-only, conservative fallback;
 /// this function provides the precise schema used for a concrete stop.
 pub fn bugcheck_argument_descriptions(info: &BugcheckInfo) -> [&'static str; 4] {
+    const VERIFIER_C4_F6_ARGS: [&str; 4] = [
+        "violation type: a kernel handle was referenced as a user-mode handle",
+        "handle value",
+        "current process",
+        "address inside the driver that referenced the handle",
+    ];
+    const VERIFIER_E6_26_ARGS: [&str; 4] = [
+        "violation type: an IOMMU detected a DMA violation",
+        "device object of the faulting device",
+        "fault information (usually the physical address)",
+        "fault type (hardware-specific)",
+    ];
+
     match info.code {
+        0x0000_00c4 if info.parameters[0] == 0xf6 => VERIFIER_C4_F6_ARGS,
+        0x0000_00e6 if info.parameters[0] == 0x26 => VERIFIER_E6_26_ARGS,
         0x0000_0077 if matches!(info.parameters[0], 0..=2) => [
             "page retrieval result: 0 = page cache; 1 = disk; 2 = disk success with a short transfer",
             "value where the kernel-stack signature should be",
@@ -433,11 +448,20 @@ pub fn resolve_current_bugcheck(debugger: &Target) -> CurrentBugcheckResolution 
         return CurrentBugcheckResolution::SymbolUnavailable;
     };
     let kernel_dtb = guest.ntoskrnl.dtb();
-    let Some(address) = debugger
+    let address = match debugger
         .symbols
-        .find_symbol_across_modules(kernel_dtb, "KiBugCheckData")
-    else {
-        return CurrentBugcheckResolution::SymbolUnavailable;
+        .find_symbol_across_modules(kernel_dtb, "nt!KiBugCheckData")
+    {
+        Ok(Some(address)) => address,
+        Ok(None) => return CurrentBugcheckResolution::SymbolUnavailable,
+        Err(error) => {
+            return CurrentBugcheckResolution::Unresolved(CurrentBugcheckFailure {
+                address: VirtAddr(0),
+                slots: None,
+                dereferenced_slots: None,
+                reason: error.to_string(),
+            });
+        }
     };
     let mem = guest.ntoskrnl.memory();
     let direct = match read_bugcheck_data(&mem, address) {
@@ -4158,6 +4182,14 @@ mod tests {
         assert_eq!(
             bugcheck_argument_descriptions(&info(0x159, [0x3001, 0, 0, 0]))[2],
             "PASID"
+        );
+        assert_eq!(
+            bugcheck_argument_descriptions(&info(0xc4, [0xf6, 0, 0, 0]))[3],
+            "address inside the driver that referenced the handle"
+        );
+        assert_eq!(
+            bugcheck_argument_descriptions(&info(0xe6, [0x26, 0, 0, 0]))[2],
+            "fault information (usually the physical address)"
         );
     }
 

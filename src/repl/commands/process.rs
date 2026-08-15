@@ -44,9 +44,9 @@ repl_command! {
 
 repl_command! {
     cmd_thread;
-    names: ["thread"],
+    names: ["thread", ".thread"],
     usage: "thread <tid|ethread|.> [k|r] [count]",
-    summary: "Inspect a Windows thread and switch to it if it is currently running.",
+    summary: "Inspect a Windows thread using a live vCPU or its saved kernel context.",
     completion: [Thread, None, None],
     run_state: Halted,
 }
@@ -413,14 +413,14 @@ impl ReplState<'_> {
         let current_alias_address = if target == "." {
             self.ctx
                 .target
-                .current_windows_thread
+                .windows_thread_selection
                 .as_ref()
                 .map(|t| t.ethread)
         } else {
             None
         };
-        let target_address =
-            current_alias_address.or_else(|| Expr::eval(target, &self.ctx.target).ok());
+        let target_address = current_alias_address
+            .or_else(|| Expr::eval_with_radix(target, &self.ctx.target, self.radix).ok());
         let matches = threads
             .iter()
             .filter(|thread| {
@@ -459,9 +459,27 @@ impl ReplState<'_> {
         let Some((vcpu, _)) = active.get(&thread.ethread.0) else {
             print_thread_detail(thread);
             println!(
-                "{}\n",
-                "thread is not currently executing on any vCPU".bright_black()
+                "{}",
+                "thread is parked: stack inspection is available, registers are not".bright_black()
             );
+            self.ctx.select_parked_windows_thread(thread);
+            self.caches.refresh_symbol_context(&self.ctx.target);
+            match action {
+                Some("k") => match self.ctx.backtrace(frame_limit) {
+                    Ok(stacktrace) => {
+                        print_stacktrace_data_with_provenance(&stacktrace, frame_limit, false)
+                    }
+                    Err(error) => error!("failed to unwind parked thread stack: {}", error),
+                },
+                Some("r" | "registers") => error!(
+                    "parked thread has no coherent register context; select a live vCPU with `vcpu <id>`"
+                ),
+                Some(other) => {
+                    error!("unknown thread action '{}': expected k or r", other)
+                }
+                None => {}
+            }
+            println!();
             return Ok(());
         };
 
@@ -486,7 +504,7 @@ impl ReplState<'_> {
 
         match action {
             Some("k") => {
-                let regs = match self.ctx.backend.read_registers() {
+                let regs = match self.ctx.read_registers() {
                     Ok(regs) => regs,
                     Err(e) => {
                         error!("failed to read registers: {:?}", e);
@@ -503,7 +521,7 @@ impl ReplState<'_> {
                 );
             }
             Some("r" | "registers") => {
-                let regs = match self.ctx.backend.read_registers() {
+                let regs = match self.ctx.read_registers() {
                     Ok(regs) => regs,
                     Err(e) => {
                         error!("failed to read registers: {:?}", e);
@@ -521,7 +539,8 @@ impl ReplState<'_> {
 
     fn cmd_vmmap(&mut self, invocation: CommandInvocation<'_>) -> Result<()> {
         let filter = invocation.arg(0);
-        let filter_address = filter.and_then(|filter| Expr::eval(filter, &self.ctx.target).ok());
+        let filter_address = filter
+            .and_then(|filter| Expr::eval_with_radix(filter, &self.ctx.target, self.radix).ok());
 
         if let Some(process) = self.ctx.target.current_process_info.clone() {
             let regions = match self

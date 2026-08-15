@@ -845,9 +845,9 @@ mod tests {
     #[test]
     fn alias_completion_infers_star_placeholder_strategy() {
         let mut completer = completer();
-        add_alias(&mut completer, "bpa", "bp ${*}; g");
+        add_alias(&mut completer, "allbp", "bp ${*}; g");
 
-        assert_eq!(values(completer.complete("bpa r", 5)), vec!["rax", "rip"]);
+        assert_eq!(values(completer.complete("allbp r", 7)), vec!["rax", "rip"]);
     }
 
     #[test]

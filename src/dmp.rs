@@ -12,6 +12,7 @@ use crate::kd::wire::{read_u16, read_u32, read_u64, read_u64 as buffer_u64};
 
 use crate::backend::MemoryOps;
 use crate::dbg_backend::{BackendCapability, DebugBackend, DebugCapability, StopEvent};
+use crate::debugger_data::{DebuggerDataCandidate, MetadataSource};
 use crate::diagnostics;
 use crate::error::{Error, Result};
 use crate::gdb::RegisterMap;
@@ -24,6 +25,22 @@ use crate::triage::{
     TriageBlock, TriageDriver, TriagePrcbInfo, is_triage_dump, parse_drivers, parse_triage,
 };
 use crate::types::{PhysAddr, VirtAddr};
+
+const IMAGE_FILE_MACHINE_AMD64: u32 = 0x8664;
+
+fn require_amd64_dump(machine_type: u32) -> Result<()> {
+    if machine_type == IMAGE_FILE_MACHINE_AMD64 {
+        return Ok(());
+    }
+    let name = match machine_type {
+        0x014c => "I386",
+        0xaa64 => "ARM64",
+        _ => "unknown",
+    };
+    Err(Error::UnsupportedArchitecture(format!(
+        "{name} crash dump (machine {machine_type:#06x})"
+    )))
+}
 
 #[derive(Debug, Clone)]
 pub struct DmpContext {
@@ -91,6 +108,14 @@ pub struct UnloadedDriver {
     pub name: String,
     pub start_address: u64,
     pub end_address: u64,
+}
+/// Metadata for a named secondary/blackbox stream. The current kdmp-parser
+/// exposes no stream payload API, so this intentionally records only facts a
+/// parser can prove without inventing a payload schema.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DmpBlackboxStream {
+    pub name: String,
+    pub size: u64,
 }
 
 impl DmpContext {
@@ -259,11 +284,13 @@ pub struct DmpInfo {
     pub number_processors: u32,
     pub is_triage: bool,
     pub ps_loaded_module_list: u64,
+    pub debugger_data_block: Option<u64>,
     pub ps_active_process_head: u64,
     pub triage_drivers: Vec<TriageDriver>,
     pub exception: Option<DmpException>,
     pub system_info: Option<DmpSystemInfo>,
     pub unloaded_drivers: Vec<UnloadedDriver>,
+    pub blackbox_streams: Vec<DmpBlackboxStream>,
     pub triage_process_snapshot: Option<Vec<u8>>,
     pub triage_thread_snapshot: Option<Vec<u8>>,
     pub triage_prcb_info: Option<TriagePrcbInfo>,
@@ -312,13 +339,14 @@ impl DmpMem {
     }
 
     fn open_full(mmap: Mmap, parser: KernelDumpParser) -> Result<Self> {
+        let hdr = parser.headers();
+        require_amd64_dump(hdr.machine_image_type)?;
         let mut pages: Vec<(u64, u64)> = parser
             .physmem()
             .map(|(gpa, offset)| (u64::from(gpa), offset))
             .collect();
         pages.sort_unstable_by_key(|&(gpa, _)| gpa);
 
-        let hdr = parser.headers();
         let ctx = parser.context_record();
 
         let offset_prcb_context = Self::read_prcb_context_offset(&parser);
@@ -356,10 +384,13 @@ impl DmpMem {
             is_triage: false,
             ps_loaded_module_list: hdr.ps_loaded_module_list,
             ps_active_process_head: hdr.ps_active_process_head,
+            debugger_data_block: (hdr.kd_debugger_data_block != 0)
+                .then_some(hdr.kd_debugger_data_block),
             triage_drivers: Vec::new(),
             exception,
             system_info,
             unloaded_drivers: Vec::new(),
+            blackbox_streams: Vec::new(),
             triage_process_snapshot: None,
             triage_thread_snapshot: None,
             triage_prcb_info: None,
@@ -416,6 +447,9 @@ impl DmpMem {
 
     fn open_triage(mmap: Mmap) -> Result<Self> {
         let (mut info, blocks) = parse_triage(&mmap)?;
+        if let Some(system_info) = info.system_info.as_ref() {
+            require_amd64_dump(system_info.machine_image_type)?;
+        }
         info.triage_drivers = parse_drivers(&mmap);
         Ok(Self {
             mmap,
@@ -541,6 +575,7 @@ pub struct DmpBackend {
     header_context: DmpContext,
     directory_table_base: u64,
     triage_crash_info: Option<TriageCrashInfo>,
+    debugger_data_hint: Option<DebuggerDataCandidate>,
 }
 
 impl DmpBackend {
@@ -567,6 +602,12 @@ impl DmpBackend {
             prcb_context_offset: info.offset_prcb_context,
             header_context: info.context.clone(),
             directory_table_base: info.directory_table_base,
+            debugger_data_hint: info
+                .debugger_data_block
+                .map(|address| DebuggerDataCandidate {
+                    address: crate::types::VirtAddr(address),
+                    source: MetadataSource::DumpHeader,
+                }),
             triage_crash_info: None,
         }
     }
@@ -745,6 +786,10 @@ impl DebugBackend for DmpBackend {
         self.triage_crash_info.as_ref()
     }
 
+    fn target_debugger_data_hint(&mut self) -> Result<Option<DebuggerDataCandidate>> {
+        Ok(self.debugger_data_hint)
+    }
+
     fn register_map(&self) -> &RegisterMap {
         &self.register_map
     }
@@ -847,6 +892,14 @@ impl DebugBackend for DmpBackend {
 mod tests {
     use super::*;
 
+    #[test]
+    fn dump_open_rejects_non_amd64_machine_types() {
+        assert!(require_amd64_dump(IMAGE_FILE_MACHINE_AMD64).is_ok());
+        let error = require_amd64_dump(0x014c).unwrap_err();
+        assert!(error.to_string().contains("I386 crash dump"));
+        assert!(error.to_string().contains("supports AMD64 targets only"));
+    }
+
     fn make_test_info() -> DmpInfo {
         DmpInfo {
             directory_table_base: 0x1ad000,
@@ -857,10 +910,12 @@ mod tests {
             is_triage: false,
             ps_loaded_module_list: 0,
             ps_active_process_head: 0,
+            debugger_data_block: None,
             triage_drivers: Vec::new(),
             exception: None,
             system_info: None,
             unloaded_drivers: Vec::new(),
+            blackbox_streams: Vec::new(),
             triage_process_snapshot: None,
             triage_thread_snapshot: None,
             triage_prcb_info: None,

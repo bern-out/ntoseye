@@ -15,7 +15,7 @@ use crate::{
     kd::KdBackend,
     memory_backend::MemoryBackend,
     phys::PhysMem,
-    repl::start_repl,
+    repl::{start_plain_repl, start_repl},
     session, symbols, virsh,
 };
 
@@ -72,6 +72,9 @@ struct Args {
     #[argh(option, long = "connect")]
     connect: Option<String>,
 
+    /// use a line-oriented REPL without terminal cursor queries, completion, or history
+    #[argh(switch, long = "plain-repl")]
+    plain_repl: bool,
     /// open a Windows kernel crash dump (.dmp) for offline analysis instead of attaching to a live VM
     #[argh(option, long = "dump")]
     dump: Option<PathBuf>,
@@ -290,7 +293,11 @@ fn run() -> Result<()> {
             session::Session::connect(phys, None, || -> Result<Box<dyn DebugBackend>> {
                 Ok(Box::new(DmpBackend::new(&info)))
             })?;
-        return start_repl(&mut ctx);
+        return if args.plain_repl {
+            start_plain_repl(&mut ctx)
+        } else {
+            start_repl(&mut ctx)
+        };
     }
 
     // kd/gdb take a per-target instance lock so a second ntoseye can't
@@ -321,7 +328,11 @@ fn run() -> Result<()> {
             })
         },
     )?;
-    start_repl(&mut ctx)
+    if args.plain_repl {
+        start_plain_repl(&mut ctx)
+    } else {
+        start_repl(&mut ctx)
+    }
 }
 
 fn print_home_migration() {

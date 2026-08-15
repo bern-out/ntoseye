@@ -7,6 +7,8 @@ use reedline::{
 };
 #[cfg(feature = "cli")]
 use reedline::{Reedline, Signal};
+#[cfg(feature = "cli")]
+use std::io::{BufRead, Write};
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::atomic::AtomicBool;
@@ -22,11 +24,15 @@ use owo_colors::OwoColorize;
 use crate::dbg_backend::DebugBackend;
 use crate::dbg_backend::{BackendCapability, DebugCapability};
 use crate::diagnostics;
-use crate::error::{Error, Result};
+#[cfg(feature = "cli")]
+use crate::error::Error;
+use crate::error::Result;
 use crate::guest::ModuleSymbolLoadReport;
 #[cfg(feature = "python")]
 use crate::python::embed;
 use crate::session::Session;
+#[cfg(feature = "cli")]
+use crate::session::StopResolution;
 #[cfg(feature = "cli")]
 use crate::symbols::ntoseye_home;
 #[cfg(feature = "cli")]
@@ -66,6 +72,7 @@ mod command;
 mod commands;
 mod completion;
 mod disasm;
+mod exception_policy;
 #[cfg(feature = "cli")]
 mod line_editor;
 mod memory_view;
@@ -78,6 +85,7 @@ pub use bugcheck::*;
 pub use command::*;
 pub use completion::*;
 pub use disasm::*;
+pub use exception_policy::*;
 #[cfg(feature = "cli")]
 use line_editor::{CustomPrompt, MyCompleter, TrackingHighlighter};
 pub use memory_view::*;
@@ -95,7 +103,36 @@ pub fn print_module_symbol_report(report: &ModuleSymbolLoadReport) {
     if report.skipped > 0 {
         summary.push_str(&format!(", {} skipped", report.skipped));
     }
+    if report.diagnostic_count > 0 {
+        summary.push_str(&format!(
+            ", {} PDB warning{}",
+            report.diagnostic_count,
+            if report.diagnostic_count == 1 {
+                ""
+            } else {
+                "s"
+            }
+        ));
+    }
     println!("{} {summary}", ui::muted("symbols:"));
+    const DISPLAY_LIMIT: usize = 8;
+    for diagnostic in report.diagnostics.iter().take(DISPLAY_LIMIT) {
+        let location = diagnostic
+            .compiland
+            .as_deref()
+            .map(|compiland| format!("{} ({compiland})", diagnostic.module))
+            .unwrap_or_else(|| diagnostic.module.clone());
+        diagnostics::print_warning(format!(
+            "{location}: {}: {}",
+            diagnostic.phase, diagnostic.message
+        ));
+    }
+    if report.diagnostic_count > DISPLAY_LIMIT {
+        diagnostics::print_warning(format!(
+            "{} additional PDB diagnostics omitted",
+            report.diagnostic_count - DISPLAY_LIMIT
+        ));
+    }
 }
 
 pub fn print_backend_capabilities(capabilities: &[BackendCapability]) {
@@ -164,6 +201,14 @@ pub fn print_plain_table(builder: Builder) {
     println!("{table}\n");
 }
 
+pub fn print_padded_table(builder: Builder) {
+    let mut table = builder.build();
+    table
+        .with(tabled::settings::Style::empty())
+        .with(Padding::new(0, 2, 0, 0));
+    println!("{table}\n");
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Flow {
     Continue,
@@ -174,6 +219,11 @@ pub struct ReplState<'a> {
     pub ctx: &'a mut Session,
     pub caches: ReplCaches,
     pub aliases: UserAliases,
+    pub exception_policies: ExceptionPolicyTable,
+    /// Nested automatic exception-command executions. Bounded so an event
+    /// command that resumes into the same exception cannot recurse forever.
+    pub event_command_depth: usize,
+    pub radix: crate::expr::NumberRadix,
     pub line: String,
 }
 
@@ -216,6 +266,9 @@ impl<'a> ReplState<'a> {
             ctx,
             caches,
             aliases: UserAliases::load(),
+            exception_policies: ExceptionPolicyTable::default(),
+            event_command_depth: 0,
+            radix: crate::expr::NumberRadix::Hexadecimal,
             line: String::new(),
         };
         state.caches.refresh_expression_context(&state.ctx.target);
@@ -226,6 +279,16 @@ impl<'a> ReplState<'a> {
 
 #[cfg(feature = "cli")]
 pub fn start_repl(ctx: &mut Session) -> Result<()> {
+    start_repl_with_mode(ctx, false)
+}
+
+#[cfg(feature = "cli")]
+pub fn start_plain_repl(ctx: &mut Session) -> Result<()> {
+    start_repl_with_mode(ctx, true)
+}
+
+#[cfg(feature = "cli")]
+fn start_repl_with_mode(ctx: &mut Session, plain: bool) -> Result<()> {
     // Borrow the two owned fields disjointly; the rest of this function (and
     // ReplState) consumes them exactly as before.
     let debugger: &mut Target = &mut ctx.target;
@@ -453,6 +516,9 @@ pub fn start_repl(ctx: &mut Session) -> Result<()> {
         ctx,
         caches,
         aliases,
+        exception_policies: ExceptionPolicyTable::default(),
+        event_command_depth: 0,
+        radix: crate::expr::NumberRadix::Hexadecimal,
         line: String::new(),
     };
     // The reload state machine lives on the Session now; seed it from the
@@ -460,117 +526,115 @@ pub fn start_repl(ctx: &mut Session) -> Result<()> {
     // boot, before rediscovery completed).
     state.ctx.reload_module_list_pending = reload_module_list_pending;
 
-    loop {
-        let prompt = CustomPrompt::new(backend_label, &state.ctx.current_thread);
-        let sig = line_editor.read_line(&prompt)?;
-        match sig {
-            Signal::Success(buffer) => {
-                if !buffer.trim().is_empty() {
-                    state.line = buffer.trim().to_string();
-                    match state.dispatch_line(&buffer)? {
-                        Flow::Quit => break,
-                        Flow::Continue => {}
-                    }
-                }
-            }
-            Signal::CtrlD => {
+    if plain {
+        let stdin = std::io::stdin();
+        let mut input = stdin.lock();
+        let mut buffer = String::new();
+
+        loop {
+            let prompt = if state.ctx.current_thread.is_empty() {
+                "ntoseye>".to_string()
+            } else {
+                format!("{backend_label}:{}>", state.ctx.current_thread)
+            };
+            println!("{prompt}");
+            std::io::stdout().flush()?;
+
+            buffer.clear();
+            if input.read_line(&mut buffer)? == 0 {
                 break;
             }
-            Signal::CtrlC => {
-                if had_content.load(Ordering::Relaxed) {
-                    had_content.store(false, Ordering::Relaxed);
-                    continue;
-                }
-
-                if state.ctx.backend.is_running() {
-                    state.interrupt_running_vm()?;
-                } else {
-                    error!("VM is already paused");
-                }
+            let command = buffer.trim();
+            if command.is_empty() {
+                continue;
             }
-            _ => {}
+
+            state.line = command.to_string();
+            if state.dispatch_line(command)? == Flow::Quit {
+                break;
+            }
+        }
+    } else {
+        loop {
+            let prompt = CustomPrompt::new(backend_label, &state.ctx.current_thread);
+            let sig = line_editor.read_line(&prompt)?;
+            match sig {
+                Signal::Success(buffer) => {
+                    if !buffer.trim().is_empty() {
+                        state.line = buffer.trim().to_string();
+                        match state.dispatch_line(&buffer)? {
+                            Flow::Quit => break,
+                            Flow::Continue => {}
+                        }
+                    }
+                }
+                Signal::CtrlD => {
+                    break;
+                }
+                Signal::CtrlC => {
+                    if had_content.load(Ordering::Relaxed) {
+                        had_content.store(false, Ordering::Relaxed);
+                        continue;
+                    }
+
+                    if state.ctx.backend.is_running() {
+                        state.interrupt_running_vm()?;
+                    } else {
+                        error!("VM is already paused");
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
     let was_running_on_exit = state.ctx.backend.is_running();
     let mut resume_on_exit = !was_running_on_exit;
     if was_running_on_exit && !state.ctx.breakpoints.list().is_empty() {
-        match state.ctx.backend.try_wait_for_stop(REPL_STOP_POLL) {
-            Ok(Some(mut event)) => {
-                let reload_status = apply_target_reload_if_needed(
-                    &mut *state.ctx.backend,
-                    &mut state.ctx.target,
-                    &mut state.ctx.breakpoints,
-                    &state.caches,
-                    &mut event,
-                );
-                update_reload_module_list_pending(
-                    &mut state.ctx.reload_module_list_pending,
-                    reload_status,
-                );
-                if !reload_status.pending_rediscovery() {
-                    set_current_thread_from_stop(
-                        &mut *state.ctx.backend,
-                        &event,
-                        &mut state.ctx.current_thread,
-                    );
-                }
-                resume_on_exit = true;
-            }
-            Ok(None) => match state.ctx.backend.interrupt() {
-                Ok(mut event) => {
-                    let reload_status = apply_target_reload_if_needed(
-                        &mut *state.ctx.backend,
-                        &mut state.ctx.target,
-                        &mut state.ctx.breakpoints,
-                        &state.caches,
-                        &mut event,
-                    );
-                    update_reload_module_list_pending(
-                        &mut state.ctx.reload_module_list_pending,
-                        reload_status,
-                    );
-                    if !reload_status.pending_rediscovery() {
-                        set_current_thread_from_stop(
-                            &mut *state.ctx.backend,
-                            &event,
-                            &mut state.ctx.current_thread,
-                        );
+        let settle = (|| -> Result<()> {
+            let mut event = match state.ctx.backend.try_wait_for_stop(REPL_STOP_POLL)? {
+                Some(event) => event,
+                None => state.ctx.backend.interrupt()?,
+            };
+            loop {
+                match state.ctx.classify_stop_event(event)? {
+                    StopResolution::Resumed => {
+                        event = state.ctx.backend.interrupt()?;
                     }
-                    resume_on_exit = true;
+                    StopResolution::Breakpoint { .. }
+                    | StopResolution::Bugcheck { .. }
+                    | StopResolution::TargetReloaded { .. }
+                    | StopResolution::Stopped { .. } => return Ok(()),
                 }
-                Err(e) => {
-                    error!("failed to interrupt during exit: {:?}", e);
-                    resume_on_exit = false;
-                }
-            },
-            Err(e) => {
-                error!("error checking running VM during exit: {:?}", e);
+            }
+        })();
+        match settle {
+            Ok(()) => resume_on_exit = true,
+            Err(error) => {
+                error!("failed to halt cleanly during exit: {error}");
                 resume_on_exit = false;
             }
         }
     }
 
-    // Best effort even if the interrupt above failed: a leftover int3 in guest
-    // code with no debugger attached is worse than a failed removal
-    let bp_ids: Vec<u32> = state
+    // Restore every debugger-owned site before allowing the guest to resume.
+    // A failed removal remains managed and forces an explicitly halted exit;
+    // resuming with an orphaned int3 would turn cleanup failure into a guest
+    // crash after the debugger disconnects.
+    let breakpoint_cleanup_succeeded = match state
         .ctx
         .breakpoints
-        .list()
-        .iter()
-        .map(|bp| bp.id)
-        .collect();
-    for id in bp_ids {
-        if let Err(e) = state
-            .ctx
-            .breakpoints
-            .remove(&mut *state.ctx.backend, &state.ctx.target, id)
-        {
-            error!("failed to uninstall breakpoint #{} on exit: {}", id, e);
+        .remove_all(&mut *state.ctx.backend, &state.ctx.target)
+    {
+        Ok(()) => true,
+        Err(error) => {
+            error!("failed to uninstall breakpoints on exit: {error}");
+            false
         }
-    }
+    };
 
-    let leave_running_on_exit = resume_on_exit || state.ctx.backend.is_running();
+    let leave_running_on_exit =
+        breakpoint_cleanup_succeeded && (resume_on_exit || state.ctx.backend.is_running());
     if let Err(e) = state.ctx.backend.prepare_for_exit(leave_running_on_exit) {
         error!("failed to prepare backend for exit: {:?}", e);
     }
