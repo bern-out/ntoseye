@@ -5,7 +5,7 @@
 
 # ntoseye ![license](https://img.shields.io/badge/license-MIT-blue) [![crates.io](https://img.shields.io/crates/v/ntoseye.svg)](https://crates.io/crates/ntoseye)
 
-Windows kernel debugger for Linux hosts running Windows under KVM/QEMU. Essentially, WinDbg for Linux.
+Windows kernel debugger for Linux hosts running Windows under KVM/QEMU/VMWARE. Essentially, WinDbg for Linux.
 
 ## Features
 
@@ -28,6 +28,7 @@ Windows kernel debugger for Linux hosts running Windows under KVM/QEMU. Essentia
 ### Disclaimer
 
 `ntoseye` needs to download symbols and images to initialize required offsets, it will only download symbols from Microsoft's official symbol server. Config, cache, and REPL state live under `~/.ntoseye`. If a legacy `~/.config/ntoseye` directory exists and `~/.ntoseye` does not, ntoseye moves it to `~/.ntoseye` automatically and prints a note. Notable paths:
+
 - `~/.ntoseye/commands/` for custom scripted commands
 - `~/.ntoseye/images/` for binaries downloaded from the VM
 - `~/.ntoseye/symbols/` for PDBs
@@ -72,7 +73,7 @@ cargo build --release --no-default-features --features cli,mcp
 
 The default and recommended backend is `kd` (KDCOM), which runs Windows KD over a QEMU serial socket. For a libvirt/virt-manager guest, the fastest path is:
 
-1. Configure the VM transport with `ntoseye virsh`: pick the domain, choose *configure debug transports*, then `kd`. (Prefer editing the XML yourself? See [VM configuration](#vm-configuration).)
+1. Configure the VM transport with `ntoseye virsh`: pick the domain, choose _configure debug transports_, then `kd`. (Prefer editing the XML yourself? See [VM configuration](#vm-configuration).)
 2. In the guest, enable kernel debugging and reboot (Administrator PowerShell):
    ```
    bcdedit /debug on
@@ -131,15 +132,15 @@ Aliases are saved in `~/.ntoseye/aliases`; `reload` reloads aliases and custom P
 
 `ntoseye` can talk to the guest three ways. Pick with `--backend kd` (default), `--backend gdb`, or `--backend memory`.
 
-| | `kd` (default) | `gdb` | `memory` |
-|---|---|---|---|
-| Transport | Windows KD over a serial pipe (KDCOM) | QEMU's `gdbstub` | None; `/dev/kvm` memory introspection only |
-| Requires in-guest configuration | Yes (`bcdedit /debug on`; anti-debug code, PatchGuard, and some Windows behaviour change once enabled) | No (guest is unaware it's being debugged) | No |
-| Requires host VM configuration | Yes (serial socket) | Yes (`-s -S`) | No |
-| Execution control | Yes | Yes | No |
-| Kernel breakpoints | Yes | Yes | No |
-| Usermode breakpoints | Yes | No | No |
-| Kernel breakpoint mechanism | `DbgKdWriteBreakPointApi` | gdb `Z0` packets | No |
+|                                 | `kd` (default)                                                                                         | `gdb`                                     | `memory`                                   |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------ | ----------------------------------------- | ------------------------------------------ |
+| Transport                       | Windows KD over a serial pipe (KDCOM)                                                                  | QEMU's `gdbstub`                          | None; `/dev/kvm` memory introspection only |
+| Requires in-guest configuration | Yes (`bcdedit /debug on`; anti-debug code, PatchGuard, and some Windows behaviour change once enabled) | No (guest is unaware it's being debugged) | No                                         |
+| Requires host VM configuration  | Yes (serial socket)                                                                                    | Yes (`-s -S`)                             | No                                         |
+| Execution control               | Yes                                                                                                    | Yes                                       | No                                         |
+| Kernel breakpoints              | Yes                                                                                                    | Yes                                       | No                                         |
+| Usermode breakpoints            | Yes                                                                                                    | No                                        | No                                         |
+| Kernel breakpoint mechanism     | `DbgKdWriteBreakPointApi`                                                                              | gdb `Z0` packets                          | No                                         |
 
 See [VM configuration](#vm-configuration) for the host-side setup of each backend.
 
@@ -161,6 +162,7 @@ Append `-s -S` to the qemu command.
 #### virt-manager
 
 Add the following to the XML configuration:
+
 ```xml
 <domain xmlns:qemu="http://libvirt.org/schemas/domain/qemu/1.0" type="kvm">
   ...
@@ -174,18 +176,22 @@ Add the following to the XML configuration:
 ### KDCOM
 
 Default backend. In the guest, enable kernel debugging (run as Administrator, then reboot):
+
 ```
 bcdedit /debug on
 bcdedit /dbgsettings serial debugport:1 baudrate:115200
 ```
+
 Use `debugport:2` instead of `:1` if the KD chardev ends up as COM2 (see the virt-manager subsection below).
 
 #### QEMU
 
 Add a Unix-socket chardev and route a serial port to it:
+
 ```
 -chardev socket,id=kd,path=/tmp/ntoseye-kd.sock,server=on,wait=off -serial chardev:kd
 ```
+
 Then connect: `ntoseye`.
 
 The initial KD handshake timeout is 8 seconds by default. For unusually slow guests, override it with `NTOSEYE_KD_TIMEOUT=<seconds>`.
@@ -199,6 +205,7 @@ The initial KD handshake timeout is 8 seconds by default. For unusually slow gue
 > via `qemu:commandline` (KD becomes COM2, use `debugport:2`).
 
 **Option A (recommended):** replace the auto-added serial. KD is COM1, `debugport:1` is correct.
+
 ```xml
 <serial type="unix">
   <source mode="bind" path="/tmp/ntoseye-kd.sock"/>
@@ -207,6 +214,7 @@ The initial KD handshake timeout is 8 seconds by default. For unusually slow gue
 ```
 
 **Option B:** keep the auto-added serial and append the KD chardev via `qemu:commandline`. If KD is COM2, use `debugport:2`.
+
 ```xml
 <domain xmlns:qemu="http://libvirt.org/schemas/domain/qemu/1.0" type="kvm">
   ...
@@ -278,6 +286,7 @@ virt-copy-out -d <domain> /Windows/MEMORY.DMP /tmp/
 ### Recommended guest tweaks
 
 Although not required, disabling memory paging and compression in the guest avoids memory-related issues. This only needs to be done once per Windows installation (Administrator PowerShell):
+
 ```
 Get-CimInstance Win32_ComputerSystem | Set-CimInstance -Property @{ AutomaticManagedPagefile = $false }
 Get-CimInstance Win32_PageFileSetting | Remove-CimInstance
@@ -373,7 +382,7 @@ Top-level flags go before the `mcp` subcommand, e.g. to pin the backend and sock
 }
 ```
 
-Use an absolute path for `command` (e.g. `../target/release/ntoseye`) if `ntoseye` isn't within `PATH`. 
+Use an absolute path for `command` (e.g. `../target/release/ntoseye`) if `ntoseye` isn't within `PATH`.
 
 ### Streamable HTTP
 
