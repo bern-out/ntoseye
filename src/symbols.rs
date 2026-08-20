@@ -1986,7 +1986,7 @@ impl SymbolStore {
         path.rsplit(['\\', '/']).next().unwrap_or(path)
     }
 
-    // TODO (everywhere) use MemoryOps, not LiveVmHandle...
+    // TODO (everywhere) use MemoryOps, not KvmHandle...
     // TODO (everywhere) propagate errors with format!
     // NOTE dont check for more than 1 CV entry, there shouldn't be more than 1
     pub fn load_from_binary(&self, object: &mut WinObject, name: &str) -> Result<Option<u128>> {

@@ -1284,7 +1284,7 @@ impl BreakpointManager {
                 memory.read_bytes(address, &mut original)?;
                 memory.write_bytes(address, &[0xcc])?;
                 // The kernel doesn't know about this BP (we patched it
-                // directly through the live VM's memory), so the backend needs to be told
+                // directly via /dev/kvm), so the backend needs to be told
                 // separately for managed-BP bookkeeping at stop time.
                 client.note_breakpoint_installed(address.0);
                 Ok(BreakpointBackend::GuestMemoryPatch {
